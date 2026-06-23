@@ -17,7 +17,6 @@ crossbeam-channel = "0.5"
 dirs = "6.0"
 easy-cast = "0.5"
 fuzzy-matcher = "0.3"
-<<<<<<< HEAD
 git-lfs = "0.7.0"
 git-lfs-filter = "0.7.0"
 git-lfs-pointer = "0.7.0"
@@ -34,7 +33,6 @@ rayon = "1.11"
 rayon-core = "1.13"
 scopetime = { path = "../scopetime", version = "0.1" }
 serde = { version = "1.0", features = ["derive"] }
-<<<<<<< HEAD
 tempfile = "3"
 thiserror = "2.0"
 unicode-truncate = "2.0"
