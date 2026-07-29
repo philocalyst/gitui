@@ -33,6 +33,13 @@ impl UnwalkedAlias {
 	}
 }
 
+impl std::ops::Deref for UnwalkedAlias {
+	type Target = CommitAlias;
+	fn deref(&self) -> &CommitAlias {
+		&self.0
+	}
+}
+
 impl std::ops::Deref for CommitAlias {
 	type Target = usize;
 	fn deref(&self) -> &usize {
@@ -86,6 +93,13 @@ pub enum ConnectionType {
 	TeeUp,
 	/// a lane starting downward while a bridge passes through
 	TeeDown,
+}
+
+impl ConnectionType {
+	/// Whether this connection is a dotted vertical line.
+	pub const fn is_dotted(self) -> bool {
+		matches!(self, Self::VerticalDotted)
+	}
 }
 
 #[derive(Clone, Debug, Default)]

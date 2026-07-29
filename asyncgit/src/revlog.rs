@@ -111,7 +111,7 @@ impl AsyncLog {
 			// (you know, scrolling up), so only feed it entries
 			// we know it is yet to have seen
 			let processed =
-				walker.processed_commits().min(needed_end);
+				walker.processed_commit_count().min(needed_end);
 
 			// The graph only needs topology for the commits it is
 			// about to fold in, so parents are looked up here on
@@ -121,7 +121,8 @@ impl AsyncLog {
 				repo.object_cache_size_if_unset(2_usize.pow(14));
 
 				for id in &entries[processed..needed_end] {
-					let parents = Self::parents_of(&repo, *id).ok()?;
+					let parents =
+						Self::parents_of(&repo, *id).ok()?;
 					walker.process(*id, &parents);
 				}
 			}
