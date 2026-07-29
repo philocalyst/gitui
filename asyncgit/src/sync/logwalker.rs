@@ -70,10 +70,7 @@ impl<'a> LogWalker<'a> {
 	}
 
 	///
-	pub fn read(
-		&mut self,
-		out: &mut Vec<CommitId>,
-	) -> Result<usize> {
+	pub fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
 		let mut count = 0_usize;
 
 		while let Some(c) = self.commits.pop() {
@@ -160,10 +157,7 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 	}
 
 	///
-	pub fn read(
-		&mut self,
-		out: &mut Vec<CommitId>,
-	) -> Result<usize> {
+	pub fn read(&mut self, out: &mut Vec<CommitId>) -> Result<usize> {
 		let mut count = 0_usize;
 
 		while let Some(Ok(info)) = self.walk.next() {

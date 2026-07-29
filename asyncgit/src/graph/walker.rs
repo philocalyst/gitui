@@ -9,7 +9,7 @@ use crate::sync::CommitId;
 use core::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-/// Get the lanes color index, which cycles through the ste palette.
+/// Get the lane's color index, which cycles through the color palette.
 fn lane_color(lane: usize) -> LaneIndex {
 	LaneIndex::from(lane % MAX_LANE_COLORS)
 }
@@ -122,9 +122,11 @@ fn overlay_cell(
 	color: LaneIndex,
 ) {
 	if let Some((conn, existing_color)) = cell {
+		// `conn_dirs` returns `None` for commit markers, which must
+		// never be drawn over; when that happens this branch is
+		// skipped and `cell` is left untouched.
 		if let Some(existing) = conn_dirs(*conn) {
-			let is_dotted =
-				matches!(conn, ConnectionType::VerticalDotted);
+			let is_dotted = conn.is_dotted();
 
 			let resolved_color =
 				if existing.vertical() || !add.vertical() {
@@ -143,6 +145,7 @@ fn overlay_cell(
 	}
 }
 
+#[derive(Default)]
 pub struct GraphWalker {
 	pub buffer: Buffer,
 	pub oids: GraphOids,
@@ -151,30 +154,19 @@ pub struct GraphWalker {
 	pub merge_parents: HashMap<CommitAlias, CommitAlias>,
 
 	/// Aliases of commits already folded into the buffer; consulted
-	/// by [`Self::drawable_parent`], which refuses to mint an
+	/// by [`Self::mint_drawable_parent`], which refuses to mint an
 	/// [`UnwalkedAlias`] for any of them.
 	processed: HashSet<CommitAlias>,
 }
 
-impl Default for GraphWalker {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
 impl GraphWalker {
 	pub fn new() -> Self {
-		Self {
-			buffer: Buffer::new(),
-			oids: GraphOids::new(),
-			merge_parents: HashMap::new(),
-			processed: HashSet::new(),
-		}
+		Self::default()
 	}
 
 	/// Mint the drawable alias for a parent commit, or `None` if the
 	/// walk already passed it.
-	fn drawable_parent(
+	fn mint_drawable_parent(
 		&mut self,
 		id: &CommitId,
 	) -> Option<UnwalkedAlias> {
@@ -190,9 +182,10 @@ impl GraphWalker {
 	) {
 		let commit_alias = self.oids.get_or_insert(&commit_id);
 
-		let mut drawable_parents = parents
-			.iter()
-			.filter_map(|parent_id| self.drawable_parent(parent_id));
+		let mut drawable_parents =
+			parents.iter().filter_map(|parent_id| {
+				self.mint_drawable_parent(parent_id)
+			});
 
 		// We explicitly cap support at 2 parents, ignoring octo/mega merges.
 		let first_parent = drawable_parents.next();
@@ -208,19 +201,21 @@ impl GraphWalker {
 				alias: commit_alias,
 				parent,
 			},
-			// `second_parent` is only ever `Some` once
-			// `first_parent` has already been consumed from the
-			// identical iterator, so a merge always has both parents.
-			(None, _) => LaneSlot::Settled {
+			(None, None) => LaneSlot::Settled {
 				alias: commit_alias,
 			},
+			(None, Some(_)) => unreachable!(
+				"second_parent is only ever Some once first_parent \
+				 has already been consumed from the identical \
+				 iterator, so a merge always has both parents"
+			),
 		};
 
 		if let LaneSlot::FlowingMerge { second, .. } = &chunk {
 			let second = second.get();
 			self.merge_parents.insert(commit_alias, second);
 
-			if !self.is_redundant_merge_track(second) {
+			if !self.has_lane_to_parent(second) {
 				self.buffer.track_merge_commit(commit_alias);
 			}
 		}
@@ -230,7 +225,7 @@ impl GraphWalker {
 	}
 
 	/// Number of commits already folded into the graph buffer.
-	pub const fn processed_commits(&self) -> usize {
+	pub const fn processed_commit_count(&self) -> usize {
 		self.buffer.deltas.len()
 	}
 
@@ -246,7 +241,15 @@ impl GraphWalker {
 			return Vec::new();
 		}
 
-		// Decompress one row before the range to establish predecessor state
+		// Decompress one row before the range to establish predecessor
+		// state. `snapshot_start_index` is usually `global_start_index
+		// - 1`, which also makes `snapshot_end_index` equal to
+		// `snapshot_start_index + commit_range.len()`. But at the very
+		// start of the walk `saturating_sub` clamps to `0` instead of
+		// going negative, since there is no predecessor row to fetch
+		// there; `index_offset` below (`0` in that case, `1`
+		// otherwise) accounts for the difference between the two
+		// cases when indexing into `snapshots`.
 		let snapshot_start_index =
 			global_start_index.saturating_sub(1);
 		let snapshot_end_index =
@@ -294,6 +297,13 @@ impl GraphWalker {
 		let Some((source_lane, target_lane)) = merge_bridge else {
 			return;
 		};
+		// A commit that lists the same parent twice (git allows
+		// duplicate parent entries, however rare in practice) makes
+		// its own lane await its second parent's alias too, so the
+		// search in `calculate_merge_bridge` can land back on
+		// `commit_lane` itself. There is no separate lane to bridge
+		// to in that case, so skip drawing rather than laying a
+		// zero-length span.
 		if source_lane == target_lane {
 			return;
 		}
@@ -376,19 +386,17 @@ impl GraphWalker {
 			.collect()
 	}
 
-	/// Checks if tracking a merge commit would be redundant based on
-	/// current buffer state: some lane already flows to the target
-	/// parent without owing a second parent of its own.
-	fn is_redundant_merge_track(
-		&self,
-		target_parent: CommitAlias,
-	) -> bool {
+	/// Whether some lane already flows or is reserved for
+	/// `target_parent` without owing a second parent of its own,
+	/// making it redundant to track a new merge bridge to that
+	/// parent.
+	fn has_lane_to_parent(&self, target_parent: CommitAlias) -> bool {
 		self.buffer.current.iter().flatten().any(|slot| {
 			matches!(
 				slot,
 				LaneSlot::Flowing { parent, .. }
 				| LaneSlot::Reserved { parent }
-					if parent.get() == target_parent
+					if **parent == target_parent
 			)
 		})
 	}
@@ -399,15 +407,13 @@ impl GraphWalker {
 		current_snapshot: &[Option<LaneSlot>],
 		previous_snapshot: Option<&[Option<LaneSlot>]>,
 	) -> bool {
-		let exists_in_current =
-			current_snapshot.get(target_lane).is_some();
-		let matches_previous =
-			previous_snapshot.is_some_and(|previous| {
-				previous.get(target_lane)
-					== current_snapshot.get(target_lane)
-			});
+		let Some(previous_snapshot) = previous_snapshot else {
+			return false;
+		};
 
-		exists_in_current && matches_previous
+		let current = current_snapshot.get(target_lane);
+		current.is_some()
+			&& previous_snapshot.get(target_lane) == current
 	}
 
 	/// Uses `Ordering` to elegantly map spatial relationships to visual bitmasks.
@@ -485,11 +491,13 @@ impl GraphWalker {
 
 		let merge_bridge =
 			second_parent_alias.and_then(|parent_alias| {
-				Self::calculate_merge_bridge(
-					current_snapshot,
-					commit_lane,
-					parent_alias,
-				)
+				commit_lane.and_then(|cl| {
+					Self::calculate_merge_bridge(
+						current_snapshot,
+						cl,
+						parent_alias,
+					)
+				})
 			});
 
 		let mut lanes: Vec<Option<(ConnectionType, LaneIndex)>> =
@@ -497,7 +505,7 @@ impl GraphWalker {
 				.iter()
 				.enumerate()
 				.map(|(lane_index, chunk_option)| {
-					let chunk = chunk_option.as_ref()?; // Returns None early if the chunk is missing
+					let chunk = chunk_option.as_ref()?;
 
 					if commit_alias.is_some()
 						&& chunk.alias() == commit_alias
@@ -515,7 +523,7 @@ impl GraphWalker {
 					}
 
 					Self::determine_passthrough_connection(
-						chunk, lane_index, head_alias,
+						chunk, head_alias,
 					)
 					.map(|connection| {
 						(connection, lane_color(lane_index))
@@ -523,26 +531,30 @@ impl GraphWalker {
 				})
 				.collect();
 
-		Self::draw_merge_bridge(
-			&mut lanes,
-			merge_bridge,
-			commit_lane,
-			current_snapshot,
-			previous_snapshot,
-		);
+		let branches = commit_lane.map_or_else(Vec::new, |cl| {
+			Self::draw_merge_bridge(
+				&mut lanes,
+				merge_bridge,
+				cl,
+				current_snapshot,
+				previous_snapshot,
+			);
 
-		let branches = Self::draw_branching_lanes(
-			&mut lanes,
-			&branching_lanes,
-			commit_lane,
-		);
+			Self::draw_branching_lanes(
+				&mut lanes,
+				&branching_lanes,
+				cl,
+			)
+		});
 
 		let active_lane_count =
 			current_snapshot.iter().flatten().count();
 
 		GraphRow {
-			lane_count: LaneIndex::from(active_lane_count),
-			commit_lane: LaneIndex::from(commit_lane),
+			lane_count: active_lane_count.into(),
+			commit_lane: LaneIndex::from(
+				commit_lane.unwrap_or(0),
+			),
 			is_merge,
 			is_branch_tip,
 			is_stash,
@@ -555,22 +567,19 @@ impl GraphWalker {
 	}
 
 	/// Locates the primary lane for the current commit.
+	///
+	/// Returns `None` if `commit_alias` is `None` or no matching lane is found.
 	fn find_commit_lane(
 		current_snapshot: &[Option<LaneSlot>],
 		commit_alias: Option<CommitAlias>,
-	) -> usize {
-		let Some(target_alias) = commit_alias else {
-			return 0;
-		};
+	) -> Option<usize> {
+		let target_alias = commit_alias?;
 
-		current_snapshot
-			.iter()
-			.position(|chunk_option| {
-				chunk_option.as_ref().is_some_and(|chunk| {
-					chunk.alias() == Some(target_alias)
-				})
+		current_snapshot.iter().position(|slot| {
+			slot.as_ref().is_some_and(|chunk| {
+				chunk.alias() == Some(target_alias)
 			})
-			.unwrap_or(0)
+		})
 	}
 
 	/// Computes the span (min, max) between the commit's lane and its second parent's lane.
@@ -583,7 +592,7 @@ impl GraphWalker {
 			.iter()
 			.position(|chunk_option| {
 				chunk_option.as_ref().is_some_and(|chunk| {
-					chunk.awaits() == Some(second_parent_alias)
+					chunk.waits_for_second_parent(second_parent_alias)
 				})
 			})
 			.map(|target_lane| {
@@ -606,13 +615,13 @@ impl GraphWalker {
 		previous
 			.iter()
 			.enumerate()
-			.filter(|(index, previous_chunk)| {
-				previous_chunk.is_some()
+			.filter_map(|(index, previous_chunk)| {
+				(previous_chunk.is_some()
 					&& current_snapshot
-						.get(*index)
-						.is_none_or(Option::is_none)
+						.get(index)
+						.is_none_or(Option::is_none))
+				.then_some(index)
 			})
-			.map(|(index, _)| index)
 			.collect()
 	}
 
@@ -633,7 +642,6 @@ impl GraphWalker {
 	/// Determines the correct vertical line style for non-commit passthrough lanes.
 	fn determine_passthrough_connection(
 		chunk: &LaneSlot,
-		lane_index: usize,
 		head_alias: Option<CommitAlias>,
 	) -> Option<ConnectionType> {
 		// A settled lane draws nothing below its commit.
@@ -641,8 +649,11 @@ impl GraphWalker {
 			return None;
 		}
 
-		let is_dotted = lane_index == 0
-			&& head_alias.is_some()
+		// Dot the segment of any lane, not just lane 0, that is
+		// heading toward HEAD: HEAD is not guaranteed to sit on the
+		// leftmost lane, e.g. once earlier lanes have closed and a
+		// later one has taken their place.
+		let is_dotted = head_alias.is_some()
 			&& (chunk.awaits() == head_alias
 				|| chunk.second() == head_alias);
 

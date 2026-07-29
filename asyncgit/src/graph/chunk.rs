@@ -58,4 +58,14 @@ impl LaneSlot {
 			| Self::Reserved { .. } => None,
 		}
 	}
+
+	/// Whether this lane's [`Self::awaits`] alias is `alias` — the
+	/// parent of a `Flowing`/`FlowingMerge` lane, or the reservation
+	/// held by a `Reserved` lane.
+	pub fn waits_for_second_parent(
+		&self,
+		alias: CommitAlias,
+	) -> bool {
+		self.awaits() == Some(alias)
+	}
 }

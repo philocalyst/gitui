@@ -35,6 +35,7 @@ const CHECKPOINT_INTERVAL: usize = 100;
 /// buffer preserves ONLY the latest state PLUS the list of [`Delta`]s that
 /// produced it.
 /// Use [`Buffer::decompress`] to get the complete version.
+#[derive(Default)]
 pub struct Buffer {
 	/// Lane state after the most recently processed commit.
 	pub current: Vec<Option<LaneSlot>>,
@@ -54,23 +55,7 @@ pub struct Buffer {
 	pending_delta: Vec<DeltaOp>,
 }
 
-impl Default for Buffer {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
 impl Buffer {
-	pub const fn new() -> Self {
-		Self {
-			current: Vec::new(),
-			deltas: Vec::new(),
-			checkpoints: BTreeMap::new(),
-			merge_commits: Vec::new(),
-			pending_delta: Vec::new(),
-		}
-	}
-
 	/// Remember `alias` as a merge commit whose second parent must be
 	/// given its own lane.
 	pub fn track_merge_commit(&mut self, alias: CommitAlias) {
@@ -78,10 +63,8 @@ impl Buffer {
 	}
 
 	pub fn update(&mut self, new_chunk: &LaneSlot) {
-		// Phase 1: place the new chunk into the lane array.
 		let placement_index = self.place_chunk(new_chunk);
 
-		// Phase 2: consume the alias in all other live chunks.
 		if let Some(alias) = new_chunk.alias() {
 			self.consume_alias_in_other_chunks(
 				alias,
@@ -89,10 +72,7 @@ impl Buffer {
 			);
 		}
 
-		// Phase 3: flush any pending merge commits into new lanes.
 		self.flush_merge_commits();
-
-		// Phase 4: commit the delta and maybe checkpoint.
 		self.commit_delta();
 	}
 
@@ -141,13 +121,13 @@ impl Buffer {
 				_ => continue,
 			};
 
-			let new = match chunk {
+			let new_chunk = match chunk {
 				// The awaited parent was JUST placed. Close the lane.
 				// The pending second parent is dropped with it.
 				LaneSlot::Flowing { parent, .. }
 				| LaneSlot::FlowingMerge { parent, .. }
 				| LaneSlot::Reserved { parent }
-					if parent.get() == alias =>
+					if *parent == alias =>
 				{
 					None
 				}
@@ -157,14 +137,14 @@ impl Buffer {
 					alias: merge_alias,
 					parent,
 					second,
-				} if second.get() == alias => Some(LaneSlot::Flowing {
+				} if *second == alias => Some(LaneSlot::Flowing {
 					alias: merge_alias,
 					parent,
 				}),
 				_ => continue,
 			};
 
-			self.record_replace(index, new);
+			self.record_replace(index, new_chunk);
 		}
 	}
 
