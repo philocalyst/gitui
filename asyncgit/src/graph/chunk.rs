@@ -39,20 +39,20 @@ impl LaneSlot {
 
 	/// The parent whose placement this lane waits on; the lane stays
 	/// open (drawing a vertical line) until that commit is walked.
-	pub const fn awaits(&self) -> Option<CommitAlias> {
+	pub fn awaits(&self) -> Option<CommitAlias> {
 		match self {
 			Self::Flowing { parent, .. }
 			| Self::FlowingMerge { parent, .. }
-			| Self::Reserved { parent } => Some(parent.get()),
+			| Self::Reserved { parent } => Some(**parent),
 			Self::Settled { .. } => None,
 		}
 	}
 
 	/// The pending second parent of a merge that hasn't been given
 	/// its own lane.
-	pub const fn second(&self) -> Option<CommitAlias> {
+	pub fn second(&self) -> Option<CommitAlias> {
 		match self {
-			Self::FlowingMerge { second, .. } => Some(second.get()),
+			Self::FlowingMerge { second, .. } => Some(**second),
 			Self::Flowing { .. }
 			| Self::Settled { .. }
 			| Self::Reserved { .. } => None,
