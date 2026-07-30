@@ -49,10 +49,10 @@ pub struct Buffer {
 
 	/// Aliases of merge commits whose second parent still needs a new
 	/// lane.
-	merge_commits: Vec<CommitAlias>,
+	pub merge_commits: Vec<CommitAlias>,
 
 	/// Scratch list of the [`DeltaOp`]s recorded for processing commit
-	pending_delta: Vec<DeltaOp>,
+	pub pending_delta: Vec<DeltaOp>,
 }
 
 impl Buffer {

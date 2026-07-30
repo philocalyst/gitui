@@ -156,7 +156,7 @@ pub struct GraphWalker {
 	/// Aliases of commits already folded into the buffer; consulted
 	/// by [`Self::mint_drawable_parent`], which refuses to mint an
 	/// [`UnwalkedAlias`] for any of them.
-	processed: HashSet<CommitAlias>,
+	pub processed: HashSet<CommitAlias>,
 }
 
 impl GraphWalker {
@@ -552,9 +552,7 @@ impl GraphWalker {
 
 		GraphRow {
 			lane_count: active_lane_count.into(),
-			commit_lane: LaneIndex::from(
-				commit_lane.unwrap_or(0),
-			),
+			commit_lane: LaneIndex::from(commit_lane.unwrap_or(0)),
 			is_merge,
 			is_branch_tip,
 			is_stash,
