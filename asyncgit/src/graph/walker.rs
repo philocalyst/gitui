@@ -766,6 +766,15 @@ mod tests {
 	}
 
 	#[test]
+	fn history_with_multiple_roots() {
+		// Two independent commit chains, each terminating in its own
+		// root (a commit with no parents), STAY IN THEIR LANE!
+		let rows =
+			render(&[(1, &[2]), (2, &[]), (3, &[4]), (4, &[])]);
+		assert_eq!(rows, vec!["o", "o", "  o", "  o"]);
+	}
+
+	#[test]
 	fn simple_merge() {
 		// 1 merges 3 into the line 1 → 2 → 4, 3 → 4
 		let rows =
@@ -919,6 +928,46 @@ mod tests {
 		// row of commit 3: lane 1 is crossed by the merge bridge but
 		// keeps both its vertical glyph and its own lane color
 		let crossed = computed[2].lanes[1]
+			.expect("crossed lane should not be empty");
+		assert_eq!(crossed.0, ConnectionType::Vertical);
+		assert_eq!(crossed.1, lane_color(1));
+	}
+
+	#[test]
+	fn branch_bridge_crosses_unrelated_lane_keeps_own_color() {
+		// 5 is the fork point for both 1 and 3
+		let history: &[(usize, &[usize])] = &[
+			(1, &[5]),
+			(2, &[6]),
+			(3, &[5]),
+			(5, &[8]),
+			(6, &[8]),
+			(8, &[]),
+		];
+		let mut walker = GraphWalker::new();
+		let ids: Vec<CommitId> =
+			history.iter().map(|(c, _)| id(*c)).collect();
+		for (commit, parents) in history {
+			let parents: Vec<CommitId> =
+				parents.iter().map(|p| id(*p)).collect();
+			walker.process(id(*commit), &parents);
+		}
+		let computed = walker.compute_rows(
+			&ids,
+			0,
+			&HashSet::new(),
+			&HashSet::new(),
+			None,
+		);
+
+		assert_eq!(
+			computed.iter().map(row_to_string).collect::<Vec<_>>(),
+			vec!["o", "┃ o", "┃ ┃ o", "o━┃━┛", "┃ o", "o━┛"]
+		);
+
+		// row of commit 5: lane 1 is crossed by the branch bridge but
+		// keeps both its vertical glyph and its own lane color (visual identity mans)
+		let crossed = computed[3].lanes[1]
 			.expect("crossed lane should not be empty");
 		assert_eq!(crossed.0, ConnectionType::Vertical);
 		assert_eq!(crossed.1, lane_color(1));
