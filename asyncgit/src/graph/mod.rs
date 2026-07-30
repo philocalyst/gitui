@@ -26,13 +26,6 @@ pub struct CommitAlias(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnwalkedAlias(CommitAlias);
 
-impl UnwalkedAlias {
-	/// The underlying alias, for comparisons against walked commits.
-	pub const fn get(self) -> CommitAlias {
-		self.0
-	}
-}
-
 impl std::ops::Deref for UnwalkedAlias {
 	type Target = CommitAlias;
 	fn deref(&self) -> &CommitAlias {
