@@ -41,9 +41,9 @@ impl Directions {
 	}
 }
 
-/// The sub network of an existing connection glyph
-/// `None` represents commit markers, which are never drawn over.
-fn conn_dirs(conn: ConnectionType) -> Option<Directions> {
+/// Extract direction components from a connection glyph.
+/// Returns `None` for commit markers, which are never drawn over.
+fn connection_to_directions(conn: ConnectionType) -> Option<Directions> {
 	Some(match conn {
 		ConnectionType::Vertical | ConnectionType::VerticalDotted => {
 			Directions::UP | Directions::DOWN
@@ -81,11 +81,11 @@ fn conn_dirs(conn: ConnectionType) -> Option<Directions> {
 	})
 }
 
-/// Determine the glyph for a cell's connectivity.
+/// Synthesize a connection glyph from direction components.
 /// Vertical lines take precedence in crossed cells.
 /// Yet the horizontal bridge continues in
 /// the spacer columns either side, so we retain wholeness.
-const fn dirs_conn(dirs: Directions, dotted: bool) -> ConnectionType {
+const fn directions_to_connection(dirs: Directions, dotted: bool) -> ConnectionType {
 	let up = dirs.contains(Directions::UP);
 	let down = dirs.contains(Directions::DOWN);
 	let left = dirs.contains(Directions::LEFT);
@@ -103,7 +103,7 @@ const fn dirs_conn(dirs: Directions, dotted: bool) -> ConnectionType {
 		(false, true, false, true) => ConnectionType::MergeBridgeEnd,
 		(false, false, _, _) => ConnectionType::MergeBridgeMid,
 		(true, true, _, _)
-		| (true | false, false | true, false, false) => {
+		| (_, false | true, false, false) => {
 			if dotted {
 				ConnectionType::VerticalDotted
 			} else {
@@ -122,10 +122,10 @@ fn overlay_cell(
 	color: LaneIndex,
 ) {
 	if let Some((conn, existing_color)) = cell {
-		// `conn_dirs` returns `None` for commit markers, which must
+		// `connection_to_directions` returns `None` for commit markers, which must
 		// never be drawn over; when that happens this branch is
 		// skipped and `cell` is left untouched.
-		if let Some(existing) = conn_dirs(*conn) {
+		if let Some(existing) = connection_to_directions(*conn) {
 			let is_dotted = conn.is_dotted();
 
 			let resolved_color =
@@ -136,12 +136,12 @@ fn overlay_cell(
 				};
 
 			*cell = Some((
-				dirs_conn(existing.merge(add), is_dotted),
+				directions_to_connection(existing.merge(add), is_dotted),
 				resolved_color,
 			));
 		}
 	} else {
-		*cell = Some((dirs_conn(add, false), color));
+		*cell = Some((directions_to_connection(add, false), color));
 	}
 }
 
@@ -212,7 +212,7 @@ impl GraphWalker {
 		};
 
 		if let LaneSlot::FlowingMerge { second, .. } = &chunk {
-			let second = second.get();
+			let second = **second;
 			self.merge_parents.insert(commit_alias, second);
 
 			if !self.has_lane_to_parent(second) {
