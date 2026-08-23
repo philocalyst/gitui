@@ -43,7 +43,9 @@ impl Directions {
 
 /// Extract direction components from a connection glyph.
 /// Returns `None` for commit markers, which are never drawn over.
-fn connection_to_directions(conn: ConnectionType) -> Option<Directions> {
+fn connection_to_directions(
+	conn: ConnectionType,
+) -> Option<Directions> {
 	Some(match conn {
 		ConnectionType::Vertical | ConnectionType::VerticalDotted => {
 			Directions::UP | Directions::DOWN
@@ -85,7 +87,10 @@ fn connection_to_directions(conn: ConnectionType) -> Option<Directions> {
 /// Vertical lines take precedence in crossed cells.
 /// Yet the horizontal bridge continues in
 /// the spacer columns either side, so we retain wholeness.
-const fn directions_to_connection(dirs: Directions, dotted: bool) -> ConnectionType {
+const fn directions_to_connection(
+	dirs: Directions,
+	dotted: bool,
+) -> ConnectionType {
 	let up = dirs.contains(Directions::UP);
 	let down = dirs.contains(Directions::DOWN);
 	let left = dirs.contains(Directions::LEFT);
@@ -102,8 +107,7 @@ const fn directions_to_connection(dirs: Directions, dotted: bool) -> ConnectionT
 		}
 		(false, true, false, true) => ConnectionType::MergeBridgeEnd,
 		(false, false, _, _) => ConnectionType::MergeBridgeMid,
-		(true, true, _, _)
-		| (_, false | true, false, false) => {
+		(true, true, _, _) | (_, false | true, false, false) => {
 			if dotted {
 				ConnectionType::VerticalDotted
 			} else {
@@ -136,7 +140,10 @@ fn overlay_cell(
 				};
 
 			*cell = Some((
-				directions_to_connection(existing.merge(add), is_dotted),
+				directions_to_connection(
+					existing.merge(add),
+					is_dotted,
+				),
 				resolved_color,
 			));
 		}
