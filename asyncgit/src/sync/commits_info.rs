@@ -10,6 +10,11 @@ use crate::{
 };
 use git2::{Commit, Error, Oid};
 use scopetime::scope_time;
+use serde::{
+	de::{Deserialize, Deserializer, Error as DeError},
+	ser::Serialize,
+	Serializer,
+};
 use smallvec::SmallVec;
 use unicode_truncate::UnicodeTruncateStr;
 
@@ -73,6 +78,38 @@ impl Display for CommitId {
 		f: &mut std::fmt::Formatter<'_>,
 	) -> std::fmt::Result {
 		write!(f, "{}", self.0)
+	}
+}
+
+/// Serialize as the full lowercase hex string (the `Display`
+/// form), so persisted data stays human-inspectable.
+impl Serialize for CommitId {
+	fn serialize<S: Serializer>(
+		&self,
+		serializer: S,
+	) -> std::result::Result<S::Ok, S::Error> {
+		serializer.serialize_str(&self.to_string())
+	}
+}
+
+/// Deserialize from a full-length hex string (40 or 64 hex
+/// digits, per object format). Abbreviated prefixes are
+/// rejected — an id in persisted data is an exact identity,
+/// never a guess — and anything
+/// [`CommitId::from_str_unchecked`] rejects (non-hex, wrong
+/// length) is a deserialization error.
+impl<'de> Deserialize<'de> for CommitId {
+	fn deserialize<D: Deserializer<'de>>(
+		deserializer: D,
+	) -> std::result::Result<Self, D::Error> {
+		let text = String::deserialize(deserializer)?;
+		if text.len() != 40 && text.len() != 64 {
+			return Err(D::Error::custom(
+				"commit id must be a full-length hex \
+				 object id, not an abbreviation",
+			));
+		}
+		Self::from_str_unchecked(&text).map_err(D::Error::custom)
 	}
 }
 
@@ -368,5 +405,36 @@ mod tests {
 		);
 
 		Ok(())
+	}
+
+	/// The full hex string a `CommitId` serializes to must
+	/// deserialize back to the same id.
+	#[test]
+	fn test_serde_hex_round_trip() {
+		const HEX: &str = "d6d7d55cb6e4ba7301d6a11a657aab4211e5777e";
+		let id = CommitId::from_str_unchecked(HEX).unwrap();
+
+		let text = ron::to_string(&id).unwrap();
+		assert_eq!(text, format!("\"{HEX}\""));
+
+		let back: CommitId = ron::from_str(&text).unwrap();
+		assert_eq!(back, id);
+	}
+
+	/// Short or malformed strings must fail deserialization:
+	/// ids are never truncated or zero-filled silently.
+	#[test]
+	fn test_serde_rejects_short_strings() {
+		for bad in [
+			"d6d7d55",                                  // abbreviated
+			"",                                         // empty
+			"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // not hex
+		] {
+			assert!(
+				ron::from_str::<CommitId>(&format!("\"{bad}\""))
+					.is_err(),
+				"deserialization accepted {bad:?}"
+			);
+		}
 	}
 }

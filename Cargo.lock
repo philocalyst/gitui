@@ -141,6 +141,7 @@ dependencies = [
  "pretty_assertions",
  "rayon",
  "rayon-core",
+ "ron",
  "scopetime",
  "serde",
  "serial_test",

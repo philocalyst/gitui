@@ -36,6 +36,11 @@ pub mod policy;
 pub mod snapshot;
 pub mod todo;
 
+#[cfg(test)]
+mod diffuzz;
+#[cfg(test)]
+pub(crate) mod testutil;
+
 /// Identity of one step inside a plan.
 ///
 /// Ids are handed out by the [`plan::Plan`] and stay stable while
@@ -84,7 +89,16 @@ impl StepId {
 /// discard stale async results and lets the journal record which
 /// generation a fact was true in.
 #[derive(
-	Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord,
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	serde::Serialize,
+	serde::Deserialize,
 )]
 pub struct Generation(pub u64);
 

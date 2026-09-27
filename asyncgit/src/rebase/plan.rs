@@ -54,7 +54,15 @@ pub struct Step {
 }
 
 /// gitui annotation for a step (not part of git's todo grammar).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(
+	Clone,
+	Debug,
+	Default,
+	PartialEq,
+	Eq,
+	serde::Serialize,
+	serde::Deserialize,
+)]
 pub struct Note {
 	/// Message the user composed for a `reword`/`squash` step;
 	/// replayed through the editor bridge at run time.
@@ -63,7 +71,15 @@ pub struct Note {
 
 /// The action a step takes, for `SetAction` edits.
 /// Mirrors the pick-family instructions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	PartialEq,
+	Eq,
+	serde::Serialize,
+	serde::Deserialize,
+)]
 pub enum Action {
 	/// Apply the commit.
 	Pick,
@@ -537,6 +553,99 @@ impl Plan {
 			.collect();
 		Self { steps, next_id }
 	}
+
+	/// The journal's persistence shape (see the module docs):
+	/// the todo document bytes, the stable id of every line in
+	/// order, and the non-default notes.
+	#[must_use]
+	pub fn to_stored(&self) -> StoredPlan {
+		StoredPlan {
+			todo: self.to_todo().to_bytes(),
+			ids: self
+				.steps
+				.iter()
+				.map(|step| step.id.value())
+				.collect(),
+			notes: self
+				.steps
+				.iter()
+				.filter(|step| step.note != Note::default())
+				.map(|step| (step.id.value(), step.note.clone()))
+				.collect(),
+		}
+	}
+
+	/// Rebuild a plan from stored data: re-parse the todo
+	/// bytes and zip the ids back on by line index.
+	///
+	/// # Errors
+	///
+	/// [`Corrupt`] when the stored data cannot be trusted:
+	/// the id count does not match the document's line count,
+	/// or the reserved zero id appears. Mismatch is treated as
+	/// corruption, never papered over with fresh ids.
+	pub fn from_stored(stored: &StoredPlan) -> Result<Self, Corrupt> {
+		let todo = Todo::parse(&stored.todo);
+		let lines = todo.lines();
+		if lines.len() != stored.ids.len() {
+			return Err(Corrupt::IdCount {
+				lines: lines.len(),
+				ids: stored.ids.len(),
+			});
+		}
+		let mut steps = Vec::with_capacity(lines.len());
+		let mut next_id = StepId::FIRST;
+		for (line, raw) in lines.iter().zip(stored.ids.iter()) {
+			let id =
+				StepId::from_value(*raw).ok_or(Corrupt::ZeroId)?;
+			let note = stored
+				.notes
+				.iter()
+				.find(|(stored_id, _)| *stored_id == *raw)
+				.map_or_else(Note::default, |(_, note)| note.clone());
+			steps.push(Step {
+				id,
+				line: line.clone(),
+				note,
+			});
+			if id >= next_id {
+				next_id = id.next();
+			}
+		}
+		Ok(Self { steps, next_id })
+	}
+}
+
+/// The journal's persistence shape for a [`Plan`] (see the
+/// `plan` module docs). Serde mirror for the journal file.
+#[derive(
+	Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+pub struct StoredPlan {
+	/// The todo document bytes (the storage format).
+	pub todo: Vec<u8>,
+	/// The stable id of every line, in document order.
+	pub ids: Vec<u32>,
+	/// Annotations, only for steps whose note is not the
+	/// default: `(step id, note)`.
+	pub notes: Vec<(u32, Note)>,
+}
+
+/// Why stored plan data could not be trusted. Loading a
+/// corrupted plan lands the session in recovery; nothing is
+/// silently repaired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corrupt {
+	/// The stored id count does not match the count of lines
+	/// re-parsed from the todo bytes.
+	IdCount {
+		/// Lines re-parsed from the stored todo bytes.
+		lines: usize,
+		/// Ids stored alongside them.
+		ids: usize,
+	},
+	/// The reserved zero id appeared in stored data.
+	ZeroId,
 }
 
 /// A derived view: which steps produce one output commit.
@@ -1228,6 +1337,81 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	#[test]
+	fn stored_round_trips_documents_and_notes() {
+		// Built from parsed bytes: plans adopt documents, so
+		// the lines are canonical and byte-stable.
+		let bytes: &[u8] =
+			b"pick 1000000000000000000000000000000000000001 # one\n\
+			# x\n\
+			reword 2000000000000000000000000000000000000002 # two\n\
+			\n";
+		let p = Plan::from_todo(Todo::parse(bytes));
+		let reword_id = p.steps()[2].id;
+		let p = p
+			.apply(&Edit::SetMessage {
+				id: reword_id,
+				message: "hello".into(),
+			})
+			.unwrap();
+		let stored = p.to_stored();
+		assert_eq!(
+			stored.ids,
+			ids(&p).iter().map(|id| id.value()).collect::<Vec<_>>()
+		);
+		// Only the non-default note is stored.
+		assert_eq!(
+			stored.notes,
+			vec![(
+				reword_id.value(),
+				Note {
+					message: Some(String::from("hello"))
+				}
+			)]
+		);
+		// The document bytes survive byte-exactly.
+		assert_eq!(stored.todo, p.to_todo().to_bytes());
+		assert_eq!(Plan::from_stored(&stored).unwrap(), p);
+	}
+
+	#[test]
+	fn stored_notes_default_when_absent() {
+		let p = Plan::from_todo(Todo::parse(
+			b"pick 1000000000000000000000000000000000000001 # one\n",
+		));
+		let mut stored = p.to_stored();
+		assert!(stored.notes.is_empty());
+		// A lost note list is not corruption: steps simply
+		// have no annotation.
+		stored.notes.clear();
+		assert_eq!(Plan::from_stored(&stored).unwrap(), p);
+	}
+
+	#[test]
+	fn stored_rejects_mismatched_id_counts() {
+		let todo = Todo::from_lines(vec![pick(1)]);
+		let stored = StoredPlan {
+			todo: todo.to_bytes(),
+			ids: vec![1, 2],
+			notes: Vec::new(),
+		};
+		assert_eq!(
+			Plan::from_stored(&stored),
+			Err(Corrupt::IdCount { lines: 1, ids: 2 })
+		);
+	}
+
+	#[test]
+	fn stored_rejects_the_zero_id() {
+		let todo = Todo::from_lines(vec![pick(1)]);
+		let stored = StoredPlan {
+			todo: todo.to_bytes(),
+			ids: vec![0],
+			notes: Vec::new(),
+		};
+		assert_eq!(Plan::from_stored(&stored), Err(Corrupt::ZeroId));
 	}
 
 	/// Seeded generator for the state-machine test.
