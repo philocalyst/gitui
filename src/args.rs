@@ -22,6 +22,7 @@ const GIT_DIR_FLAG_ID: &str = "directory";
 const WATCHER_FLAG_ID: &str = "watcher";
 const KEY_BINDINGS_FLAG_ID: &str = "key_bindings";
 const KEY_SYMBOLS_FLAG_ID: &str = "key_symbols";
+const REBASE_BRIDGE_FLAG_ID: &str = "rebase_bridge";
 const DEFAULT_THEME: &str = "theme.ron";
 const DEFAULT_GIT_DIR: &str = ".";
 
@@ -189,6 +190,13 @@ fn app() -> ClapApp {
 				.long("workdir")
 				.env("GIT_WORK_TREE")
 				.num_args(1),
+		)
+		.arg(
+			Arg::new(REBASE_BRIDGE_FLAG_ID)
+				.help("Internal rebase editor bridge; invoked by gitui itself")
+				.long("rebase-bridge")
+				.num_args(0..=2)
+				.hide(true),
 		)
 }
 

@@ -104,7 +104,7 @@ use scopeguard::defer;
 use std::{
 	io::{self, Stdout},
 	panic,
-	path::Path,
+	path::{Path, PathBuf},
 	time::{Duration, Instant},
 };
 use ui::style::Theme;
@@ -159,6 +159,10 @@ macro_rules! log_eprintln {
 }
 
 fn main() -> Result<()> {
+	if std::env::args().nth(1).as_deref() == Some("--rebase-bridge") {
+		run_rebase_bridge();
+	}
+
 	let app_start = Instant::now();
 
 	let cliargs = process_cmdline()?;
@@ -218,6 +222,38 @@ fn main() -> Result<()> {
 	}
 
 	Ok(())
+}
+
+/// The hidden rebase editor-bridge subcommand: git invokes
+/// gitui as the (sequence) editor while the main gitui process
+/// runs a rebase through [`asyncgit::rebase`]. Runs before any
+/// terminal setup and never logs — git captures our output.
+///
+/// Protocol: `gitui --rebase-bridge [msg] <file>` with the
+/// bridge directory in `GITUI_REBASE_BRIDGE`. Always exits with
+/// the helper's exit code.
+fn run_rebase_bridge() {
+	let args: Vec<String> = std::env::args().skip(2).collect();
+	let (kind, file) = match args.as_slice() {
+		[file] => (
+			asyncgit::rebase::snapshot::BridgeKind::Sequence,
+			file.clone(),
+		),
+		[marker, file] if marker == "msg" => (
+			asyncgit::rebase::snapshot::BridgeKind::Message,
+			file.clone(),
+		),
+		_ => std::process::exit(1),
+	};
+	let Some(dir) =
+		std::env::var_os("GITUI_REBASE_BRIDGE").map(PathBuf::from)
+	else {
+		std::process::exit(1);
+	};
+	let file = PathBuf::from(file);
+	let code =
+		asyncgit::rebase::helper::run_with_kind(&dir, &file, kind);
+	std::process::exit(code);
 }
 
 fn run_app(

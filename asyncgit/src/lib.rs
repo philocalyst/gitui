@@ -56,6 +56,7 @@ mod progress;
 mod pull;
 mod push;
 mod push_tags;
+pub mod rebase;
 pub mod remote_progress;
 pub mod remote_tags;
 mod revlog;
