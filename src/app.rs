@@ -26,9 +26,13 @@ use crate::{
 		Action, AppTabs, InternalEvent, NeedsUpdate, Queue,
 		StackablePopupOpen,
 	},
+	rebase_service::RebaseService,
 	setup_popups,
 	strings::{self, ellipsis_trim_start, order},
-	tabs::{FilesTab, Revlog, StashList, Stashing, Status},
+	tabs::SharedBackend,
+	tabs::{
+		FilesTab, RebaseTab, Revlog, StashList, Stashing, Status,
+	},
 	try_or_popup,
 	ui::style::{SharedTheme, Theme},
 	AsyncAppNotification, AsyncNotification,
@@ -107,6 +111,8 @@ pub struct App {
 	stashing_tab: Stashing,
 	stashlist_tab: StashList,
 	files_tab: FilesTab,
+	rebase_service: Rc<RefCell<RebaseService>>,
+	rebase_tab: RebaseTab,
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -188,8 +194,15 @@ impl App {
 			}
 			2
 		} else {
-			env.options.borrow().current_tab()
+			env.options.borrow().current_tab().min(5)
 		};
+
+		let rebase_service =
+			Rc::new(RefCell::new(RebaseService::new(&env)?));
+		let rebase_tab = RebaseTab::new(
+			&env,
+			Rc::clone(&rebase_service) as SharedBackend,
+		);
 
 		let mut app = Self {
 			input,
@@ -235,6 +248,8 @@ impl App {
 			stashing_tab: Stashing::new(&env),
 			stashlist_tab: StashList::new(&env),
 			files_tab: FilesTab::new(&env, select_file),
+			rebase_service: Rc::clone(&rebase_service),
+			rebase_tab,
 			checkout_option_popup: CheckoutOptionPopup::new(&env),
 			goto_line_popup: GotoLinePopup::new(&env),
 			tab: 0,
@@ -293,6 +308,7 @@ impl App {
 				2 => self.files_tab.draw(f, chunks_main[1])?,
 				3 => self.stashing_tab.draw(f, chunks_main[1])?,
 				4 => self.stashlist_tab.draw(f, chunks_main[1])?,
+				5 => self.rebase_tab.draw(f, chunks_main[1])?,
 				_ => bail!("unknown tab"),
 			}
 		}
@@ -345,6 +361,9 @@ impl App {
 				) || key_match(
 					k,
 					self.key_config.keys.tab_stashes,
+				) || key_match(
+					k,
+					self.key_config.keys.tab_rebase,
 				) {
 					self.switch_tab(k)?;
 					NeedsUpdate::COMMANDS
@@ -411,9 +430,22 @@ impl App {
 		self.stashlist_tab.update()?;
 		self.reset_popup.update()?;
 
+		self.rebase_service.borrow_mut().refresh()?;
+		self.push_rebase_errors();
+
 		self.update_commands();
 
 		Ok(())
+	}
+
+	/// Surface asynchronously produced rebase errors exactly
+	/// once, as ordinary message popups.
+	fn push_rebase_errors(&self) {
+		for error in self.rebase_service.borrow_mut().take_errors() {
+			self.queue.push(InternalEvent::ShowErrorMsg(format!(
+				"rebase:\n{error}"
+			)));
+		}
 	}
 
 	///
@@ -424,6 +456,10 @@ impl App {
 		log::trace!("update_async: {ev:?}");
 
 		if let AsyncNotification::Git(ev) = ev {
+			if matches!(ev, AsyncGitNotification::Rebase) {
+				self.rebase_service.borrow_mut().on_worker_event()?;
+				self.push_rebase_errors();
+			}
 			self.status_tab.update_git(ev)?;
 			self.stashing_tab.update_git(ev)?;
 			self.revlog.update_git(ev)?;
@@ -477,6 +513,7 @@ impl App {
 			|| self.fetch_popup.any_work_pending()
 			|| self.revision_files_popup.any_work_pending()
 			|| self.tags_popup.any_work_pending()
+			|| self.rebase_service.borrow().is_busy()
 	}
 
 	///
@@ -601,6 +638,7 @@ impl App {
 			&mut self.files_tab,
 			&mut self.stashing_tab,
 			&mut self.stashlist_tab,
+			&mut self.rebase_tab,
 		]
 	}
 
@@ -626,6 +664,8 @@ impl App {
 			self.switch_to_tab(&AppTabs::Stashing)?;
 		} else if key_match(k, self.key_config.keys.tab_stashes) {
 			self.switch_to_tab(&AppTabs::Stashlist)?;
+		} else if key_match(k, self.key_config.keys.tab_rebase) {
+			self.switch_to_tab(&AppTabs::Rebase)?;
 		}
 
 		Ok(())
@@ -654,6 +694,7 @@ impl App {
 			AppTabs::Files => self.set_tab(2)?,
 			AppTabs::Stashing => self.set_tab(3)?,
 			AppTabs::Stashlist => self.set_tab(4)?,
+			AppTabs::Rebase => self.set_tab(5)?,
 		}
 		Ok(())
 	}
@@ -939,6 +980,45 @@ impl App {
 			InternalEvent::CheckoutOption(branch) => {
 				self.checkout_option_popup.open(branch)?;
 			}
+			InternalEvent::RebaseRewriteFrom(commit) => {
+				let parent =
+					sync::commit_parent(&self.repo.borrow(), commit);
+				if let Some(parent) = parent {
+					self.rebase_service.borrow_mut().create_draft(
+						asyncgit::rebase::engine::Base::Upstream(
+							parent,
+						),
+						false,
+					);
+					self.switch_to_tab(&AppTabs::Rebase)?;
+					flags.insert(NeedsUpdate::ALL);
+				} else {
+					self.queue.push(InternalEvent::ShowErrorMsg(
+						"cannot rewrite history from the root commit this way".to_string(),
+					));
+				}
+			}
+			InternalEvent::RebaseOnto(branch) => {
+				self.rebase_service.borrow_mut().create_draft(
+					asyncgit::rebase::engine::Base::Upstream(
+						branch.top_commit,
+					),
+					false,
+				);
+				self.switch_to_tab(&AppTabs::Rebase)?;
+				flags.insert(NeedsUpdate::ALL);
+			}
+			InternalEvent::OpenRebase => {
+				{
+					let mut service =
+						self.rebase_service.borrow_mut();
+					if !service.exists() {
+						service.adopt_existing();
+					}
+				}
+				self.switch_to_tab(&AppTabs::Rebase)?;
+				flags.insert(NeedsUpdate::ALL);
+			}
 		}
 
 		Ok(flags)
@@ -1022,7 +1102,9 @@ impl App {
 				self.status_tab.revert_pending_state();
 			}
 			Action::AbortRebase => {
-				self.status_tab.abort_rebase();
+				// Rebases abort through the workspace now; keep
+				// the confirmed action for older flows only.
+				self.rebase_service.borrow_mut().abort();
 			}
 			Action::UndoCommit => {
 				try_or_popup!(
@@ -1167,13 +1249,20 @@ impl App {
 			horizontal: 1,
 		});
 
-		let tab_labels = [
+		let mut tab_labels = vec![
 			Span::raw(strings::tab_status(&self.key_config)),
 			Span::raw(strings::tab_log(&self.key_config)),
 			Span::raw(strings::tab_files(&self.key_config)),
 			Span::raw(strings::tab_stashing(&self.key_config)),
 			Span::raw(strings::tab_stashes(&self.key_config)),
 		];
+		// The rebase workspace appears once there is anything
+		// to show: a draft, an active session, or an outcome.
+		if self.rebase_service.borrow().exists() {
+			tab_labels.push(Span::raw(strings::tab_rebase(
+				&self.key_config,
+			)));
+		}
 		let divider = strings::tab_divider(&self.key_config);
 
 		// heuristic, since tui doesn't provide a way to know

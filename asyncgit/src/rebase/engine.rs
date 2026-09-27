@@ -278,6 +278,9 @@ pub struct NativeEngine {
 	pub version: Version,
 	/// Directory git runs in (worktree, or git dir when bare).
 	workdir: PathBuf,
+	/// The repository's absolute git dir, resolved once at
+	/// construction (correct for linked worktrees).
+	git_dir: PathBuf,
 	/// The all-zero oid of this repository's object format
 	/// (create-only CAS in `update-ref`).
 	zero_oid: String,
@@ -439,18 +442,24 @@ fn prepare_child(cmd: &mut Command, workdir: &Path) {
 impl NativeEngine {
 	/// Create an engine bound to a repository and a session
 	/// directory, discovering the git executable. The
-	/// executable is probed once (`--version`, object format)
-	/// so failures surface at construction, not mid-rebase.
+	/// executable is probed once (`--version`, object format,
+	/// absolute git dir) so failures surface at construction,
+	/// not mid-rebase.
+	///
+	/// When `session` is `None`, the default session directory
+	/// `<absolute git dir>/gitui/rebase` is used (see
+	/// [`NativeEngine::session_dir`]).
 	///
 	/// The environment variable `GITUI_GIT_PATH` overrides the
 	/// executable (default: `git` from `PATH`).
 	///
 	/// # Errors
 	///
-	/// When no usable git executable exists in `PATH`.
+	/// When no usable git executable exists in `PATH`, or the
+	/// repository cannot be identified.
 	pub fn new(
 		repo: RepoPath,
-		session: std::path::PathBuf,
+		session: Option<std::path::PathBuf>,
 	) -> crate::error::Result<Self> {
 		let git = std::env::var_os("GITUI_GIT_PATH")
 			.map_or_else(|| PathBuf::from("git"), PathBuf::from);
@@ -476,6 +485,24 @@ impl NativeEngine {
 				))
 			})?;
 
+		let git_dir = {
+			let mut cmd = Command::new(&git);
+			prepare_child(&mut cmd, &workdir);
+			let out = cmd
+				.arg("rev-parse")
+				.arg("--absolute-git-dir")
+				.output()?;
+			if !out.status.success() {
+				return Err(Error::Generic(format!(
+					"git rev-parse failed: {}",
+					String::from_utf8_lossy(&out.stderr)
+				)));
+			}
+			PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+		};
+		let session = session
+			.unwrap_or_else(|| git_dir.join("gitui").join("rebase"));
+
 		// Pre-2.22 git lacks the flag; sha1 is the honest
 		// default there (CAS creation-only still holds for
 		// 40 zero digits).
@@ -498,12 +525,29 @@ impl NativeEngine {
 			git,
 			version,
 			workdir,
+			git_dir,
 			zero_oid,
 			serial: Mutex::new(()),
 			generation: AtomicU64::new(0),
 			extra_env: Vec::new(),
 			bridge_exe_override: None,
 		})
+	}
+
+	/// The repository's absolute git dir, resolved once at
+	/// construction (one `rev-parse --absolute-git-dir`;
+	/// correct for linked worktrees).
+	#[must_use]
+	pub fn git_dir(&self) -> &Path {
+		&self.git_dir
+	}
+
+	/// Where this engine's session lives (the same directory
+	/// the [`Engine::session_dir`] seam reports; engines
+	/// sharing a session directory share one bridge).
+	#[must_use]
+	pub fn session_dir(&self) -> &Path {
+		&self.session
 	}
 
 	/// Add environment variables for every child process.
@@ -1227,11 +1271,38 @@ mod tests {
 		conflicting_branch, start_opts, todo_of, two_step_branch,
 		Sandbox,
 	};
-	use crate::sync::CommitId;
+	use crate::sync::{CommitId, RepoPath};
 	use std::path::Path;
 	use std::process::Command;
 	use std::sync::Arc;
 	use std::time::Duration;
+
+	#[test]
+	fn git_dir_and_default_session_are_resolved() {
+		let s = Sandbox::new();
+		let (_a, _b, _c) = two_step_branch(&s);
+
+		let engine = super::NativeEngine::new(
+			RepoPath::Workdir {
+				gitdir: s.path().join(".git"),
+				workdir: s.path(),
+			},
+			None,
+		)
+		.unwrap();
+
+		let git_dir = s.path().join(".git").canonicalize().unwrap();
+		assert_eq!(engine.git_dir(), git_dir);
+		assert_eq!(
+			engine.session_dir(),
+			git_dir.join("gitui").join("rebase")
+		);
+		// The trait seam reports the same directory.
+		assert_eq!(
+			Engine::session_dir(&engine),
+			engine.session_dir()
+		);
+	}
 
 	#[test]
 	fn generate_todo_captures_canonical_todo() {

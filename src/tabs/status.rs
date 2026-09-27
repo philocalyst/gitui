@@ -643,22 +643,6 @@ impl Status {
 		);
 	}
 
-	pub fn abort_rebase(&self) {
-		try_or_popup!(
-			self,
-			"abort rebase",
-			sync::abort_pending_rebase(&self.repo.borrow())
-		);
-	}
-
-	fn continue_rebase(&self) {
-		try_or_popup!(
-			self,
-			"continue rebase",
-			sync::continue_pending_rebase(&self.repo.borrow())
-		);
-	}
-
 	fn commands_nav(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -936,10 +920,7 @@ impl Component for Status {
 					self.key_config.keys.rebase_branch,
 				) && self.pending_rebase()
 				{
-					self.continue_rebase();
-					self.queue.push(InternalEvent::Update(
-						NeedsUpdate::ALL,
-					));
+					self.queue.push(InternalEvent::OpenRebase);
 					Ok(EventState::Consumed)
 				} else if key_match(
 					k,

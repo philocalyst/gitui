@@ -161,6 +161,19 @@ impl Theme {
 		}
 	}
 
+	/// Applies the selection background (and selection
+	/// foreground, when enabled) to an arbitrary base style.
+	/// Lets composed styles like the rebase rail glyphs
+	/// participate in the standard selection look without new
+	/// theme roles.
+	pub const fn selected(
+		&self,
+		style: Style,
+		selected: bool,
+	) -> Style {
+		self.apply_select(style, selected)
+	}
+
 	pub fn option(&self, on: bool) -> Style {
 		if on {
 			Style::default().fg(self.diff_line_add)

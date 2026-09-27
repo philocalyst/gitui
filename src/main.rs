@@ -73,6 +73,7 @@ mod options;
 mod popup_stack;
 mod popups;
 mod queue;
+mod rebase_service;
 mod spinner;
 mod string_utils;
 mod strings;

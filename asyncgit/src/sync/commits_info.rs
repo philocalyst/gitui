@@ -218,6 +218,20 @@ pub fn get_commits_info(
 }
 
 ///
+/// The first parent of a commit; `None` for a root commit.
+/// Merge commits ignore their second parent here (a linear
+/// "rewrite from this commit" scope follows the first parent).
+#[must_use]
+pub fn commit_parent(
+	repo_path: &RepoPath,
+	commit: CommitId,
+) -> Option<CommitId> {
+	let repo = repo(repo_path).ok()?;
+	let commit = repo.find_commit(commit.get_oid()).ok()?;
+	commit.parent(0).ok().map(|p| CommitId::new(p.id()))
+}
+
+///
 pub fn get_commit_info(
 	repo_path: &RepoPath,
 	commit_id: &CommitId,

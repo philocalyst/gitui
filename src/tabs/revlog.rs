@@ -617,6 +617,20 @@ impl Component for Revlog {
 							Ok(EventState::Consumed)
 						},
 					);
+				} else if key_match(
+					k,
+					self.key_config.keys.log_rewrite_from,
+				) && !self.is_search_pending()
+				{
+					return self.selected_commit().map_or(
+						Ok(EventState::NotConsumed),
+						|id| {
+							self.queue.push(
+								InternalEvent::RebaseRewriteFrom(id),
+							);
+							Ok(EventState::Consumed)
+						},
+					);
 				} else if key_match(k, self.key_config.keys.log_find)
 					&& self.can_start_search()
 				{
@@ -660,6 +674,7 @@ impl Component for Revlog {
 		Ok(EventState::NotConsumed)
 	}
 
+	#[allow(clippy::too_many_lines)]
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -736,6 +751,11 @@ impl Component for Revlog {
 			strings::commands::log_checkout_commit(&self.key_config),
 			self.selected_commit().is_some(),
 			self.visible || force_all,
+		));
+		out.push(CommandInfo::new(
+			strings::commands::log_rewrite_from(&self.key_config),
+			self.selected_commit().is_some(),
+			(self.visible && !self.is_search_pending()) || force_all,
 		));
 
 		out.push(CommandInfo::new(

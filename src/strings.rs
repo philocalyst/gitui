@@ -91,6 +91,12 @@ pub fn tab_stashes(key_config: &SharedKeyConfig) -> String {
 		key_config.get_hint(key_config.keys.tab_stashes)
 	)
 }
+pub fn tab_rebase(key_config: &SharedKeyConfig) -> String {
+	format!(
+		"Rebase [{}]",
+		key_config.get_hint(key_config.keys.tab_rebase)
+	)
+}
 pub fn tab_divider(_key_config: &SharedKeyConfig) -> String {
 	" | ".to_string()
 }
@@ -1583,6 +1589,19 @@ pub mod commands {
 			CMD_GROUP_LOG,
 		)
 	}
+	pub fn log_rewrite_from(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Rewrite from here [{}]",
+				key_config
+					.get_hint(key_config.keys.log_rewrite_from),
+			),
+			"draft an interactive rebase of everything after this commit's parent, including it",
+			CMD_GROUP_LOG,
+		)
+	}
 	pub fn log_find_commit(
 		key_config: &SharedKeyConfig,
 	) -> CommandText {
@@ -1952,6 +1971,478 @@ pub mod commands {
 			"Go to the given line",
 			CMD_GROUP_GENERAL,
 		)
+	}
+}
+
+// rebase tab — until then nothing outside tests reaches it.
+pub mod rebase {
+	use crate::keys::SharedKeyConfig;
+	use asyncgit::rebase::policy::{Done, Phase, Stop};
+
+	static CMD_GROUP_REBASE: &str = "-- Rebase --";
+
+	/// Short label of the current phase for the context header.
+	pub fn phase_label(phase: &Phase) -> String {
+		match phase {
+			Phase::Draft => String::from("draft"),
+			Phase::Review => String::from("review"),
+			Phase::Executing => String::from("executing…"),
+			Phase::Stopped(stop) => {
+				format!("stopped: {}", stop_label(stop))
+			}
+			Phase::Restoring => String::from("restoring…"),
+			Phase::Done(done) => {
+				format!("done: {}", done_label(*done))
+			}
+			Phase::Adopted { .. } => {
+				String::from("adopted (read-only)")
+			}
+			Phase::Reconciling { .. } => String::from("reconcile"),
+			Phase::Unsupported { .. } => {
+				String::from("unsupported state")
+			}
+		}
+	}
+
+	///
+	pub fn stop_label(stop: &Stop) -> String {
+		match stop {
+			Stop::Conflicts { paths } => {
+				if paths.is_empty() {
+					String::from("conflicts resolved")
+				} else {
+					format!("conflicts ({})", paths.len())
+				}
+			}
+			Stop::Edit { .. } => String::from("edit"),
+			Stop::Break => String::from("break"),
+			Stop::BecameEmpty { .. } => {
+				String::from("commit became empty")
+			}
+			Stop::Message { .. } => String::from("message"),
+			Stop::ExecFailed { .. } => String::from("exec failed"),
+			Stop::Unknown { .. } => String::from("unknown"),
+		}
+	}
+
+	///
+	pub const fn done_label(done: Done) -> &'static str {
+		match done {
+			Done::Finished => "finished",
+			Done::Aborted => "aborted",
+			Done::Quit => "quit",
+		}
+	}
+
+	/// The one-line context header: `branch → onto · phase · progress`.
+	pub fn header(
+		branch: &str,
+		onto: &str,
+		phase: &Phase,
+		done: usize,
+		total: Option<usize>,
+	) -> String {
+		let progress = total.map_or_else(
+			|| String::from("not started"),
+			|total| format!("{done}/{total} steps"),
+		);
+		format!(
+			"{branch} → {onto} · {} · {progress}",
+			phase_label(phase)
+		)
+	}
+
+	///
+	pub fn header_no_session() -> String {
+		String::from("no rebase session")
+	}
+
+	///
+	pub fn rail_title(key_config: &SharedKeyConfig) -> String {
+		format!(
+			"Plan [{}{} move]",
+			key_config.get_hint(key_config.keys.move_up),
+			key_config.get_hint(key_config.keys.move_down),
+		)
+	}
+
+	///
+	pub fn rail_empty_hint() -> String {
+		String::from(
+			"no rebase session — start one from the Log tab (R on a commit)",
+		)
+	}
+
+	///
+	pub fn inspector_title_preview(count: usize) -> String {
+		format!("planned result · {count} commits")
+	}
+
+	///
+	pub const fn inspector_title_review() -> &'static str {
+		"review"
+	}
+
+	///
+	pub const fn inspector_title_stop() -> &'static str {
+		"stopped"
+	}
+
+	///
+	pub const fn inspector_title_outcome() -> &'static str {
+		"outcome"
+	}
+
+	///
+	pub const fn inspector_title_reconcile() -> &'static str {
+		"reconcile"
+	}
+
+	///
+	pub fn preview_folded(count: usize) -> String {
+		format!(" (+{count} folded)")
+	}
+
+	///
+	pub fn preview_dropped(label: &str) -> String {
+		format!("dropped: {label}")
+	}
+
+	///
+	pub fn review_destination(branch: &str, onto: &str) -> String {
+		format!("destination: {branch} onto {onto}")
+	}
+
+	///
+	pub fn review_counts(groups: usize, drops: usize) -> String {
+		format!("groups: {groups} · drops: {drops}")
+	}
+
+	///
+	pub const fn review_changes_pending() -> &'static str {
+		"local changes: yes — protected before start"
+	}
+
+	///
+	pub const fn review_changes_none() -> &'static str {
+		"local changes: none"
+	}
+
+	///
+	pub fn stop_conflict_path(path: &str) -> String {
+		format!("! {path}")
+	}
+
+	///
+	pub fn stop_conflicts_unresolved(count: usize) -> String {
+		format!("{count} unresolved conflict(s) — resolve in the Status tab")
+	}
+
+	///
+	pub const fn stop_conflicts_resolved() -> &'static str {
+		"all conflicts resolved — continue to proceed"
+	}
+
+	///
+	pub fn stop_edit(commit: &str) -> String {
+		format!("stopped at {commit} for amend/split")
+	}
+
+	///
+	pub const fn stop_edit_hint() -> &'static str {
+		"stage changes and continue to amend, or continue unchanged"
+	}
+
+	///
+	pub fn stop_message(file: &str) -> String {
+		format!("compose the message for {file}")
+	}
+
+	///
+	pub const fn stop_message_hint() -> &'static str {
+		"enter saves the message, esc cancels"
+	}
+
+	///
+	pub const fn stop_break() -> &'static str {
+		"deliberate stop — continue when ready"
+	}
+
+	///
+	pub fn stop_became_empty(commit: &str) -> String {
+		format!("{commit} became empty — keep it or skip it")
+	}
+
+	///
+	pub fn stop_exec_failed(command: &str) -> String {
+		format!("exec failed: {command}")
+	}
+
+	///
+	pub const fn stop_exec_unknown_exit() -> &'static str {
+		"exit status unknown (git does not record it)"
+	}
+
+	///
+	pub fn stop_unknown(note: &str) -> String {
+		format!("unrecognized stop: {note}")
+	}
+
+	///
+	pub fn outcome_label(done: Done) -> String {
+		String::from(done_label(done))
+	}
+
+	///
+	pub fn outcome_tip(tip: &str) -> String {
+		format!("new tip: {tip}")
+	}
+
+	///
+	pub const fn outcome_protection_outstanding() -> &'static str {
+		"protected local changes are still stashed"
+	}
+
+	///
+	pub const fn outcome_protection_restored() -> &'static str {
+		"protected local changes restored"
+	}
+
+	///
+	pub const fn outcome_restore_hint() -> &'static str {
+		"continue to restore the protected changes"
+	}
+
+	///
+	pub const fn outcome_close_hint() -> &'static str {
+		"enter closes the session"
+	}
+
+	///
+	pub fn reconcile_reason(reason: &str) -> String {
+		format!("divergence: {reason}")
+	}
+
+	///
+	pub const fn reconcile_no_mutation() -> &'static str {
+		"nothing will mutate until resolved"
+	}
+
+	///
+	pub fn composer_title_message() -> String {
+		String::from("message")
+	}
+
+	///
+	pub fn composer_title_note() -> String {
+		String::from("reword note")
+	}
+
+	///
+	pub const fn composer_default_msg() -> &'static str {
+		"type message.."
+	}
+
+	///
+	pub const fn exec_popup_title() -> &'static str {
+		"exec command"
+	}
+
+	///
+	pub const fn exec_popup_default_msg() -> &'static str {
+		"shell command to insert.."
+	}
+
+	/// Errors from plan/session mutations surface verbatim with this prefix.
+	pub const fn msg_action_failed() -> &'static str {
+		"rebase action failed"
+	}
+
+	pub mod commands {
+		use super::CMD_GROUP_REBASE;
+		use crate::components::CommandText;
+		use crate::keys::SharedKeyConfig;
+
+		///
+		pub fn start(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Start [{}]",
+					key_config.get_hint(key_config.keys.rebase_start)
+				),
+				"start the reviewed rebase",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn r#continue(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Continue [{}]",
+					key_config.get_hint(key_config.keys.enter)
+				),
+				"continue the stopped rebase",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn skip(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Skip [{}]",
+					key_config.get_hint(key_config.keys.rebase_skip)
+				),
+				"skip the stopped step",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn keep_empty(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Keep [{}]",
+					key_config.get_hint(key_config.keys.rebase_keep)
+				),
+				"keep the commit that became empty",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn abort(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Abort [{}]",
+					key_config.get_hint(key_config.keys.rebase_abort)
+				),
+				"abort the rebase and restore the original state",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn set_action(word: &str, hint: &str) -> CommandText {
+			CommandText::new(
+				format!("{word} [{hint}]"),
+				"change what the selected step does",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn insert_break(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Break [{}]",
+					key_config.get_hint(key_config.keys.rebase_break)
+				),
+				"insert a deliberate stop before the selection",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn insert_exec(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Exec [{}]",
+					key_config.get_hint(key_config.keys.rebase_exec)
+				),
+				"insert a shell command before the selection",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn compose(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Message [{}]",
+					key_config
+						.get_hint(key_config.keys.rebase_compose)
+				),
+				"compose the selected reword/squash message",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn undo(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Undo [{}]",
+					key_config.get_hint(key_config.keys.rebase_undo)
+				),
+				"undo the last plan edit",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn redo(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Redo [{}]",
+					key_config.get_hint(key_config.keys.rebase_redo)
+				),
+				"redo an undone plan edit",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn move_steps(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Move [{}{}]",
+					key_config.get_hint(key_config.keys.shift_up),
+					key_config.get_hint(key_config.keys.shift_down),
+				),
+				"move the selected step up or down",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn toggle_inspector(
+			key_config: &SharedKeyConfig,
+		) -> CommandText {
+			CommandText::new(
+				format!(
+					"Details [{}]",
+					key_config
+						.get_hint(key_config.keys.rebase_inspector)
+				),
+				"toggle the inspector panel",
+				CMD_GROUP_REBASE,
+			)
+		}
+
+		///
+		pub fn scroll(key_config: &SharedKeyConfig) -> CommandText {
+			CommandText::new(
+				format!(
+					"Scroll [{}{}]",
+					key_config.get_hint(key_config.keys.move_up),
+					key_config.get_hint(key_config.keys.move_down),
+				),
+				"scroll through the plan",
+				CMD_GROUP_REBASE,
+			)
+		}
 	}
 }
 

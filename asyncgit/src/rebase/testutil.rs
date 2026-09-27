@@ -208,7 +208,7 @@ impl Sandbox {
 				gitdir: self.path().join(".git"),
 				workdir: self.path(),
 			},
-			self.path().join(session),
+			Some(self.path().join(session)),
 		)
 		.unwrap()
 		.with_extra_env(self.env.clone());

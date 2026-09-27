@@ -129,6 +129,8 @@ pub enum AsyncGitNotification {
 	TreeFiles,
 	///
 	CommitFilter,
+	///
+	Rebase,
 }
 
 /// helper function to calculate the hash of an arbitrary type that implements the `Hash` trait

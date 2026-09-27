@@ -165,11 +165,7 @@ impl Component for BranchListPopup {
 				&& !selection_is_cur_branch
 				&& self.valid_selection()
 			{
-				try_or_popup!(
-					self,
-					"rebase error:",
-					self.rebase_branch()
-				);
+				self.rebase_branch();
 			} else if key_match(e, self.key_config.keys.move_right)
 				&& self.valid_selection()
 			{
@@ -361,20 +357,16 @@ impl BranchListPopup {
 		Ok(())
 	}
 
-	fn rebase_branch(&mut self) -> Result<()> {
+	fn rebase_branch(&mut self) {
 		if let Some(branch) =
 			self.branches.get(usize::from(self.selection))
 		{
-			sync::rebase_branch(
-				&self.repo.borrow(),
-				&branch.name,
-				self.get_branch_type(),
-			)?;
-
-			self.hide_and_switch_tab()?;
+			// Route through the rebase workspace: a reviewed
+			// draft, then a managed native replay.
+			self.queue
+				.push(InternalEvent::RebaseOnto(branch.clone()));
+			self.hide();
 		}
-
-		Ok(())
 	}
 
 	fn inspect_head_of_branch(&mut self) {

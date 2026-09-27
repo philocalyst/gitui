@@ -80,6 +80,7 @@ pub enum AppTabs {
 	Files,
 	Stashing,
 	Stashlist,
+	Rebase,
 }
 
 ///
@@ -164,6 +165,14 @@ pub enum InternalEvent {
 	GotoLine(usize),
 	///
 	CheckoutOption(BranchInfo),
+	/// Start drafting a rebase of everything after the
+	/// selected commit's parent, inclusive of the commit.
+	RebaseRewriteFrom(CommitId),
+	/// Start drafting a rebase of the current branch onto the
+	/// selected branch's tip.
+	RebaseOnto(BranchInfo),
+	/// Open (or create) the rebase session workspace.
+	OpenRebase,
 }
 
 /// single threaded simple queue for components to communicate with each other

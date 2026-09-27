@@ -87,6 +87,7 @@ pub struct KeysList {
 	pub log_checkout_commit: GituiKeyEvent,
 	pub log_reset_commit: GituiKeyEvent,
 	pub log_reword_commit: GituiKeyEvent,
+	pub log_rewrite_from: GituiKeyEvent,
 	pub log_find: GituiKeyEvent,
 	pub find_commit_sha: GituiKeyEvent,
 	pub commit_amend: GituiKeyEvent,
@@ -130,10 +131,30 @@ pub struct KeysList {
 	pub newline: GituiKeyEvent,
 	pub goto_line: GituiKeyEvent,
 	pub log_toggle_graph: GituiKeyEvent,
+	pub tab_rebase: GituiKeyEvent,
+	pub rebase_pick: GituiKeyEvent,
+	pub rebase_reword: GituiKeyEvent,
+	pub rebase_edit_stop: GituiKeyEvent,
+	pub rebase_squash: GituiKeyEvent,
+	pub rebase_fixup: GituiKeyEvent,
+	pub rebase_drop: GituiKeyEvent,
+	pub rebase_break: GituiKeyEvent,
+	pub rebase_exec: GituiKeyEvent,
+	pub rebase_undo: GituiKeyEvent,
+	pub rebase_redo: GituiKeyEvent,
+	pub rebase_compose: GituiKeyEvent,
+	pub rebase_start: GituiKeyEvent,
+	pub rebase_skip: GituiKeyEvent,
+	pub rebase_keep: GituiKeyEvent,
+	pub rebase_abort: GituiKeyEvent,
+	pub rebase_inspector: GituiKeyEvent,
 }
 
 #[rustfmt::skip]
 impl Default for KeysList {
+	// v1 of the rebase workspace pushed this over clippy's
+	// 100-line bar; the table is intentionally one line per key.
+	#[allow(clippy::too_many_lines)]
 	fn default() -> Self {
 		Self {
 			tab_status: GituiKeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()),
@@ -186,6 +207,7 @@ impl Default for KeysList {
 			log_checkout_commit: GituiKeyEvent { code: KeyCode::Char('S'), modifiers: KeyModifiers::SHIFT },
 			log_reset_commit: GituiKeyEvent { code: KeyCode::Char('R'), modifiers: KeyModifiers::SHIFT },
 			log_reword_commit: GituiKeyEvent { code: KeyCode::Char('r'), modifiers: KeyModifiers::empty() },
+			log_rewrite_from: GituiKeyEvent { code: KeyCode::Char('W'), modifiers: KeyModifiers::empty() },
 			log_find: GituiKeyEvent { code: KeyCode::Char('f'), modifiers: KeyModifiers::empty() },
 			find_commit_sha: GituiKeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
 			commit_amend: GituiKeyEvent::new(KeyCode::Char('a'),  KeyModifiers::CONTROL),
@@ -229,6 +251,23 @@ impl Default for KeysList {
 			newline: GituiKeyEvent::new(KeyCode::Enter,  KeyModifiers::empty()),
 			goto_line: GituiKeyEvent::new(KeyCode::Char('L'),  KeyModifiers::SHIFT),
 			log_toggle_graph: GituiKeyEvent::new(KeyCode::Char('g'),  KeyModifiers::empty()),
+			tab_rebase: GituiKeyEvent::new(KeyCode::Char('6'),  KeyModifiers::empty()),
+			rebase_pick: GituiKeyEvent::new(KeyCode::Char('p'),  KeyModifiers::empty()),
+			rebase_reword: GituiKeyEvent::new(KeyCode::Char('r'),  KeyModifiers::empty()),
+			rebase_edit_stop: GituiKeyEvent::new(KeyCode::Char('e'),  KeyModifiers::empty()),
+			rebase_squash: GituiKeyEvent::new(KeyCode::Char('s'),  KeyModifiers::empty()),
+			rebase_fixup: GituiKeyEvent::new(KeyCode::Char('f'),  KeyModifiers::empty()),
+			rebase_drop: GituiKeyEvent::new(KeyCode::Char('d'),  KeyModifiers::empty()),
+			rebase_break: GituiKeyEvent::new(KeyCode::Char('b'),  KeyModifiers::empty()),
+			rebase_exec: GituiKeyEvent::new(KeyCode::Char('x'),  KeyModifiers::empty()),
+			rebase_undo: GituiKeyEvent::new(KeyCode::Char('u'),  KeyModifiers::empty()),
+			rebase_redo: GituiKeyEvent::new(KeyCode::Char('U'),  KeyModifiers::SHIFT),
+			rebase_compose: GituiKeyEvent::new(KeyCode::Char('m'),  KeyModifiers::empty()),
+			rebase_start: GituiKeyEvent::new(KeyCode::Char('S'),  KeyModifiers::SHIFT),
+			rebase_skip: GituiKeyEvent::new(KeyCode::Char('k'),  KeyModifiers::empty()),
+			rebase_keep: GituiKeyEvent::new(KeyCode::Char('K'),  KeyModifiers::SHIFT),
+			rebase_abort: GituiKeyEvent::new(KeyCode::Char('A'),  KeyModifiers::empty()),
+			rebase_inspector: GituiKeyEvent::new(KeyCode::Char('v'),  KeyModifiers::empty()),
 		}
 	}
 }
