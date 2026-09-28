@@ -2,6 +2,23 @@
 
 Design proposal · 27 September 2026 · repository baseline `07aeddd3`
 
+> **Implementation status (post-review):** the core of this
+> design shipped in `asyncgit::rebase` (lossless todo document,
+> plans, event-sourced journal with crash reconciliation,
+> observation snapshots, native-git engine with an editor
+> bridge, one pure policy projection) and the `Rebase` workspace
+> tab (rail, inspector, composer, review gating, recovery
+> refs, stash protection). Simpler than this document in
+> places — and deliberately: the todo document *is* the storage
+> format, folds are positional like git's own, and the journal
+> *is* the undo history. The state atlas below exists as
+> executable insta fixtures (`rebase_state_*`,
+> `rebase_e2e_*`), so screenshots cannot drift from policy.
+> The difficult-states table drove the test inventory; rows
+> not yet covered there (scope/entry screens, autosquash
+> chooser, topology lens authoring, split ledger) remain
+> future work. This text is kept as the original proposal.
+
 **Make rewriting history feel like editing a visible, recoverable sequence.** The user should always be able to locate the original history, understand the intended result, identify the current stop, and see the next valid action. The same workspace must explain a clean rebase, the fifth conflict, a failed signer, and an interrupted session with incomplete metadata.
 
 This is a proposed product and engineering design, not implemented functionality. The companion [interactive state atlas](interactive-rebase-atlas.html) illustrates representative states using fictional repository data. Research observations are distinguished from design recommendations below. Research used three Luna agents covering terminal clients, desktop clients, and editor integrations/Git semantics; the repository analysis and synthesis were performed locally.
