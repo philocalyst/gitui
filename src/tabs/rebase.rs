@@ -586,7 +586,16 @@ impl RebaseTab {
 			return strings::rebase::phase_label(&policy.phase);
 		}
 		session.scope.as_ref().map_or_else(
-			strings::rebase::header_no_session,
+			// Without a pinned scope there is no branch →
+			// base story; an observed divergence still gets
+			// its phase named instead of a bare "no session".
+			|| match &policy.phase {
+				Phase::Unsupported { .. }
+				| Phase::Reconciling { .. } => {
+					strings::rebase::phase_label(&policy.phase)
+				}
+				_ => strings::rebase::header_no_session(),
+			},
 			|scope| {
 				strings::rebase::header(
 					scope.branch.as_deref().unwrap_or("detached HEAD"),
@@ -887,8 +896,9 @@ mod tests {
 	use crate::tabs::rebase_backend::RebaseBackend;
 	use asyncgit::rebase::{
 		engine::{Base, EmptyPolicy},
+		journal::Event as JournalEvent,
 		journal::Session as JSession,
-		plan::Plan,
+		plan::{Edit, Plan},
 		policy as policy_mod,
 		snapshot::{
 			BridgeKind, BridgeRequest, Change, ChangeKind, Conflict,
@@ -897,7 +907,7 @@ mod tests {
 		todo::{CommitArg, FixupMessage, Instruction, TodoLine},
 	};
 	use asyncgit::sync::CommitId;
-	use crossterm::event::KeyCode;
+	use crossterm::event::{KeyCode, KeyModifiers};
 	use insta::assert_snapshot;
 	use ratatui::{backend::TestBackend, Terminal};
 	use std::rc::Rc;
@@ -1007,59 +1017,100 @@ mod tests {
 		}
 	}
 
-	fn draft_session(lines: Vec<TodoLine>) -> JSession {
-		JSession::fold(&[
+	fn draft_events(lines: Vec<TodoLine>) -> Vec<JournalEvent> {
+		vec![
 			scope_event(),
 			asyncgit::rebase::journal::Event::PlanAdopted {
 				plan: plan_of(lines).to_stored(),
 			},
-		])
+		]
 	}
 
-	fn running_session(lines: Vec<TodoLine>) -> JSession {
-		let plan = plan_of(lines);
+	fn started_events(lines: Vec<TodoLine>) -> Vec<JournalEvent> {
+		let plan = plan_of(lines.clone());
 		let todo = plan.to_todo().to_bytes();
-		JSession::fold(&[
-			scope_event(),
-			asyncgit::rebase::journal::Event::PlanAdopted {
-				plan: plan.to_stored(),
-			},
-			asyncgit::rebase::journal::Event::Started {
-				todo,
-				base: Base::Upstream(oid(8)),
-				empty: EmptyPolicy::Stop,
-				recovery_ref: None,
-				protection: None,
-			},
-		])
+		let mut events = draft_events(lines);
+		events.push(asyncgit::rebase::journal::Event::Started {
+			todo,
+			base: Base::Upstream(oid(8)),
+			empty: EmptyPolicy::Stop,
+			recovery_ref: None,
+			protection: None,
+		});
+		events
 	}
 
-	fn finished_session(lines: Vec<TodoLine>) -> JSession {
-		let plan = plan_of(lines);
-		let todo = plan.to_todo().to_bytes();
-		JSession::fold(&[
-			scope_event(),
-			asyncgit::rebase::journal::Event::PlanAdopted {
-				plan: plan.to_stored(),
-			},
-			asyncgit::rebase::journal::Event::Started {
-				todo,
-				base: Base::Upstream(oid(8)),
-				empty: EmptyPolicy::Stop,
-				recovery_ref: None,
-				protection: None,
-			},
-			asyncgit::rebase::journal::Event::Completed {
-				tip: oid(42),
-			},
-		])
+	fn finished_events(lines: Vec<TodoLine>) -> Vec<JournalEvent> {
+		let mut events = started_events(lines);
+		events.push(asyncgit::rebase::journal::Event::Completed {
+			tip: oid(42),
+		});
+		events
 	}
 
-	/// In-memory backend over a folded session plus snapshot.
+	/// A reword step line.
+	fn reword_line(n: u64) -> TodoLine {
+		TodoLine::Instruction(Instruction::Reword {
+			word: b"reword".as_slice().into(),
+			commit: CommitArg::from_id(oid(n)),
+			after: format!(" # subject {n}").into_bytes().into(),
+		})
+	}
+
+	/// An edit-stop step line.
+	fn edit_line(n: u64) -> TodoLine {
+		TodoLine::Instruction(Instruction::Edit {
+			word: b"edit".as_slice().into(),
+			commit: CommitArg::from_id(oid(n)),
+			after: format!(" # subject {n}").into_bytes().into(),
+		})
+	}
+
+	fn raw_line(text: &str) -> TodoLine {
+		TodoLine::Raw(text.as_bytes().into())
+	}
+
+	fn break_line() -> TodoLine {
+		TodoLine::Instruction(Instruction::break_instruction())
+	}
+
+	fn exec_line(command: &str) -> TodoLine {
+		TodoLine::Instruction(
+			Instruction::exec(command.as_bytes()).unwrap(),
+		)
+	}
+
+	/// In-memory backend over a folded journal event history
+	/// plus a snapshot — the same synchronous plan/undo path
+	/// the real service takes (`Edited`/`Undo`/`Redo` events,
+	/// then a re-fold).
 	struct MockBackend {
+		events: Vec<JournalEvent>,
 		session: JSession,
 		snapshot: Snapshot,
-		busy: bool,
+		/// Simulated in-flight worker command; drives the
+		/// Executing/Restoring phase merge exactly like
+		/// `RebaseService::policy`.
+		in_flight: Option<&'static str>,
+	}
+
+	impl MockBackend {
+		fn new(
+			events: Vec<JournalEvent>,
+			snapshot: Snapshot,
+		) -> Self {
+			let session = JSession::fold(&events);
+			Self {
+				events,
+				session,
+				snapshot,
+				in_flight: None,
+			}
+		}
+
+		fn refold(&mut self) {
+			self.session = JSession::fold(&self.events);
+		}
 	}
 
 	impl RebaseBackend for MockBackend {
@@ -1068,11 +1119,27 @@ mod tests {
 		}
 
 		fn policy(&self) -> Policy {
-			policy_mod::policy(&self.session, &self.snapshot)
+			let mut projection =
+				policy_mod::policy(&self.session, &self.snapshot);
+			if self.in_flight.is_some() {
+				let restoring = self.in_flight == Some("stash apply");
+				projection.phase = match projection.phase {
+					Phase::Done(policy_mod::Done::Finished)
+						if restoring =>
+					{
+						Phase::Restoring
+					}
+					Phase::Done(_)
+					| Phase::Reconciling { .. }
+					| Phase::Unsupported { .. } => projection.phase,
+					_ => Phase::Executing,
+				};
+			}
+			projection
 		}
 
 		fn is_busy(&self) -> bool {
-			self.busy
+			self.in_flight.is_some()
 		}
 
 		fn apply_edit(&mut self, edit: Edit) -> Result<()> {
@@ -1084,16 +1151,21 @@ mod tests {
 			let next = plan
 				.apply(&edit)
 				.map_err(|err| anyhow::anyhow!("{err:?}"))?;
-			self.session.plan = Some(next);
-			self.session.edits.push(edit);
+			self.events
+				.push(JournalEvent::Edited { edit, plan: next });
+			self.refold();
 			Ok(())
 		}
 
 		fn undo(&mut self) -> Result<()> {
+			self.events.push(JournalEvent::Undo);
+			self.refold();
 			Ok(())
 		}
 
 		fn redo(&mut self) -> Result<()> {
+			self.events.push(JournalEvent::Redo);
+			self.refold();
 			Ok(())
 		}
 
@@ -1134,14 +1206,10 @@ mod tests {
 	}
 
 	fn mock_backend(
-		session: JSession,
+		events: Vec<JournalEvent>,
 		snapshot: Snapshot,
 	) -> SharedBackend {
-		Rc::new(RefCell::new(MockBackend {
-			session,
-			snapshot,
-			busy: false,
-		}))
+		Rc::new(RefCell::new(MockBackend::new(events, snapshot)))
 	}
 
 	fn draw_tab(
@@ -1155,10 +1223,590 @@ mod tests {
 		terminal.backend().clone()
 	}
 
-	fn draft_tab() -> RebaseTab {
+	/// Draw the tab plus the REAL command bar under it, fed
+	/// from the tab's own command shelf: the fixture shows
+	/// the action shelf a user would actually see (disabled
+	/// commands included).
+	fn draw_tab_with_shelf(
+		tab: &RebaseTab,
+		width: u16,
+		height: u16,
+	) -> TestBackend {
 		let env = Environment::test_env();
-		let backend = mock_backend(
-			draft_session(vec![
+		let mut cmdbar = crate::cmdbar::CommandBar::new(
+			env.theme.clone(),
+			env.key_config.clone(),
+		);
+		let mut terminal =
+			Terminal::new(TestBackend::new(width, height)).unwrap();
+		terminal
+			.draw(|f| {
+				let rows = ratatui::layout::Layout::default()
+					.direction(ratatui::layout::Direction::Vertical)
+					.constraints([
+						ratatui::layout::Constraint::Min(0),
+						ratatui::layout::Constraint::Length(1),
+					])
+					.split(f.area())
+					.to_vec();
+				tab.draw(f, rows[0]).unwrap();
+				cmdbar.refresh_width(rows[1].width);
+				let mut out = Vec::new();
+				let _blocking = tab.commands(&mut out, false);
+				cmdbar.set_cmds(out);
+				cmdbar.draw(f, rows[1]);
+			})
+			.unwrap();
+		terminal.backend().clone()
+	}
+
+	fn show(
+		events: Vec<JournalEvent>,
+		snapshot: Snapshot,
+	) -> RebaseTab {
+		let env = Environment::test_env();
+		let mut tab =
+			RebaseTab::new(&env, mock_backend(events, snapshot));
+		tab.show().unwrap();
+		tab
+	}
+
+	// ------------------------------------------------------------------
+	// the fixture gallery: one screen per difficult state of
+	// the design doc's acceptance inventory, rendered through
+	// the real tab, the real policy, and the real command bar
+	// ------------------------------------------------------------------
+
+	/// The draft rail: a fold group, a drop, a reword with a
+	/// composed note, an unknown-syntax row (validation
+	/// visible in the inspector), and a deliberate break.
+	#[test]
+	fn rebase_state_draft() {
+		let mut events = draft_events(vec![
+			pick_line(1),
+			fixup_line(2),
+			reword_line(4),
+			drop_line(3),
+			raw_line("a newer git wrote this"),
+			break_line(),
+		]);
+		// the composed note rides in as a journaled edit
+		{
+			let session = JSession::fold(&events);
+			let plan = session.plan.unwrap();
+			let id = plan
+				.steps()
+				.iter()
+				.find(|step| {
+					matches!(
+						step.line.instruction(),
+						Some(Instruction::Reword { .. })
+					)
+				})
+				.map(|step| step.id)
+				.unwrap();
+			let next = plan
+				.apply(&Edit::SetMessage {
+					id,
+					message: String::from("announce the TTL"),
+				})
+				.unwrap();
+			events.push(JournalEvent::Edited {
+				edit: Edit::SetMessage {
+					id,
+					message: String::from("announce the TTL"),
+				},
+				plan: next,
+			});
+		}
+		let tab = show(events, clean_snapshot());
+
+		assert_snapshot!(
+			"rebase_state_draft",
+			draw_tab(&tab, 100, 30)
+		);
+		assert_snapshot!(
+			"rebase_state_draft_narrow",
+			draw_tab(&tab, 40, 15)
+		);
+	}
+
+	/// An invalid draft: the first step is a fixup with
+	/// nothing to fold into. The blocker sentence is visible
+	/// in the inspector and the (disabled) Start on the
+	/// action shelf.
+	#[test]
+	fn rebase_state_draft_invalid() {
+		let events = draft_events(vec![fixup_line(1), pick_line(2)]);
+		let tab = show(events, clean_snapshot());
+
+		assert_snapshot!(
+			"rebase_state_draft_invalid",
+			draw_tab_with_shelf(&tab, 100, 30)
+		);
+	}
+
+	/// Review blocked by local changes: staged and unstaged
+	/// work needs protection before the start; the counts
+	/// render under the preview.
+	#[test]
+	fn rebase_state_review_blocked() {
+		let mut snapshot = clean_snapshot();
+		snapshot.staged = vec![change("f.txt")];
+		snapshot.worktree = vec![change("g.txt")];
+		snapshot.untracked = vec![String::from("h.txt")];
+		let tab = show(draft_events(vec![pick_line(1)]), snapshot);
+
+		assert_snapshot!(
+			"rebase_state_review_blocked",
+			draw_tab_with_shelf(&tab, 100, 30)
+		);
+	}
+
+	/// Executing: a worker command is in flight; the rail
+	/// stays visible, the inspector names the state.
+	#[test]
+	fn rebase_state_executing() {
+		let env = Environment::test_env();
+		let mut snapshot = clean_snapshot();
+		// Mid-run observation: the sequencer owns the
+		// repository, git is between stops, no marker yet.
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[],
+		));
+		let mut backend = MockBackend::new(
+			started_events(vec![pick_line(1), pick_line(2)]),
+			snapshot,
+		);
+		backend.in_flight = Some("apply todo");
+		let mut tab = RebaseTab::new(
+			&env,
+			Rc::new(RefCell::new(backend)) as SharedBackend,
+		);
+		tab.show().unwrap();
+
+		assert_snapshot!(
+			"rebase_state_executing",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Conflict stop with two work items: a content conflict
+	/// (with markers in the worktree) and a modify/delete.
+	#[test]
+	fn rebase_state_stopped_conflict() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.conflicts = vec![
+			Conflict {
+				path: String::from("f.txt"),
+				stages: [Some(oid(1)), Some(oid(2)), Some(oid(3))],
+				markers_in_worktree: true,
+			},
+			Conflict {
+				path: String::from("gone.txt"),
+				stages: [Some(oid(4)), Some(oid(5)), None],
+				markers_in_worktree: false,
+			},
+		];
+		snapshot.rebase = Some(rebase_state(
+			&format!(
+				"pick {} # subject 1\npick {} # subject 2\n",
+				hex(1),
+				hex(2)
+			),
+			&format!(
+				"pick {} # subject 3\npick {} # subject 4\n",
+				hex(3),
+				hex(4)
+			),
+			&[("stopped-sha", hex(2).as_str())],
+		));
+		let tab = show(
+			started_events(vec![
+				pick_line(1),
+				pick_line(2),
+				pick_line(3),
+				pick_line(4),
+			]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_conflict",
+			draw_tab(&tab, 100, 30)
+		);
+		assert_snapshot!(
+			"rebase_state_stopped_conflict_narrow",
+			draw_tab(&tab, 40, 15)
+		);
+	}
+
+	/// Conflict resolved: the resolutions are staged, the
+	/// unmerged entries are gone, Continue is the move.
+	#[test]
+	fn rebase_state_stopped_conflict_resolved() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.staged = vec![change("f.txt")];
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[("stopped-sha", hex(1).as_str())],
+		));
+		let tab = show(
+			started_events(vec![pick_line(1), pick_line(2)]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_conflict_resolved",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Edit stop with something staged: amend is the
+	/// primary move, continue-unchanged is hidden.
+	#[test]
+	fn rebase_state_stopped_edit() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.staged = vec![change("amend-me.txt")];
+		snapshot.rebase = Some(rebase_state(
+			&format!("edit {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[
+				("stopped-sha", hex(1).as_str()),
+				("amend", hex(1).as_str()),
+			],
+		));
+		let tab = show(
+			started_events(vec![edit_line(1), pick_line(2)]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_edit",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// A deliberate break: an intentional pause, not an
+	/// error; leaving is `continue unchanged`.
+	#[test]
+	fn rebase_state_stopped_break() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\nbreak\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[],
+		));
+		let tab = show(
+			started_events(vec![
+				pick_line(1),
+				break_line(),
+				pick_line(2),
+			]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_break",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// The commit became empty while replaying: the
+	/// keep/skip decision blocks plain continue.
+	#[test]
+	fn rebase_state_stopped_became_empty() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[("stopped-sha", hex(1).as_str())],
+		));
+		let tab = show(
+			started_events(vec![pick_line(1), pick_line(2)]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_became_empty",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// A failed exec: the command is shown verbatim with the
+	/// unknown exit status named honestly.
+	#[test]
+	fn rebase_state_stopped_exec_failed() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\nexec make test\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[("no-reschedule-failed-exec", "")],
+		));
+		let tab = show(
+			started_events(vec![
+				pick_line(1),
+				exec_line("make test"),
+				pick_line(2),
+			]),
+			snapshot,
+		);
+
+		assert_snapshot!(
+			"rebase_state_stopped_exec_failed",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Message bridge: git waits in the helper; the tab
+	/// opens the composer over the workspace.
+	#[test]
+	fn rebase_state_stopped_message() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.rebase = Some(rebase_state(
+			&format!("reword {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[("stopped-sha", hex(1).as_str())],
+		));
+		snapshot.bridge = Some(BridgeRequest {
+			kind: BridgeKind::Message,
+			file: String::from("/tmp/gitui-bridge/msg"),
+		});
+		let tab = show(
+			started_events(vec![reword_line(1), pick_line(2)]),
+			snapshot,
+		);
+		assert!(tab.composer.is_visible());
+
+		assert_snapshot!(
+			"rebase_state_stopped_message",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// An adopted external rebase: observation rows from the
+	/// sequencer files, stop classification rides along.
+	#[test]
+	fn rebase_state_adopted() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::RebaseInteractive;
+		snapshot.conflicts = vec![conflict("f.txt")];
+		snapshot.rebase = Some(rebase_state(
+			&format!("pick {} # subject 1\n", hex(1)),
+			&format!("pick {} # subject 2\n", hex(2)),
+			&[("stopped-sha", hex(1).as_str())],
+		));
+		let events = vec![scope_event(), JournalEvent::Adopted];
+		let tab = show(events, snapshot);
+
+		assert_snapshot!(
+			"rebase_state_adopted",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Reconciling: the journal says running, the repository
+	/// says clean — the divergence is named, nothing mutates.
+	#[test]
+	fn rebase_state_reconciling() {
+		let tab = show(
+			started_events(vec![pick_line(1)]),
+			clean_snapshot(),
+		);
+
+		assert_snapshot!(
+			"rebase_state_reconciling",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Unsupported: a foreign operation (merge) owns the
+	/// repository; inspection only.
+	#[test]
+	fn rebase_state_unsupported() {
+		let mut snapshot = clean_snapshot();
+		snapshot.operation = Operation::Merge;
+		let tab = show(Vec::new(), snapshot);
+
+		assert_snapshot!(
+			"rebase_state_unsupported",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Finished with protection pending: history is done,
+	/// restoring the local work is the active task.
+	#[test]
+	fn rebase_state_finished_protection() {
+		let mut events =
+			finished_events(vec![pick_line(1), fixup_line(2)]);
+		events.push(JournalEvent::Protected {
+			stash: oid(5),
+			include_untracked: true,
+		});
+		let tab = show(events, clean_snapshot());
+
+		assert_snapshot!(
+			"rebase_state_finished_protection",
+			draw_tab(&tab, 100, 30)
+		);
+		assert_snapshot!(
+			"rebase_state_finished_protection_narrow",
+			draw_tab(&tab, 40, 15)
+		);
+	}
+
+	/// Finished and restored: the clean restoration is
+	/// recorded, restore is no longer offered.
+	#[test]
+	fn rebase_state_finished_restored() {
+		let mut events =
+			finished_events(vec![pick_line(1), fixup_line(2)]);
+		events.push(JournalEvent::Protected {
+			stash: oid(5),
+			include_untracked: true,
+		});
+		events.push(JournalEvent::Restored {
+			stash: oid(5),
+			clean: true,
+		});
+		let tab = show(events, clean_snapshot());
+
+		assert_snapshot!(
+			"rebase_state_finished_restored",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	/// Aborted: the original history is back; the session
+	/// stays inspectable until closed.
+	#[test]
+	fn rebase_state_aborted() {
+		let mut events =
+			started_events(vec![pick_line(1), pick_line(2)]);
+		events.push(JournalEvent::Aborted);
+		let tab = show(events, clean_snapshot());
+
+		assert_snapshot!(
+			"rebase_state_aborted",
+			draw_tab(&tab, 100, 30)
+		);
+	}
+
+	// ------------------------------------------------------------------
+	// keyboard journey: selection, drop, move, undo, redo,
+	// composer, inspector — the focus/selection semantics of
+	// a draft editing session, in one drive
+	// ------------------------------------------------------------------
+
+	#[test]
+	fn keyboard_journey_draft_editing() {
+		let events = draft_events(vec![
+			pick_line(1),
+			pick_line(2),
+			fixup_line(3),
+			reword_line(4),
+			pick_line(5),
+		]);
+		let mut tab = show(events, clean_snapshot());
+
+		// select row 2 and drop it
+		tab.key_event(&KeyEvent::from(KeyCode::Down)).unwrap();
+		tab.key_event(&KeyEvent::from(KeyCode::Char('d'))).unwrap();
+		assert!(tab.backend.borrow().session().can_undo());
+		assert_snapshot!(
+			"rebase_journey_drop",
+			draw_tab(&tab, 80, 24)
+		);
+
+		// move the dropped row further down
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Down,
+			KeyModifiers::SHIFT,
+		))
+		.unwrap();
+		assert_snapshot!(
+			"rebase_journey_move",
+			draw_tab(&tab, 80, 24)
+		);
+
+		// undo twice: the drop is gone; redo brings it back
+		tab.key_event(&KeyEvent::from(KeyCode::Char('u'))).unwrap();
+		tab.key_event(&KeyEvent::from(KeyCode::Char('u'))).unwrap();
+		let still_dropped = tab
+			.backend
+			.borrow()
+			.session()
+			.plan
+			.clone()
+			.unwrap()
+			.steps()
+			.iter()
+			.any(|step| {
+				matches!(
+					step.line,
+					TodoLine::Instruction(Instruction::Drop { .. })
+				)
+			});
+		assert!(!still_dropped, "undo must remove the drop");
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Char('U'),
+			KeyModifiers::SHIFT,
+		))
+		.unwrap();
+		if !tab.backend.borrow().session().can_undo() {
+			let session = tab.backend.borrow().session().clone();
+			panic!(
+				"redo must restore the undone edit \
+				 (edits: {}, redoable: {})",
+				session.edits.len(),
+				session.redoable
+			);
+		}
+
+		// open the composer on the reword row and type
+		tab.key_event(&KeyEvent::from(KeyCode::Home)).unwrap();
+		for _ in 0..3 {
+			tab.key_event(&KeyEvent::from(KeyCode::Down)).unwrap();
+		}
+		tab.key_event(&KeyEvent::from(KeyCode::Char('m'))).unwrap();
+		assert!(tab.composer.is_visible());
+		tab.key_event(&KeyEvent::from(KeyCode::Char('x'))).unwrap();
+		assert_snapshot!(
+			"rebase_journey_compose",
+			draw_tab(&tab, 80, 24)
+		);
+
+		// esc cancels the composer without saving; the
+		// inspector toggles over the narrow rail
+		tab.key_event(&KeyEvent::from(KeyCode::Esc)).unwrap();
+		assert!(!tab.composer.is_visible());
+		tab.key_event(&KeyEvent::from(KeyCode::Char('v'))).unwrap();
+		assert_snapshot!(
+			"rebase_journey_inspector",
+			draw_tab(&tab, 80, 24)
+		);
+	}
+
+	// ------------------------------------------------------------------
+	// behavior tests
+	// ------------------------------------------------------------------
+
+	#[test]
+	fn draft_keys_apply_edits_through_the_backend() {
+		let mut tab = show(
+			draft_events(vec![
 				pick_line(1),
 				pick_line(2),
 				fixup_line(3),
@@ -1166,74 +1814,6 @@ mod tests {
 			]),
 			clean_snapshot(),
 		);
-		let mut tab = RebaseTab::new(&env, backend);
-		tab.show().unwrap();
-		tab
-	}
-
-	#[test]
-	fn snapshot_rebase_draft() {
-		let tab = draft_tab();
-		assert_snapshot!(
-			"rebase_draft_100x30",
-			draw_tab(&tab, 100, 30)
-		);
-	}
-
-	#[test]
-	fn snapshot_rebase_stopped_conflict() {
-		let env = Environment::test_env();
-		let session = running_session(vec![
-			pick_line(1),
-			pick_line(2),
-			pick_line(3),
-		]);
-		let mut snapshot = clean_snapshot();
-		snapshot.operation = Operation::RebaseInteractive;
-		snapshot.conflicts = vec![conflict("f.txt")];
-		snapshot.rebase = Some(rebase_state(
-			&format!("pick {} # subject 1\n", hex(1)),
-			&format!(
-				"pick {} # subject 2\npick {} # subject 3\n",
-				hex(2),
-				hex(3)
-			),
-			&[("stopped-sha", hex(1).as_str())],
-		));
-		let mut tab =
-			RebaseTab::new(&env, mock_backend(session, snapshot));
-		tab.show().unwrap();
-		// 80 columns: narrow mode — open the inspector over the
-		// rail so the conflict card is visible
-		tab.key_event(&KeyEvent::from(KeyCode::Char('v'))).unwrap();
-		assert_snapshot!(
-			"rebase_stopped_conflict_80x24",
-			draw_tab(&tab, 80, 24)
-		);
-	}
-
-	#[test]
-	fn snapshot_rebase_finished() {
-		let env = Environment::test_env();
-		let backend = mock_backend(
-			finished_session(vec![
-				pick_line(1),
-				fixup_line(2),
-				drop_line(3),
-			]),
-			clean_snapshot(),
-		);
-		let mut tab = RebaseTab::new(&env, backend);
-		tab.show().unwrap();
-		assert_snapshot!(
-			"rebase_finished_40x15",
-			draw_tab(&tab, 40, 15)
-		);
-	}
-
-	#[test]
-	fn draft_keys_apply_edits_through_the_backend() {
-		let mut tab = draft_tab();
 
 		// move selection to the second row, then drop it
 		tab.key_event(&KeyEvent::from(KeyCode::Down)).unwrap();
@@ -1252,7 +1832,8 @@ mod tests {
 
 	#[test]
 	fn narrow_mode_toggles_inspector_with_v() {
-		let tab = draft_tab();
+		let tab =
+			show(draft_events(vec![pick_line(1)]), clean_snapshot());
 		assert!(!tab.inspector_toggled);
 
 		let mut tab = tab;
@@ -1267,11 +1848,12 @@ mod tests {
 
 	#[test]
 	fn preview_groups_count_folds_and_drops() {
-		let session = draft_session(vec![
+		let events = draft_events(vec![
 			pick_line(1),
 			fixup_line(2),
 			drop_line(3),
 		]);
+		let session = JSession::fold(&events);
 		let policy = policy_mod::policy(&session, &clean_snapshot());
 		let groups =
 			crate::components::rebase::inspector::preview_groups(
@@ -1286,8 +1868,6 @@ mod tests {
 
 	#[test]
 	fn composer_opens_on_message_stop_and_esc_cancels() {
-		let env = Environment::test_env();
-		let session = running_session(vec![pick_line(1)]);
 		let mut snapshot = clean_snapshot();
 		snapshot.operation = Operation::RebaseInteractive;
 		snapshot.rebase = Some(rebase_state(
@@ -1299,18 +1879,24 @@ mod tests {
 			kind: BridgeKind::Message,
 			file: String::from("/tmp/bridge/msg"),
 		});
-		let mut tab =
-			RebaseTab::new(&env, mock_backend(session, snapshot));
-		tab.show().unwrap();
+		let tab = show(started_events(vec![pick_line(1)]), snapshot);
 		assert!(tab.composer.is_visible());
 
+		let mut tab = tab;
 		tab.key_event(&KeyEvent::from(KeyCode::Esc)).unwrap();
 		assert!(!tab.composer.is_visible());
 	}
 
 	#[test]
 	fn blocked_start_surfaces_blockers() {
-		let mut tab = draft_tab();
+		let mut tab = show(
+			draft_events(vec![
+				pick_line(1),
+				fixup_line(2),
+				drop_line(4),
+			]),
+			clean_snapshot(),
+		);
 		// 'S' starts: the draft plan has an all-dropped-free
 		// validation, so the mutation goes through the mock
 		tab.key_event(&KeyEvent::from(KeyCode::Char('S'))).unwrap();

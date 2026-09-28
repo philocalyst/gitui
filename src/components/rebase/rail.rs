@@ -108,9 +108,18 @@ pub fn rail_items(
 				.step
 				.and_then(|id| plan.and_then(|p| p.step(id)))
 				.and_then(|step| step.line.instruction())
-				.map_or("????", |instruction| {
-					action_word(Some(instruction.canonical_word()))
-				});
+				.map_or_else(
+					// No plan behind the step (adopted
+					// sessions, observation rows): the
+					// policy row carries the canonical
+					// word; raw rows carry "" → ????.
+					|| action_word(Some(row.action)),
+					|instruction| {
+						action_word(Some(
+							instruction.canonical_word(),
+						))
+					},
+				);
 			RailItem {
 				step: row.step,
 				state: row.state,
@@ -320,16 +329,21 @@ impl Rail {
 }
 
 /// Truncate to `width` display columns, marking a cut with an
-/// ellipsis.
+/// ellipsis. Control characters are sanitized first: they are
+/// unrenderable in a terminal, and zero-width boundaries are
+/// where naive truncation goes wrong (see the audit — the
+/// truncation itself is hand-rolled because the
+/// `unicode-truncate` crate panics on right-to-left text).
 #[must_use]
 pub fn truncate_ellipsis(text: &str, width: usize) -> String {
 	if width == 0 {
 		return String::new();
 	}
-	let (cut, _) = text.unicode_truncate(width);
+	let text = &crate::string_utils::sanitize_control_chars(text);
+	let cut = crate::string_utils::truncate_to_width(text, width);
 	if cut.len() < text.len() {
-		let (shortened, _) =
-			cut.unicode_truncate(width.saturating_sub(1));
+		let shortened =
+			crate::string_utils::truncate_to_width(text, width - 1);
 		format!("{shortened}{}", strings::symbol::ELLIPSIS)
 	} else {
 		String::from(cut)
@@ -467,6 +481,7 @@ mod tests {
 		Row {
 			step: Some(StepId::FIRST),
 			state: RowState::Pending,
+			action: "pick",
 			label: format!("subject {n}"),
 			short_oid: Some(oid_hex(n)[..7].to_owned()),
 			folds_into_previous: false,
@@ -508,6 +523,7 @@ mod tests {
 		let rows = vec![Row {
 			step: Some(StepId::FIRST),
 			state: RowState::Failed,
+			action: "",
 			label: String::from("future syntax"),
 			short_oid: None,
 			folds_into_previous: false,
@@ -587,5 +603,74 @@ mod tests {
 			rail.selected_step(),
 			Some(StepId::from_value(3).unwrap())
 		);
+	}
+
+	/// Hostile rendering: a thousand rows (scrolling math to
+	/// the end and back), control characters, RTL text, 300
+	/// character paths, combining marks, and degenerate
+	/// terminal sizes (down to the 1x1 TestBackend minimum).
+	/// None of these may panic or corrupt the draw.
+	#[test]
+	fn hostile_rendering_never_panics() {
+		use ratatui::{backend::TestBackend, Terminal};
+
+		fn draw(rail: &Rail, width: u16, height: u16) {
+			let mut terminal =
+				Terminal::new(TestBackend::new(width, height))
+					.unwrap();
+			terminal
+				.draw(|f| rail.draw(f, f.area()).unwrap())
+				.unwrap();
+		}
+
+		let env = Environment::test_env();
+		let mut rail = Rail::new(&env, "Plan");
+
+		// 1000 rows with adversarial labels
+		let mut long = String::from("very/long/");
+		long.extend(std::iter::repeat_n('x', 300));
+		let samples: [&str; 6] = [
+			"normal subject",
+			"ctrl \u{7}\u{1b}[31m chars",
+			"RTL \u{5d9}\u{5d5}\u{5dd} \u{633}\u{644}\u{627} mixed",
+			&long,
+			"combining e\u{301}\u{301}\u{301} marks",
+			"",
+		];
+		let items: Vec<RailItem> = (0..1000)
+			.map(|n| RailItem {
+				step: StepId::from_value(
+					u32::try_from(n).unwrap() + 1,
+				),
+				state: match n % 6 {
+					0 => RowState::Pending,
+					1 => RowState::Done,
+					2 => RowState::Current,
+					3 => RowState::Dropped,
+					4 => RowState::Stop,
+					_ => RowState::Failed,
+				},
+				word: "PICK",
+				short_oid: Some(format!("{n:07x}")),
+				label: samples[n % samples.len()].to_owned(),
+				fold: n % 3 == 2,
+			})
+			.collect();
+		rail.set_items(items);
+
+		for (width, height) in
+			[(200u16, 50u16), (80, 24), (20, 5), (2, 2), (1, 1)]
+		{
+			draw(&rail, width, height);
+		}
+		// scroll to both extremes through degenerate sizes
+		rail.move_selection(ScrollType::End);
+		draw(&rail, 1, 1);
+		draw(&rail, 20, 5);
+		rail.move_selection(ScrollType::Home);
+		draw(&rail, 20, 5);
+		rail.move_selection(ScrollType::PageDown);
+		rail.move_selection(ScrollType::PageUp);
+		draw(&rail, 200, 50);
 	}
 }

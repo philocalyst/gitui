@@ -288,13 +288,23 @@ pub struct RebaseService {
 impl RebaseService {
 	/// Create a service for the environment's repository. The
 	/// journal (and any prior session) under
-	/// `<git dir>/gitui/rebase` is loaded and folded.
+	/// `<git dir>/gitui/rebase` is loaded and folded; a rebase
+	/// found in the repository without a gitui session is
+	/// adopted read-only at construction.
 	///
 	/// # Errors
 	///
 	/// When the repository cannot be read at all, or the
 	/// worker threads cannot be spawned.
 	pub fn new(env: &Environment) -> Result<Self> {
+		// Testing seam: integration tests drive the real app
+		// (whose service construction goes through this path)
+		// with a hermetic child environment and the editor
+		// bridge shim. Set per thread before building the app.
+		#[cfg(test)]
+		if let Some((extra, bridge)) = test_harness() {
+			return Self::build(env, extra, Some(bridge));
+		}
 		Self::build(env, Vec::new(), None)
 	}
 
@@ -751,7 +761,7 @@ impl RebaseService {
 
 	/// Build the service. `extra_env` and `bridge_exe` are
 	/// testing seams mirroring the engine's own.
-	fn build(
+	pub(crate) fn build(
 		env: &Environment,
 		mut extra_env: Vec<(String, std::ffi::OsString)>,
 		bridge_exe: Option<PathBuf>,
@@ -766,9 +776,11 @@ impl RebaseService {
 		));
 		let mut engine = NativeEngine::new(repo.clone(), None)?;
 		let session = engine.session_dir().to_path_buf();
-		// Shares the session directory (and therefore the
-		// bridge) with `engine`, but owns no effects: its
-		// observations stay answerable while an exec blocks.
+		// Shares the session directory (one journal) with
+		// `engine`, but owns no effects: its observations stay
+		// answerable while an exec blocks. The editor bridge
+		// directories are per-instance (see the engine), so
+		// the observer never touches the exec bridge.
 		let mut observer = NativeEngine::new(repo, Some(session))?;
 		if let Some(exe) = bridge_exe {
 			engine = engine.with_bridge_exe(exe);
@@ -814,7 +826,7 @@ impl RebaseService {
 		// honest from the first frame.
 		let snapshot = engine.observe()?;
 
-		Ok(Self {
+		let mut service = Self {
 			session,
 			events,
 			journal,
@@ -833,7 +845,31 @@ impl RebaseService {
 			observing: false,
 			draft_rebase_merges: false,
 			errors,
-		})
+		};
+
+		// Load-on-start adoption: the repository carries a
+		// rebase this build did not start and no session of
+		// ours exists. Adopt it read-only right here so the
+		// first frame observes the external session instead
+		// of reconciling against an empty one. A sealed
+		// journal never adopts: no effects on unreadable
+		// history.
+		if service.journal.is_some()
+			&& service.session.phase == journal::Phase::Empty
+			&& service
+				.events
+				.iter()
+				.all(|event| matches!(event, Event::Schema(_)))
+		{
+			if let Some(scope) = adopt_scope(&service.snapshot) {
+				service.record_all(&[
+					Event::Created { scope },
+					Event::Adopted,
+				]);
+			}
+		}
+
+		Ok(service)
 	}
 
 	/// Spawn the exec worker.
@@ -927,6 +963,12 @@ impl RebaseService {
 	/// event: intent before effect.
 	fn record(&mut self, event: &Event) -> bool {
 		let Some(journal) = self.journal.as_mut() else {
+			// A sealed journal must refuse loudly: a silent
+			// refusal reads as success to the user.
+			self.errors.push(String::from(
+				"the rebase journal is sealed (unreadable); \
+				 the action was refused",
+			));
 			return false;
 		};
 		match journal.append(event) {
@@ -1119,8 +1161,13 @@ impl RebaseService {
 				&snapshot,
 				&mut batch,
 			),
-			Kind::Start => self
-				.start_events(code, &stderr, &snapshot, &mut batch),
+			Kind::Start => self.start_events(
+				code,
+				generated_todo.as_ref(),
+				&stderr,
+				&snapshot,
+				&mut batch,
+			),
 			Kind::Stash => self
 				.protection_events(code, stash, &stderr, &mut batch),
 			Kind::CreateRef if code != 0 => {
@@ -1203,9 +1250,17 @@ impl RebaseService {
 	/// finished (fast-forward replays complete instantly). A
 	/// start that never began leaves the session a draft and
 	/// surfaces git's reason.
+	///
+	/// `code == 0` alone does not prove anything: git exits 0
+	/// even when it bails before the editor (e.g. a read-only
+	/// git dir prints "Permission denied" and still exits 0,
+	/// and an up-to-date range skips the editor entirely).
+	/// The rebase demonstrably began when the repository says
+	/// so, or when our editor bridge actually ran.
 	fn start_events(
 		&mut self,
 		code: i32,
+		generated_todo: Option<&Todo>,
 		stderr: &[u8],
 		snapshot: &Snapshot,
 		batch: &mut Vec<Event>,
@@ -1213,9 +1268,7 @@ impl RebaseService {
 		let Some(pending) = self.pending_start.take() else {
 			return;
 		};
-		let began = code == 0
-			|| snapshot.operation.is_rebase()
-			|| snapshot.rebase.is_some();
+		let began = start_began(code, generated_todo, snapshot);
 		if !began {
 			self.errors
 				.push(one_line(stderr, "the rebase did not start"));
@@ -1298,12 +1351,7 @@ impl RebaseService {
 			return false;
 		}
 		self.pending_adopt = false;
-		let scope = snapshot.rebase.as_ref().map(|rebase| Scope {
-			branch: rebase.head_name.clone(),
-			original_tip: rebase.orig_head,
-			base: Base::Upstream(rebase.onto),
-		});
-		let Some(scope) = scope else {
+		let Some(scope) = adopt_scope(snapshot) else {
 			self.errors.push(String::from(
 				"rebase: no rebase is in progress to adopt",
 			));
@@ -1321,6 +1369,50 @@ impl RebaseService {
 	}
 }
 
+// The per-thread test harness for integration tests that
+// drive the real app: the extra child environment and the
+// editor-bridge executable handed to every engine this
+// thread constructs via [`RebaseService::new`].
+#[cfg(test)]
+thread_local! {
+	static TEST_HARNESS: std::cell::RefCell<
+		Option<(Vec<(String, std::ffi::OsString)>, PathBuf)>,
+	> = const { std::cell::RefCell::new(None) };
+}
+
+/// Read the thread's test harness, if installed.
+#[cfg(test)]
+fn test_harness(
+) -> Option<(Vec<(String, std::ffi::OsString)>, PathBuf)> {
+	TEST_HARNESS.with(|harness| harness.borrow().clone())
+}
+
+/// Install the thread's test harness (see `TEST_HARNESS`).
+#[cfg(test)]
+pub(crate) fn set_test_harness(
+	harness: Option<(Vec<(String, std::ffi::OsString)>, PathBuf)>,
+) {
+	TEST_HARNESS.with(|slot| *slot.borrow_mut() = harness);
+}
+
+/// Whether a `Start` outcome proves the rebase began.
+///
+/// `code == 0` alone does not prove anything: git exits 0
+/// even when it bails before the editor (a read-only git dir
+/// prints "Permission denied" and still exits 0) — but then
+/// the editor bridge never ran, so no todo was captured. The
+/// rebase demonstrably began when the repository says so, or
+/// when our bridge answered git's editor call.
+const fn start_began(
+	code: i32,
+	generated_todo: Option<&Todo>,
+	snapshot: &Snapshot,
+) -> bool {
+	snapshot.operation.is_rebase()
+		|| snapshot.rebase.is_some()
+		|| (code == 0 && generated_todo.is_some())
+}
+
 /// First line of a command's stderr, or a fixed fallback.
 fn one_line(stderr: &[u8], fallback: &str) -> String {
 	let text = String::from_utf8_lossy(stderr);
@@ -1330,6 +1422,22 @@ fn one_line(stderr: &[u8], fallback: &str) -> String {
 	} else {
 		String::from(line)
 	}
+}
+
+/// The adoption scope an observation implies, when it shows a
+/// rebase in progress at all. The branch label drops git's
+/// ref prefix: it renders in the context header.
+fn adopt_scope(snapshot: &Snapshot) -> Option<Scope> {
+	snapshot.rebase.as_ref().map(|rebase| Scope {
+		branch: rebase.head_name.as_ref().map(|head_name| {
+			head_name
+				.strip_prefix("refs/heads/")
+				.unwrap_or(head_name)
+				.to_owned()
+		}),
+		original_tip: rebase.orig_head,
+		base: Base::Upstream(rebase.onto),
+	})
 }
 
 #[cfg(test)]
@@ -1513,6 +1621,19 @@ done
 		) -> Output {
 			let mut cmd = Command::new("git");
 			cmd.args(args).current_dir(self.repo());
+			// other tests may probe hostile ambient
+			// repo-redirecting variables; never inherit them
+			for var in [
+				"GIT_DIR",
+				"GIT_WORK_TREE",
+				"GIT_INDEX_FILE",
+				"GIT_OBJECT_DIRECTORY",
+				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+				"GIT_COMMON_DIR",
+				"GIT_NAMESPACE",
+			] {
+				cmd.env_remove(var);
+			}
 			for (key, _) in &self.env {
 				cmd.env_remove(key);
 			}
@@ -2126,6 +2247,192 @@ done
 	// ------------------------------------------------------------------
 	// test-only wait helpers
 	// ------------------------------------------------------------------
+
+	/// The start decision must not trust `code == 0` alone:
+	/// git exits 0 when it bails before the editor (read-only
+	/// git dir prints "Permission denied", exits 0; verified
+	/// against 2.55 in the engine tests).
+	#[test]
+	fn start_began_never_trusts_a_lying_exit_code() {
+		let s = Sandbox::new();
+		let mut service = s.service();
+		// a real observation from a live repository
+		let clean = service.engine.observe().unwrap();
+		// exit 0 without a captured todo: NOT began
+		assert!(!start_began(0, None, &clean));
+		// exit 0 with the bridge's capture: began (a real run
+		// that completed instantly)
+		assert!(start_began(
+			0,
+			Some(&Todo::parse(b"noop\n")),
+			&clean
+		));
+		// the repository mid-rebase: began whatever the code
+		let mut running = clean.clone();
+		running.operation = Operation::RebaseInteractive;
+		assert!(start_began(1, None, &running));
+		// nonzero on a clean repository: never began
+		assert!(!start_began(1, None, &clean));
+	}
+
+	/// A read-only `.git` cancels the staged start sequence at
+	/// its first effect: no `Started` is ever journaled, the
+	/// draft survives, and the failure is surfaced.
+	#[test]
+	fn read_only_git_dir_cancels_the_start_sequence() {
+		let s = Sandbox::new();
+		let (a, _b, _c) = s.two_step();
+		let mut service = s.service();
+
+		service.create_draft(Base::Upstream(s.oid(&a)), false);
+		service.wait_idle(WAIT);
+		assert_eq!(service.session().phase, journal::Phase::Draft);
+
+		let git_dir = s.repo().join(".git");
+		let mut permissions =
+			fs::metadata(&git_dir).unwrap().permissions();
+		let original = permissions.clone();
+		std::os::unix::fs::PermissionsExt::set_mode(
+			&mut permissions,
+			0o555,
+		);
+		fs::set_permissions(&git_dir, permissions).unwrap();
+
+		service.start(EmptyPolicy::Stop, vec![]);
+		service.wait_idle(WAIT);
+
+		// restore before assertions that may panic
+		fs::set_permissions(&git_dir, original).unwrap();
+
+		assert_eq!(
+			service.session().phase,
+			journal::Phase::Draft,
+			"a refused start never leaves the draft"
+		);
+		assert!(!load_events(&service)
+			.iter()
+			.any(|event| matches!(event, Event::Started { .. })));
+		assert_paired(&load_events(&service));
+		assert!(!service.take_errors().is_empty());
+	}
+
+	/// An unwritable journal (here: the directory is read-only
+	/// at open time; on Linux a /dev/full journal file is the
+	/// equivalent disk-full proxy) seals the session: every
+	/// effect refuses, nothing half-records, and the surfaced
+	/// errors explain the situation. (After open, a directory
+	/// chmod cannot revoke an open fd's write access on POSIX
+	/// — the seal must happen at open or write time.)
+	#[test]
+	#[cfg(unix)]
+	fn unwritable_journal_seals_the_session() {
+		let s2 = Sandbox::new();
+		let (a2, _b2, _c2) = s2.two_step();
+		let dir = s2.repo().join(".git").join("gitui").join("rebase");
+		fs::create_dir_all(&dir).unwrap();
+		let mut permissions =
+			fs::metadata(&dir).unwrap().permissions();
+		let original = permissions.clone();
+		std::os::unix::fs::PermissionsExt::set_mode(
+			&mut permissions,
+			0o555,
+		);
+		fs::set_permissions(&dir, permissions).unwrap();
+
+		let mut service2 = s2.service();
+		assert!(
+			!service2.take_errors().is_empty(),
+			"the unreadable journal must be surfaced"
+		);
+		service2.create_draft(Base::Upstream(s2.oid(&a2)), false);
+		service2.wait_idle(WAIT);
+		fs::set_permissions(&dir, original).unwrap();
+		assert_eq!(
+			service2.session().phase,
+			journal::Phase::Empty,
+			"a sealed session records nothing"
+		);
+		assert!(
+			!service2.take_errors().is_empty(),
+			"the refusal must be explained"
+		);
+	}
+
+	/// A pathologically slow `git` (the observer's status
+	/// takes seconds) must not block the UI thread: `refresh`
+	/// returns immediately, the service stays answerable, and
+	/// the observation lands whenever git finishes. (The UI
+	/// never blocks on observe by construction — this pins
+	/// the timing.)
+	///
+	/// Ignored in the default suite: it must point the whole
+	/// process at a wrapper via `GITUI_GIT_PATH`, which would
+	/// race sibling tests' engine constructions. Run it in
+	/// isolation: `cargo test -p gitui slow_git -- --ignored`.
+	#[test]
+	#[ignore = "mutates the ambient GITUI_GIT_PATH; run isolated"]
+	fn slow_git_keeps_the_service_responsive() {
+		use std::sync::Mutex;
+		static ENV_LOCK: Mutex<()> = Mutex::new(());
+		let s = Sandbox::new();
+		let (a, _b, _c) = s.two_step();
+
+		// a git wrapper that stalls on status only
+		let wrapper_dir = s.dir.path().join("slow-bin");
+		fs::create_dir_all(&wrapper_dir).unwrap();
+		let wrapper = wrapper_dir.join("git");
+		let real_git = String::from_utf8_lossy(
+			&Command::new("which")
+				.arg("git")
+				.output()
+				.unwrap()
+				.stdout,
+		)
+		.trim()
+		.to_owned();
+		fs::write(
+			&wrapper,
+			format!(
+				"#!/bin/sh\n\
+				 if [ \"$1\" = \"status\" ]; then sleep 2; fi\n\
+				 exec {real_git} \"$@\"\n"
+			),
+		)
+		.unwrap();
+		fs::set_permissions(
+			&wrapper,
+			fs::Permissions::from_mode(0o755),
+		)
+		.unwrap();
+
+		let mut service = {
+			let _guard = ENV_LOCK.lock().unwrap();
+			std::env::set_var("GITUI_GIT_PATH", &wrapper);
+			let service = s.service();
+			std::env::remove_var("GITUI_GIT_PATH");
+			service
+		};
+
+		service.create_draft(Base::Upstream(s.oid(&a)), false);
+		service.wait_idle(WAIT);
+		assert!(service.take_errors().is_empty());
+
+		// refresh returns immediately even though the
+		// observation itself needs ~2s of git
+		let started = std::time::Instant::now();
+		service.refresh().unwrap();
+		assert!(
+			started.elapsed() < Duration::from_millis(500),
+			"refresh must not block on the observer: {:?}",
+			started.elapsed()
+		);
+		// and the service stays answerable in the meantime
+		assert!(service.session().plan.is_some());
+
+		// the slow observation still lands
+		service.wait_idle(WAIT);
+		assert!(service.take_errors().is_empty());
+	}
 
 	impl RebaseService {
 		/// Pump outcomes until no command or observation is in

@@ -2,7 +2,7 @@
 source: src/tabs/rebase.rs
 expression: "draw_tab(&tab, 40, 15)"
 ---
-"main → 0000008 · done: finished · not st"
+"main → 0000008 · done: finished · —     "
 "┌Plan [↑↓ move] 3/3────────────────────┐"
 "│✓ PICK   0000001 subject 1            █"
 "│✓ FIXUP  0000002  └ subject 2         ║"

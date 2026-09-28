@@ -715,7 +715,7 @@ fn replay_target(
 /// Canonical identity of a line, for id preservation across
 /// [`Edit::ReplaceAll`]: instructions compare by their parsed
 /// value, every other line by its bytes.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum LineKey {
 	Instruction(Instruction),
 	Comment(Box<[u8]>),
@@ -736,11 +736,61 @@ impl LineKey {
 	}
 }
 
+/// Cell budget for the dense LCS table (~16 MB as `u32`).
+/// Beyond it, alignment falls back to a linear monotone
+/// match: bounded memory and time, best-effort identity.
+const DENSE_LCS_CELL_LIMIT: usize = 4_000_000;
+
 /// Longest-common-subsequence alignment between the old steps
 /// and the new lines: for each new line, the index of the old
 /// step of identical content it inherits identity from, if any.
 /// Unmatched new lines get fresh ids; removed lines simply vanish.
+///
+/// The cost is bounded: a common prefix and suffix are matched
+/// directly, the middle runs the dense table only within
+/// [`DENSE_LCS_CELL_LIMIT`], and larger middles use a linear
+/// monotone match (first unused identical step at or after the
+/// previous match).
 fn align(old: &[Step], new: &[TodoLine]) -> Vec<Option<usize>> {
+	let mut inherited = vec![None; new.len()];
+
+	// A shared prefix (or suffix) always participates in an
+	// LCS, so matching it directly is exact, not a heuristic.
+	let max_prefix = old.len().min(new.len());
+	let mut prefix = 0;
+	while prefix < max_prefix && old[prefix].line == new[prefix] {
+		inherited[prefix] = Some(prefix);
+		prefix += 1;
+	}
+	let max_suffix = (old.len() - prefix).min(new.len() - prefix);
+	let mut suffix = 0;
+	while suffix < max_suffix
+		&& old[old.len() - 1 - suffix].line
+			== new[new.len() - 1 - suffix]
+	{
+		inherited[new.len() - 1 - suffix] =
+			Some(old.len() - 1 - suffix);
+		suffix += 1;
+	}
+
+	let old_mid = &old[prefix..old.len() - suffix];
+	let new_mid = &new[prefix..new.len() - suffix];
+	let cells = old_mid.len().saturating_mul(new_mid.len());
+	let aligned = if cells <= DENSE_LCS_CELL_LIMIT {
+		lcs_align(old_mid, new_mid)
+	} else {
+		monotone_align(old_mid, new_mid)
+	};
+	for (offset, matched) in aligned.into_iter().enumerate() {
+		inherited[prefix + offset] =
+			matched.map(|index| prefix + index);
+	}
+	inherited
+}
+
+/// The dense LCS alignment over the middle sections; returns
+/// old-middle indexes per new-middle line.
+fn lcs_align(old: &[Step], new: &[TodoLine]) -> Vec<Option<usize>> {
 	let old_keys: Vec<LineKey> =
 		old.iter().map(|s| LineKey::of(&s.line)).collect();
 	let new_keys: Vec<LineKey> =
@@ -767,6 +817,53 @@ fn align(old: &[Step], new: &[TodoLine]) -> Vec<Option<usize>> {
 		} else {
 			i += 1;
 		}
+	}
+	inherited
+}
+
+/// The linear fallback for oversized middles: every new line
+/// inherits the first not-yet-used identical old step at or
+/// after the previous match. Order-preserving, so the result
+/// is a valid (greedy) common subsequence.
+fn monotone_align(
+	old: &[Step],
+	new: &[TodoLine],
+) -> Vec<Option<usize>> {
+	let mut positions: std::collections::HashMap<
+		LineKey,
+		Vec<usize>,
+	> = std::collections::HashMap::new();
+	for (index, step) in old.iter().enumerate() {
+		positions
+			.entry(LineKey::of(&step.line))
+			.or_default()
+			.push(index);
+	}
+	let mut cursor: std::collections::HashMap<&LineKey, usize> =
+		std::collections::HashMap::new();
+	let mut inherited = Vec::with_capacity(new.len());
+	let mut floor = 0usize;
+	for line in new {
+		let key = LineKey::of(line);
+		let matched = if let Some((canonical, slots)) =
+			positions.get_key_value(&key)
+		{
+			let used = cursor.entry(canonical).or_insert(0);
+			let start = *used
+				+ slots[*used..]
+					.partition_point(|&slot| slot < floor);
+			*used = start;
+			if let Some(&slot) = slots.get(start) {
+				*used += 1;
+				floor = slot + 1;
+				Some(slot)
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		inherited.push(matched);
 	}
 	inherited
 }
@@ -1412,6 +1509,72 @@ mod tests {
 			notes: Vec::new(),
 		};
 		assert_eq!(Plan::from_stored(&stored), Err(Corrupt::ZeroId));
+	}
+
+	#[test]
+	fn replace_all_identical_megadocument_keeps_every_id() {
+		// The whole document is a shared prefix: identity is
+		// preserved without ever touching the LCS table.
+		let lines: Vec<TodoLine> = (0..6_000).map(pick).collect();
+		let p = plan(lines.clone());
+		let out = p
+			.apply(&Edit::ReplaceAll {
+				todo: Todo::from_lines(lines),
+			})
+			.unwrap();
+		let expected: Vec<StepId> = (1..=6_000)
+			.map(|value| StepId::from_value(value).unwrap())
+			.collect();
+		assert_eq!(ids(&out), expected);
+		check_invariants(&out);
+	}
+
+	#[test]
+	fn replace_all_huge_shifted_window_bounded_and_sound() {
+		// 3000x3000 identical-shaped lines shifted by 1000:
+		// above the dense-table budget, so the monotone
+		// fallback runs. Identity follows the matched window;
+		// every id stays unique and below next_id.
+		let old: Vec<TodoLine> = (0..3_000).map(pick).collect();
+		let new: Vec<TodoLine> = (1_000..4_000).map(pick).collect();
+		let p = plan(old);
+		let out = p
+			.apply(&Edit::ReplaceAll {
+				todo: Todo::from_lines(new),
+			})
+			.unwrap();
+		let kept = out
+			.steps()
+			.iter()
+			.filter(|step| step.id.value() <= 3_000)
+			.count();
+		assert_eq!(kept, 2_000, "the overlapping window keeps ids");
+		check_invariants(&out);
+	}
+
+	#[test]
+	fn replace_all_at_the_dense_budget_still_uses_lcs() {
+		// Just inside the budget: a swap of two halves (the
+		// dense LCS anchors the earliest matches).
+		let old: Vec<TodoLine> = (0..2_000).map(pick).collect();
+		let mut new: Vec<TodoLine> =
+			(1_000..2_000).map(pick).collect();
+		new.extend((0..1_000).map(pick));
+		let original = ids(&plan(old));
+		let p = plan((0..2_000).map(pick).collect());
+		let out = p
+			.apply(&Edit::ReplaceAll {
+				todo: Todo::from_lines(new),
+			})
+			.unwrap();
+		// LCS length is 1000 (one half), order-preserving.
+		let inherited = out
+			.steps()
+			.iter()
+			.filter(|step| original.contains(&step.id))
+			.count();
+		assert_eq!(inherited, 1_000);
+		check_invariants(&out);
 	}
 
 	/// Seeded generator for the state-machine test.

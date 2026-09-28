@@ -2043,7 +2043,17 @@ pub mod rebase {
 		total: Option<usize>,
 	) -> String {
 		let progress = total.map_or_else(
-			|| String::from("not started"),
+			|| {
+				String::from(match phase {
+					// Nothing is queued or running in these
+					// states; a count would only be noise.
+					Phase::Done(_)
+					| Phase::Reconciling { .. }
+					| Phase::Unsupported { .. } => "—",
+					Phase::Adopted { .. } => "observed",
+					_ => "not started",
+				})
+			},
 			|total| format!("{done}/{total} steps"),
 		);
 		format!(
@@ -2075,7 +2085,11 @@ pub mod rebase {
 
 	///
 	pub fn inspector_title_preview(count: usize) -> String {
-		format!("planned result · {count} commits")
+		if count == 1 {
+			String::from("planned result · 1 commit")
+		} else {
+			format!("planned result · {count} commits")
+		}
 	}
 
 	///
@@ -2216,6 +2230,33 @@ pub mod rebase {
 	///
 	pub const fn outcome_close_hint() -> &'static str {
 		"enter closes the session"
+	}
+
+	/// Why the reviewed start is currently refused.
+	pub fn start_blocked(reason: &str) -> String {
+		format!("! start blocked: {reason}")
+	}
+
+	/// The local-change evidence behind the protection need.
+	pub fn local_changes_counts(
+		staged: usize,
+		unstaged: usize,
+		untracked: usize,
+	) -> String {
+		format!(
+			"local changes: {staged} staged · {unstaged} unstaged \
+			 · {untracked} untracked"
+		)
+	}
+
+	///
+	pub const fn stop_adopted_observing() -> &'static str {
+		"adopted an external rebase — observing only"
+	}
+
+	///
+	pub const fn stop_adopted_mutations() -> &'static str {
+		"native continue/skip/abort stay available"
 	}
 
 	///

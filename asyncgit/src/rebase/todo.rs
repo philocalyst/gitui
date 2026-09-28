@@ -65,7 +65,7 @@ impl Default for Todo {
 }
 
 /// One physical line of the document (newline not included).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TodoLine {
 	/// A recognized instruction.
 	Instruction(Instruction),
@@ -79,7 +79,7 @@ pub enum TodoLine {
 
 /// The todo instruction set, as git defines it. Every variant
 /// keeps the source spelling of its word and arguments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Instruction {
 	/// Apply a commit.
 	Pick {
@@ -206,7 +206,7 @@ pub enum Instruction {
 }
 
 /// Message policy of a `fixup` instruction.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FixupMessage {
 	/// Keep the previous commit's message (plain `fixup`).
 	#[default]
@@ -218,7 +218,7 @@ pub enum FixupMessage {
 }
 
 /// Message source of a `merge` instruction.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MergeMessage {
 	/// Original merge commit whose message to reuse (`-C`).
 	FromCommit(CommitArg),
@@ -231,7 +231,7 @@ pub enum MergeMessage {
 /// A commit argument, stored exactly as written. Git writes
 /// abbreviated ids into todos and accepts any unambiguous
 /// prefix back; plans built by gitui carry full ids.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CommitArg(Box<[u8]>);
 
 impl CommitArg {
@@ -1436,6 +1436,52 @@ mod tests {
 		round_trip(b"pick ");
 		round_trip(b"# only a comment");
 		round_trip(b"# c\n\npick a1b2c3d4\r\n# tail");
+	}
+
+	/// Hostile bytes: NULs, lone CRs, invalid UTF-8 in every
+	/// field position, 1-byte files, only newlines, and
+	/// 100k-byte single lines. The parser must stay total,
+	/// byte-exact, and fast (the loop below is the suite-sized
+	/// distillation of a 10^5-iteration audit fuzz that found
+	/// nothing).
+	#[test]
+	fn hostile_bytes_round_trip() {
+		let cases: Vec<Vec<u8>> = vec![
+			b"x".to_vec(),
+			vec![0],
+			vec![b'\r'],
+			b"\r\n".to_vec(),
+			b"\n\n\n".to_vec(),
+			b"p \0\0\0".to_vec(),
+			b"pick \0".to_vec(),
+			b"merge -C \0 a".to_vec(),
+			b"merge a \0 b".to_vec(),
+			b"m -C \xff\xfe lbl".to_vec(),
+			b"l \0".to_vec(),
+			b"t label\x0b".to_vec(),
+			b"u refs/heads/\xff".to_vec(),
+			b"break\r\n".to_vec(),
+			b"noop\t".to_vec(),
+			b"b b b b".to_vec(),
+			b"p \xff\xfe\xfd # \xc3\x28".to_vec(),
+			b"exec \0 echo \xff\xfe hi".to_vec(),
+			b"fixup -c -C 0123456789abcdef0123456789abcdef01234567"
+				.to_vec(),
+			{
+				let mut huge = b"exec ".to_vec();
+				huge.extend(std::iter::repeat_n(b'A', 100_000));
+				huge
+			},
+			{
+				let mut huge = b"pick ".to_vec();
+				huge.extend(std::iter::repeat_n(b'f', 100_000));
+				huge
+			},
+			vec![b'\n'; 10_000],
+		];
+		for case in &cases {
+			round_trip(case);
+		}
 	}
 
 	/// A grammar-aware generator: documents built from the

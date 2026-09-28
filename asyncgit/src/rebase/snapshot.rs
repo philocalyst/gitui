@@ -611,21 +611,36 @@ fn parse_untracked(
 	Ok(())
 }
 
-/// Full hex object id; whitespace-trimmed.
+/// Full hex object id; whitespace-trimmed. Must be exactly
+/// this build's oid width (40, sha1): git never writes
+/// abbreviated ids here, and git2's parser zero-pads partial
+/// hex, which would turn garbage files into plausible oids.
+/// 64-hex names sha256 explicitly — this build cannot
+/// represent those oids at all, so the verdict says so.
 fn parse_oid(bytes: &[u8]) -> Result<CommitId, crate::error::Error> {
 	let text = std::str::from_utf8(bytes)
-		.map_err(|_| malformed("bad object id"))?;
-	CommitId::from_str_unchecked(text.trim())
+		.map_err(|_| malformed("bad object id"))?
+		.trim();
+	let all_hex = !text.is_empty()
+		&& text.bytes().all(|b| b.is_ascii_hexdigit());
+	if all_hex && text.len() == 64 {
+		return Err(malformed(
+			"object id looks like sha256, which this build \
+			 does not support",
+		));
+	}
+	if text.len() != 40 || !all_hex {
+		return Err(malformed("bad object id"));
+	}
+	CommitId::from_str_unchecked(text)
 		.map_err(|_| malformed("bad object id"))
 }
 
-/// Optional full hex object id from a sequencer file.
+/// Optional full hex object id from a sequencer file. See
+/// [`parse_oid`] for why partial hex is refused rather than
+/// zero-padded.
 fn oid_field(bytes: &[u8]) -> Option<CommitId> {
-	let text = std::str::from_utf8(bytes).ok()?.trim();
-	if text.is_empty() {
-		return None;
-	}
-	CommitId::from_str_unchecked(text).ok()
+	parse_oid(bytes).ok()
 }
 
 /// Optional decimal number from a sequencer file.
@@ -824,6 +839,16 @@ mod tests {
 			let output = Command::new("git")
 				.args(args)
 				.current_dir(repo)
+				// other tests may probe hostile ambient
+				// repo-redirecting variables; never inherit
+				// them here
+				.env_remove("GIT_DIR")
+				.env_remove("GIT_WORK_TREE")
+				.env_remove("GIT_INDEX_FILE")
+				.env_remove("GIT_OBJECT_DIRECTORY")
+				.env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+				.env_remove("GIT_COMMON_DIR")
+				.env_remove("GIT_NAMESPACE")
 				.env(
 					"GIT_CONFIG_GLOBAL",
 					self.0.path().join("config"),
@@ -1538,6 +1563,86 @@ mod tests {
 			rebase_files(&files(b"GIT_AUTHOR_NAME='a\xffb'\n"))
 				.author,
 			None
+		);
+	}
+
+	#[test]
+	fn rebase_state_garbage_oid_files_degrade() {
+		// Partial hex must not be zero-padded into plausible
+		// oids: git2's parser would, so the field parser
+		// refuses anything but full-width hex.
+		for (name, value) in [
+			("onto", "abc".to_string()),
+			("onto", "1".to_string()),
+			("orig-head", "".to_string()),
+			("stopped-sha", "0123456789abcdef".to_string()),
+			("amend", "zz".to_string()),
+		] {
+			let mut files: Vec<(&str, &[u8])> =
+				vec![("head-name", b"refs/heads/x")];
+			for (required, bytes) in [
+				("onto", OID_A.as_bytes()),
+				("orig-head", OID_A.as_bytes()),
+			] {
+				if required != name {
+					files.push((required, bytes));
+				}
+			}
+			files.push((name, value.as_bytes()));
+			let state = RebaseState::from_files(&RebaseFiles {
+				files: &files,
+			});
+			if name == "onto" || name == "orig-head" {
+				assert_eq!(state, None, "{name}={value}");
+			} else {
+				let state = state.unwrap();
+				assert_eq!(state.stopped_sha, None, "{name}");
+				assert_eq!(state.amend, None, "{name}");
+			}
+		}
+		// 64-hex names sha256, which this build cannot
+		// represent at all: refused, never padded or guessed.
+		let files: Vec<(&str, &[u8])> = vec![
+			(
+				"onto",
+				"1111111111111111111111111111111111111111111111111111111111111111"
+					.as_bytes(),
+			),
+			("orig-head", OID_A.as_bytes()),
+			("head-name", b"refs/heads/x"),
+		];
+		assert_eq!(
+			RebaseState::from_files(&RebaseFiles { files: &files }),
+			None
+		);
+	}
+
+	/// porcelain v2 `-z` never quotes: a newline inside a
+	/// path arrives raw and must survive parsing unchanged.
+	/// Also locks the sha256 verdict for `branch.oid`.
+	#[test]
+	fn status_z_paths_are_raw_bytes() {
+		let sb = Sandbox::new();
+		let dir = init_repo(&sb);
+		let weird = "we\nird.txt";
+		fs::write(dir.path().join(weird), "x\n").unwrap();
+		let (head, _, entries) =
+			parse_status(&status_bytes(&sb, dir.path())).unwrap();
+		assert!(head.is_none(), "unborn: no oid yet");
+		assert_eq!(entries.untracked, vec![weird]);
+
+		let sha = dir.path().join("sha256");
+		fs::create_dir_all(&sha).unwrap();
+		sb.git(&sha, &["init", "-q", "--object-format=sha256", "."]);
+		sb.git(&sha, &["commit", "-q", "--allow-empty", "-m", "i"]);
+		let bytes = sb.git(
+			&sha,
+			&["status", "--porcelain=v2", "--branch", "-z"],
+		);
+		let error = parse_status(&bytes).unwrap_err().to_string();
+		assert!(
+			error.contains("sha256"),
+			"expected a sha256 verdict, got: {error}"
 		);
 	}
 

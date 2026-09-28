@@ -203,27 +203,42 @@ impl Sandbox {
 	/// gitui process after a crash). Unix tests wire the
 	/// bridge shim in as the editor executable.
 	pub fn engine_at(&self, session: &str) -> NativeEngine {
-		let mut engine = NativeEngine::new(
+		self.engine_on(
 			RepoPath::Workdir {
 				gitdir: self.path().join(".git"),
 				workdir: self.path(),
 			},
-			Some(self.path().join(session)),
+			session,
 		)
-		.unwrap()
-		.with_extra_env(self.env.clone());
+	}
+
+	/// An engine bound to an arbitrary [`RepoPath`] (custom
+	/// worktrees, bare repositories) with the same hermetic
+	/// environment and bridge-shim wiring as
+	/// [`Self::engine_at`].
+	pub fn engine_on(
+		&self,
+		repo: RepoPath,
+		session: &str,
+	) -> NativeEngine {
+		let mut engine =
+			NativeEngine::new(repo, Some(self.path().join(session)))
+				.unwrap()
+				.with_extra_env(self.env.clone());
 		if cfg!(unix) {
-			let shim = self.path().join("bridge-shim.sh");
-			fs::write(&shim, BRIDGE_SHIM).unwrap();
-			fs::set_permissions(
-				&shim,
-				fs::Permissions::from_mode(0o755),
-			)
-			.unwrap();
-			engine =
-				engine.with_bridge_exe(shim.canonicalize().unwrap());
+			engine = engine.with_bridge_exe(self.bridge_shim());
 		}
 		engine
+	}
+
+	/// The editor-bridge shim double (written once per
+	/// sandbox, executable).
+	pub fn bridge_shim(&self) -> PathBuf {
+		let shim = self.path().join("bridge-shim.sh");
+		fs::write(&shim, BRIDGE_SHIM).unwrap();
+		fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+			.unwrap();
+		shim.canonicalize().unwrap()
 	}
 
 	pub fn engine(&self) -> NativeEngine {

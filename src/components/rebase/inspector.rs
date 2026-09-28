@@ -54,23 +54,28 @@ impl<'a> Out<'a> {
 		}
 	}
 
-	fn push(&mut self, text: String, style: Style) {
-		self.lines.push(Line::from(Span::styled(text, style)));
+	/// Every line passes through control-character
+	/// sanitization: labels carry repository bytes (commit
+	/// subjects, paths, exec commands) and must never inject
+	/// terminal escapes.
+	fn push(&mut self, text: &str, style: Style) {
+		let safe = crate::string_utils::sanitize_control_chars(text);
+		self.lines.push(Line::from(Span::styled(safe, style)));
 	}
 
-	fn plain(&mut self, text: String) {
+	fn plain(&mut self, text: &str) {
 		self.push(text, Style::default());
 	}
 
-	fn muted(&mut self, text: String) {
+	fn muted(&mut self, text: &str) {
 		self.push(text, self.theme.text(false, false));
 	}
 
-	fn danger(&mut self, text: String) {
+	fn danger(&mut self, text: &str) {
 		self.push(text, self.theme.text_danger());
 	}
 
-	fn loud(&mut self, text: String) {
+	fn loud(&mut self, text: &str) {
 		self.push(
 			text,
 			Style::default().add_modifier(Modifier::BOLD),
@@ -107,13 +112,17 @@ pub struct PreviewGroup {
 
 /// Derive the preview groups from rail rows (order
 /// preserved): a group head is a non-fold row; fold rows
-/// attach to it. Dropped rows render their own line.
+/// attach to it. A fold never lands on a dropped row — git
+/// folds into the nearest preceding output that survives —
+/// so the attachment search skips dropped groups.
 #[must_use]
 pub fn preview_groups(rail: &[Row]) -> Vec<PreviewGroup> {
 	let mut groups: Vec<PreviewGroup> = Vec::new();
 	for row in rail {
 		if row.folds_into_previous {
-			if let Some(head) = groups.last_mut() {
+			if let Some(head) =
+				groups.iter_mut().rev().find(|group| !group.dropped)
+			{
 				head.folded += 1;
 				continue;
 			}
@@ -188,10 +197,12 @@ pub fn build(
 			let commits =
 				groups.iter().filter(|g| !g.dropped).count();
 			build_preview(&groups, &mut out);
+			build_start_blockers(policy, snapshot, &mut out);
 			strings::rebase::inspector_title_preview(commits)
 		}
 		Variant::Review => {
 			build_review(policy, session, &mut out);
+			build_start_blockers(policy, snapshot, &mut out);
 			String::from(strings::rebase::inspector_title_review())
 		}
 		Variant::Stop => {
@@ -208,6 +219,34 @@ pub fn build(
 		}
 	};
 	(title, out.lines)
+}
+
+/// Why the start is refused right now, with the local-change
+/// evidence behind the protection blocker. Rendered under the
+/// preview so an unusable plan explains itself in place.
+fn build_start_blockers(
+	policy: &Policy,
+	snapshot: Option<&Snapshot>,
+	out: &mut Out<'_>,
+) {
+	let Availability::Disabled(blockers) = &policy.actions.start
+	else {
+		return;
+	};
+	for blocker in blockers {
+		out.danger(&strings::rebase::start_blocked(&blocker_text(
+			blocker,
+		)));
+		if matches!(blocker, Blocker::LocalChanges) {
+			if let Some(snapshot) = snapshot {
+				out.muted(&strings::rebase::local_changes_counts(
+					snapshot.staged.len(),
+					snapshot.worktree.len(),
+					snapshot.untracked.len(),
+				));
+			}
+		}
+	}
 }
 
 fn build_preview(groups: &[PreviewGroup], out: &mut Out<'_>) {
@@ -234,7 +273,7 @@ fn build_preview(groups: &[PreviewGroup], out: &mut Out<'_>) {
 		} else {
 			group.head_label.clone()
 		};
-		out.plain(format!("{glyph} {label}"));
+		out.plain(&format!("{glyph} {label}"));
 	}
 }
 
@@ -244,14 +283,14 @@ fn build_review(
 	out: &mut Out<'_>,
 ) {
 	let Some(scope) = session.scope.as_ref() else {
-		out.muted(String::from(
+		out.muted(&String::from(
 			"no scope — the draft is not pinned to a branch yet",
 		));
 		return;
 	};
 
 	let branch = scope.branch.as_deref().unwrap_or("detached HEAD");
-	out.plain(strings::rebase::review_destination(
+	out.plain(&strings::rebase::review_destination(
 		branch,
 		&base_name(scope),
 	));
@@ -259,7 +298,7 @@ fn build_review(
 	let groups = preview_groups(&policy.rail);
 	let drops = groups.iter().filter(|g| g.dropped).count();
 	let heads = groups.iter().filter(|g| !g.dropped).count();
-	out.plain(strings::rebase::review_counts(heads, drops));
+	out.plain(&strings::rebase::review_counts(heads, drops));
 
 	let local_changes = matches!(
 		&policy.actions.start,
@@ -267,11 +306,11 @@ fn build_review(
 			if blockers.contains(&Blocker::LocalChanges)
 	);
 	if local_changes {
-		out.loud(String::from(
+		out.loud(&String::from(
 			strings::rebase::review_changes_pending(),
 		));
 	} else {
-		out.plain(String::from(
+		out.plain(&String::from(
 			strings::rebase::review_changes_none(),
 		));
 	}
@@ -282,31 +321,61 @@ fn build_stop(
 	snapshot: Option<&Snapshot>,
 	out: &mut Out<'_>,
 ) {
-	let stop = match &policy.phase {
-		Phase::Stopped(stop) => stop.clone(),
-		Phase::Adopted { .. } => {
-			out.plain(String::from(
-				"adopted an external rebase — observing only",
-			));
-			return;
-		}
-		_ => {
-			out.plain(String::from(
-				"a command is running — the workspace follows",
-			));
-			return;
-		}
+	// In-flight states merged on top of the projection (see
+	// `RebaseService::policy`): the workspace follows the
+	// running command; the stop classification underneath is
+	// a mid-run artifact, not what the user waits on.
+	if matches!(policy.phase, Phase::Executing | Phase::Restoring) {
+		out.plain(&String::from(
+			"a command is running — the workspace follows",
+		));
+		return;
+	}
+
+	// An adopted session has no phase-carried stop of its
+	// own: the classified observation rides on the policy
+	// and renders here, framed by the observing note.
+	let adopted = matches!(policy.phase, Phase::Adopted { .. });
+	let Some(stop) = policy.stop.as_ref() else {
+		out.plain(&String::from(if adopted {
+			strings::rebase::stop_adopted_observing()
+		} else {
+			"a command is running — the workspace follows"
+		}));
+		return;
 	};
 
-	match &stop {
+	if adopted {
+		out.loud(&String::from(
+			strings::rebase::stop_adopted_observing(),
+		));
+	}
+
+	build_stop_card(stop, snapshot, out);
+
+	if adopted {
+		out.muted(&String::from(
+			strings::rebase::stop_adopted_mutations(),
+		));
+	}
+}
+
+/// The classified stop's own lines: what the workspace waits
+/// on, with the exact evidence (paths, commit, command).
+fn build_stop_card(
+	stop: &Stop,
+	snapshot: Option<&Snapshot>,
+	out: &mut Out<'_>,
+) {
+	match stop {
 		Stop::Conflicts { paths } => {
 			if paths.is_empty() {
-				out.loud(String::from(
+				out.loud(&String::from(
 					strings::rebase::stop_conflicts_resolved(),
 				));
 				return;
 			}
-			out.plain(strings::rebase::stop_conflicts_unresolved(
+			out.plain(&strings::rebase::stop_conflicts_unresolved(
 				paths.len(),
 			));
 			for path in paths {
@@ -325,42 +394,40 @@ fn build_stop(
 					.collect::<Vec<_>>()
 					.join("/");
 				if shapes.is_empty() {
-					out.danger(strings::rebase::stop_conflict_path(
+					out.danger(&strings::rebase::stop_conflict_path(
 						path,
 					));
 				} else {
-					out.danger(format!("! {path} ({shapes})"));
+					out.danger(&format!("! {path} ({shapes})"));
 				}
 			}
 		}
 		Stop::Edit { commit } => {
-			out.plain(strings::rebase::stop_edit(
+			out.plain(&strings::rebase::stop_edit(
 				&commit.get_short_string(),
 			));
-			out.muted(
-				String::from(strings::rebase::stop_edit_hint()),
-			);
+			out.muted(strings::rebase::stop_edit_hint());
 		}
 		Stop::Break => {
-			out.plain(String::from(strings::rebase::stop_break()));
+			out.plain(&String::from(strings::rebase::stop_break()));
 		}
 		Stop::BecameEmpty { commit } => {
-			out.plain(strings::rebase::stop_became_empty(
+			out.plain(&strings::rebase::stop_became_empty(
 				&commit.get_short_string(),
 			));
-			out.muted(String::from(
+			out.muted(&String::from(
 				"keep [K] or skip [k] to proceed",
 			));
 		}
 		Stop::Message { request } => {
-			out.plain(strings::rebase::stop_message(request));
-			out.muted(String::from(
+			out.plain(&strings::rebase::stop_message(request));
+			out.muted(&String::from(
 				strings::rebase::stop_message_hint(),
 			));
 		}
 		Stop::ExecFailed { command, code } => {
-			out.danger(strings::rebase::stop_exec_failed(command));
-			out.muted(code.map_or_else(
+			out.danger(&strings::rebase::stop_exec_failed(command));
+			out.muted(&code.map_or_else(
 				|| {
 					String::from(
 						strings::rebase::stop_exec_unknown_exit(),
@@ -370,7 +437,7 @@ fn build_stop(
 			));
 		}
 		Stop::Unknown { note } => {
-			out.plain(strings::rebase::stop_unknown(note));
+			out.plain(&strings::rebase::stop_unknown(note));
 		}
 	}
 }
@@ -384,46 +451,48 @@ fn build_outcome(
 		return;
 	};
 
-	out.loud(strings::rebase::outcome_label(done));
+	out.loud(&strings::rebase::outcome_label(done));
 
 	if let Some(Outcome::Completed(tip)) = session.outcome.as_ref() {
-		out.plain(strings::rebase::outcome_tip(
+		out.plain(&strings::rebase::outcome_tip(
 			&tip.get_short_string(),
 		));
 	}
 
 	if session.protection.is_some() {
 		if policy.actions.restore.is_enabled() {
-			out.plain(String::from(
+			out.plain(&String::from(
 				strings::rebase::outcome_protection_outstanding(),
 			));
-			out.muted(String::from(
+			out.muted(&String::from(
 				strings::rebase::outcome_restore_hint(),
 			));
 		} else {
-			out.muted(String::from(
+			out.muted(&String::from(
 				strings::rebase::outcome_protection_restored(),
 			));
 		}
 	}
 
-	out.muted(String::from(strings::rebase::outcome_close_hint()));
+	out.muted(&String::from(strings::rebase::outcome_close_hint()));
 }
 
 fn build_reconcile(policy: &Policy, out: &mut Out<'_>) {
 	match &policy.phase {
 		Phase::Reconciling { reason } => {
-			out.plain(strings::rebase::reconcile_reason(reason));
+			out.plain(&strings::rebase::reconcile_reason(reason));
 		}
 		Phase::Unsupported { operation } => {
-			out.plain(format!(
+			out.plain(&format!(
 				"the repository is in an unsupported state: \\
 				 {operation:?}"
 			));
 		}
 		_ => {}
 	}
-	out.muted(String::from(strings::rebase::reconcile_no_mutation()));
+	out.muted(
+		&String::from(strings::rebase::reconcile_no_mutation()),
+	);
 }
 
 /// Renders the prebuilt inspector content.

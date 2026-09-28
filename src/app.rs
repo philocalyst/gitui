@@ -432,6 +432,11 @@ impl App {
 
 		self.rebase_service.borrow_mut().refresh()?;
 		self.push_rebase_errors();
+		// The workspace re-derives its projection from the
+		// service, so worker outcomes (and fresh
+		// observations) reach the visible tab without a
+		// manual tab switch.
+		self.rebase_tab.reload();
 
 		self.update_commands();
 
@@ -567,7 +572,8 @@ impl App {
 			status_tab,
 			files_tab,
 			stashing_tab,
-			stashlist_tab
+			stashlist_tab,
+			rebase_tab
 		]
 	);
 

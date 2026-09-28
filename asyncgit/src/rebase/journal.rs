@@ -208,6 +208,12 @@ pub struct Session {
 	/// A command was recorded whose finish is missing.
 	pub uncertain_command: Option<String>,
 
+	/// A clean restoration of the protection was recorded:
+	/// the stash is consumed, so restoring must not be
+	/// offered again. A failed restore keeps this false
+	/// (the stash entry survives and can be retried).
+	pub protection_restored: bool,
+
 	/// The edit descriptors of the redo stack, in undo
 	/// order — the companions of `redoable` so a `Redo`
 	/// re-adds the right ledger entry. Fold-only state.
@@ -269,9 +275,13 @@ struct FoldState {
 impl FoldState {
 	fn apply(&mut self, session: &mut Session, event: &Event) {
 		match event {
-			// Recorded, nothing to fold: the schema gate
-			// ran at load; a restoration is a fact whose
-			// protection stays in force.
+			// Recorded, nothing to fold — except a clean
+			// restoration, which marks the protection
+			// consumed (a failed one leaves it in force:
+			// the stash entry survived).
+			Event::Restored { clean: true, .. } => {
+				session.protection_restored = true;
+			}
 			Event::Schema(_) | Event::Restored { .. } => {}
 			Event::Created { scope } => {
 				session.scope = Some(scope.clone());
@@ -532,7 +542,7 @@ pub fn reconcile(
 }
 
 /// The session file name under the session directory.
-const JOURNAL_FILE: &str = "journal.ron";
+pub const JOURNAL_FILE: &str = "journal.ron";
 
 /// The schema version this build writes. Loads accept this
 /// version and any lower one.
@@ -641,8 +651,14 @@ impl Journal {
 			.map_err(|error| {
 				JournalError::Format(error.to_string())
 			})?;
-		self.file.write_all(line.as_bytes())?;
-		self.file.write_all(b"\n")?;
+		// One write: with O_APPEND each write(2) is placed
+		// atomically, so a concurrent appender (a second
+		// gitui on the same session) can never interleave
+		// mid-line and tear both journals.
+		let mut bytes = String::with_capacity(line.len() + 1);
+		bytes.push_str(&line);
+		bytes.push('\n');
+		self.file.write_all(bytes.as_bytes())?;
 		self.file.flush()?;
 		self.file.sync_data()?;
 		Ok(())
@@ -1301,6 +1317,115 @@ mod tests {
 			Journal::open(dir.path()),
 			Err(JournalError::Corrupt)
 		));
+	}
+
+	/// Hostile on-disk shapes and impossible event orders:
+	/// loading stays total, every verdict is one of the
+	/// documented errors, folding never panics. (The 10 MB
+	/// single line below is the suite-sized proof that a huge
+	/// journal line neither hangs nor panics the RON decoder.)
+	#[test]
+	fn hostile_journal_shapes_and_orders() {
+		let dir = TempDir::new().unwrap();
+		let path = dir.path().join(JOURNAL_FILE);
+
+		// the journal file is a directory: a clean Io error
+		fs::create_dir_all(&path).unwrap();
+		assert!(matches!(
+			Journal::open(dir.path()),
+			Err(JournalError::Io(_))
+		));
+		fs::remove_dir(&path).unwrap();
+
+		// 0-byte file: opens, no events
+		fs::write(&path, b"").unwrap();
+		let loaded = Journal::open(dir.path()).unwrap();
+		assert!(loaded.events.is_empty());
+		assert!(!loaded.truncated_tail);
+		drop(loaded.journal);
+
+		// 1-byte file: a torn tail
+		fs::write(&path, b"x").unwrap();
+		let loaded = Journal::open(dir.path()).unwrap();
+		assert!(loaded.truncated_tail);
+		assert!(loaded.events.is_empty());
+		drop(loaded.journal);
+
+		// duplicate schema with a following event: mid-file
+		// damage is a hard error, not a dropped tail
+		let dup = TempDir::new().unwrap();
+		let mut journal = Journal::open(dup.path()).unwrap();
+		journal.journal.append(&Event::Schema(1)).unwrap();
+		journal.journal.append(&Event::Schema(1)).unwrap();
+		journal
+			.journal
+			.append(&Event::Command {
+				intent: String::from("after"),
+			})
+			.unwrap();
+		drop(journal.journal);
+		assert!(matches!(
+			Journal::open(dup.path()),
+			Err(JournalError::Corrupt)
+		));
+
+		// impossible orders: the fold is total, the last
+		// `Started` wins, trailing unfinished intents stay
+		// honestly uncertain
+		let oid = oid(1);
+		let started = |todo: &[u8]| Event::Started {
+			todo: todo.to_vec(),
+			base: Base::Upstream(oid),
+			empty: EmptyPolicy::Stop,
+			recovery_ref: None,
+			protection: None,
+		};
+		let trailing_intent = Session::fold(&[
+			Event::Finished {
+				code: 0,
+				head: Some(oid),
+				generation: Generation(0),
+			},
+			Event::Command {
+				intent: String::from("later"),
+			},
+		]);
+		assert_eq!(
+			trailing_intent.uncertain_command.as_deref(),
+			Some("later")
+		);
+		let last_wins = Session::fold(&[
+			started(b"a"),
+			Event::Started {
+				todo: b"b".to_vec(),
+				base: Base::Upstream(oid),
+				empty: EmptyPolicy::Keep,
+				recovery_ref: None,
+				protection: None,
+			},
+		]);
+		assert_eq!(last_wins.phase, Phase::Running);
+		assert_eq!(last_wins.started.unwrap().todo, b"b".to_vec());
+		let _ =
+			Session::fold(&[Event::Undo, Event::Undo, Event::Redo]);
+		let _ = Session::fold(&[
+			Event::Aborted,
+			Event::Completed { tip: oid },
+		]);
+
+		// a 10 MB single event line loads well within budget
+		let huge = TempDir::new().unwrap();
+		let mut journal = Journal::open(huge.path()).unwrap();
+		journal.journal.append(&Event::Schema(1)).unwrap();
+		journal
+			.journal
+			.append(&Event::Command {
+				intent: "x".repeat(10_000_000),
+			})
+			.unwrap();
+		drop(journal.journal);
+		let loaded = Journal::open(huge.path()).unwrap();
+		assert_eq!(loaded.events.len(), 2);
 	}
 
 	#[test]

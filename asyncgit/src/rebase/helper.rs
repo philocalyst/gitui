@@ -50,7 +50,6 @@
 
 use crate::rebase::snapshot::BridgeKind;
 use crate::rebase::todo::Todo;
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Maximum time a message request waits for an answer before
@@ -192,18 +191,42 @@ fn apply_sequence(
 /// Whether every pick-family commit of `generated` is still
 /// present in `plan` (drops count as present: they are explicit,
 /// reviewable omissions).
+///
+/// Git writes *abbreviated* ids into todos (unless the user
+/// forces `core.abbrev = 40`), so the comparison goes through
+/// [`CommitArg::names`]: a generated argument matches a plan
+/// step when it could name its full id. Comparing only full
+/// hex would make the check vacuous for every default-config
+/// repository — a plan silently dropping commits would pass.
 fn covers_generated(generated: &[u8], plan: &[u8]) -> bool {
-	let plan_commits: HashSet<crate::sync::CommitId> =
+	let plan_args: Vec<crate::rebase::todo::CommitArg> =
 		Todo::parse(plan)
 			.instructions()
 			.filter(|(_, i)| i.is_pick_family())
-			.filter_map(|(_, i)| i.commit())
+			.filter_map(|(_, i)| i.commit_arg().cloned())
 			.collect();
-	!Todo::parse(generated)
+	Todo::parse(generated)
 		.instructions()
 		.filter(|(_, i)| i.is_pick_family())
-		.filter_map(|(_, i)| i.commit())
-		.any(|commit| !plan_commits.contains(&commit))
+		.filter_map(|(_, i)| i.commit_arg().cloned())
+		.all(|generated_arg| {
+			plan_args
+				.iter()
+				.any(|plan_arg| arg_names(plan_arg, &generated_arg))
+		})
+}
+
+/// Whether `plan_arg` could name the commit `generated_arg`
+/// names: full plan ids accept any unambiguous-looking prefix,
+/// anything else must match byte for byte.
+fn arg_names(
+	plan_arg: &crate::rebase::todo::CommitArg,
+	generated_arg: &crate::rebase::todo::CommitArg,
+) -> bool {
+	plan_arg.full().map_or_else(
+		|| plan_arg.as_bytes() == generated_arg.as_bytes(),
+		|full| generated_arg.names(&full),
+	)
 }
 
 /// Message-editor requests: deliver a composed message. During
@@ -401,6 +424,52 @@ mod tests {
 		assert!(bridge.get(GENERATED_FILE).is_some());
 	}
 
+	/// Git writes abbreviated ids into todos by default (the
+	/// audit found the old full-hex-only comparison was
+	/// vacuous there): the coverage check must catch a plan
+	/// dropping an abbreviated generated commit.
+	#[test]
+	fn apply_refuses_dropped_commits_with_abbreviated_ids() {
+		let bridge = Bridge::new(MODE_APPLY);
+		// the plan only replays the first commit
+		bridge.put(PLAN_FILE, TODO_A.as_bytes());
+		let file = bridge
+			.edited(b"pick 1111111 # one\npick 2222222 # two\n");
+		assert_eq!(
+			run_with_kind(
+				&bridge.path(),
+				&file,
+				BridgeKind::Sequence
+			),
+			1,
+			"a plan dropping an abbreviated commit must refuse"
+		);
+		assert_eq!(
+			fs::read(&file).unwrap(),
+			b"pick 1111111 # one\npick 2222222 # two\n",
+			"refused plan must not touch git's file"
+		);
+
+		// the same shape WITH every generated commit kept passes
+		let bridge = Bridge::new(MODE_APPLY);
+		bridge.put(
+			PLAN_FILE,
+			b"pick 1111111111111111111111111111111111111111 # one\n\
+			  pick 2222222222222222222222222222222222222222 # two\n",
+		);
+		let file = bridge
+			.edited(b"pick 1111111 # one\npick 2222222 # two\n");
+		assert_eq!(
+			run_with_kind(
+				&bridge.path(),
+				&file,
+				BridgeKind::Sequence
+			),
+			0,
+			"a plan covering every abbreviated commit applies"
+		);
+	}
+
 	#[test]
 	fn fail_mode_and_missing_mode_refuse() {
 		let bridge = Bridge::new(MODE_FAIL);
@@ -444,6 +513,52 @@ mod tests {
 			bridge.get(REQUEST_FILE).is_none(),
 			"cancelled request must be resolved"
 		);
+	}
+
+	/// An answer written *before* the request resolves on the
+	/// first poll (the engine allows messages into a waiting
+	/// mode before git opens its editor).
+	#[test]
+	fn message_answered_before_request() {
+		let bridge = Bridge::new(MODE_MESSAGE);
+		bridge.put(MESSAGE_FILE, b"early\n");
+		let file = bridge.edited(b"original\n");
+		let code =
+			run_with_kind(&bridge.path(), &file, BridgeKind::Message);
+		assert_eq!(code, 0);
+		assert_eq!(fs::read(&file).unwrap(), b"early\n");
+	}
+
+	/// When both answers are present the message wins; the
+	/// order is deterministic (message checked first).
+	#[test]
+	fn message_beats_cancel_when_both_present() {
+		let bridge = Bridge::new(MODE_MESSAGE);
+		bridge.put(CANCEL_FILE, b"");
+		bridge.put(MESSAGE_FILE, b"decisive\n");
+		let file = bridge.edited(b"original\n");
+		let code =
+			run_with_kind(&bridge.path(), &file, BridgeKind::Message);
+		assert_eq!(code, 0, "the message wins over a stale cancel");
+		assert_eq!(fs::read(&file).unwrap(), b"decisive\n");
+	}
+
+	/// An unreadable target file fails the edit (exit ≠ 0);
+	/// git stays stopped at a clean boundary.
+	#[test]
+	#[cfg(unix)]
+	fn unreadable_target_fails_the_edit() {
+		use std::os::unix::fs::PermissionsExt;
+		let bridge = Bridge::new(MODE_MESSAGE);
+		bridge.put(MESSAGE_FILE, b"composed\n");
+		let file = bridge.edited(b"original\n");
+		fs::set_permissions(&file, fs::Permissions::from_mode(0o000))
+			.unwrap();
+		let code =
+			run_with_kind(&bridge.path(), &file, BridgeKind::Message);
+		fs::set_permissions(&file, fs::Permissions::from_mode(0o644))
+			.unwrap();
+		assert_eq!(code, 1, "an unwritable edit must fail");
 	}
 
 	#[test]

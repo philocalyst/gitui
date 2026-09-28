@@ -78,6 +78,10 @@ use crate::sync::CommitId;
 pub struct Policy {
 	/// Which phase the workspace presents.
 	pub phase: Phase,
+	/// The classified stop of a `Stopped` or `Adopted`
+	/// phase (what the workspace waits on); `None` in every
+	/// other phase.
+	pub stop: Option<Stop>,
 	/// Rail rows, in program order.
 	pub rail: Vec<Row>,
 	/// What the inspector shows.
@@ -183,6 +187,9 @@ pub struct Row {
 	pub step: Option<StepId>,
 	/// Execution state of this row.
 	pub state: RowState,
+	/// Canonical instruction word (`""` for raw rows); the
+	/// display action word for rows the plan cannot resolve.
+	pub action: &'static str,
 	/// Label (subject or command).
 	pub label: String,
 	/// Short oid, when the row has a commit.
@@ -367,6 +374,7 @@ pub fn policy(session: &Session, snapshot: &Snapshot) -> Policy {
 	let progress = progress_of(session, snapshot, &phase);
 	Policy {
 		phase,
+		stop,
 		rail,
 		inspector,
 		actions,
@@ -594,9 +602,10 @@ fn rail_of(
 		}
 		// Between stops with a live program: align plan and
 		// observation; misalignment falls back to the raw
-		// observation.
+		// observation. An adopted session never has a
+		// recorded start — the observation is all it has.
 		Phase::Stopped(_) | Phase::Adopted { .. }
-			if session.started.is_some() && rebase.is_some() =>
+			if rebase.is_some() =>
 		{
 			match (rebase, session.plan.as_ref()) {
 				(Some(observed), Some(plan)) => {
@@ -659,7 +668,8 @@ fn draft_rows(plan: Option<&Plan>) -> Vec<Row> {
 				} else {
 					RowState::Pending
 				},
-				label: label_of(instruction),
+				action: instruction.canonical_word(),
+				label: label_with_note(instruction, &step.note),
 				short_oid: short_of_instruction(instruction),
 				folds_into_previous: folds(instruction),
 			}),
@@ -668,6 +678,7 @@ fn draft_rows(plan: Option<&Plan>) -> Vec<Row> {
 			TodoLine::Raw(bytes) => Some(Row {
 				step: Some(step.id),
 				state: RowState::Failed,
+				action: "",
 				label: String::from_utf8_lossy(bytes).into_owned(),
 				short_oid: None,
 				folds_into_previous: false,
@@ -695,7 +706,8 @@ fn terminal_rows(plan: Option<&Plan>) -> Vec<Row> {
 				} else {
 					RowState::Done
 				},
-				label: label_of(instruction),
+				action: instruction.canonical_word(),
+				label: label_with_note(instruction, &step.note),
 				short_oid: short_of_instruction(instruction),
 				folds_into_previous: folds(instruction),
 			}),
@@ -792,6 +804,7 @@ fn aligned_rows(
 			Row {
 				step: Some(*id),
 				state,
+				action: instruction.canonical_word(),
 				label: label_of(instruction),
 				short_oid,
 				folds_into_previous: folds(instruction),
@@ -862,9 +875,28 @@ fn observation_row(instruction: &Instruction, in_done: bool) -> Row {
 	Row {
 		step: None,
 		state,
+		action: instruction.canonical_word(),
 		label: label_of(instruction),
 		short_oid: short_of_instruction(instruction),
 		folds_into_previous: folds(instruction),
+	}
+}
+
+/// Display label: the commit subject comment when git wrote
+/// one, the argument/command otherwise. A composed note (the
+/// projected new message of a reword/squash) previews as
+/// `old → new` so the rail shows what the step will become.
+fn label_with_note(
+	instruction: &Instruction,
+	note: &crate::rebase::plan::Note,
+) -> String {
+	let label = label_of(instruction);
+	match note.message.as_deref() {
+		Some(new) if !new.trim().is_empty() => {
+			let new = new.lines().next().unwrap_or(new).trim();
+			format!("{label} \u{2192} {new}")
+		}
+		_ => label,
 	}
 }
 
@@ -1355,17 +1387,21 @@ const fn keep_empty_action(stop: Option<&Stop>) -> Availability {
 }
 
 /// Restoring protected changes once the rebase finished.
+/// A restoration already applied cleanly is not offered again
+/// (the stash entry was consumed); a failed one is.
 const fn restore_action(
 	session: &Session,
 	phase: &Phase,
 ) -> Availability {
 	if matches!(phase, Phase::Done(Done::Finished))
 		&& session.protection.is_some()
+		&& !session.protection_restored
 	{
 		Availability::Enabled
 	} else {
-		// Nothing protected, or the session did not finish
-		// (an aborted rebase already restored its state).
+		// Nothing protected, already restored, or the
+		// session did not finish (an aborted rebase
+		// already restored its state).
 		Availability::Hidden
 	}
 }

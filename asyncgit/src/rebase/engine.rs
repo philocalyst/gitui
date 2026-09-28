@@ -293,6 +293,14 @@ pub struct NativeEngine {
 	extra_env: Vec<(String, std::ffi::OsString)>,
 	/// Editor-bridge executable override (see [`NativeEngine::with_bridge_exe`]).
 	bridge_exe_override: Option<PathBuf>,
+	/// This process's bridge directory, resolved once:
+	/// `<session>/bridge-<pid>`. Unique per gitui process —
+	/// a second gitui on the same repository can never
+	/// clobber this one's protocol files — while the exec
+	/// and observer engines of one service deliberately
+	/// share it (the observer must see pending editor
+	/// requests to answer them).
+	bridge: PathBuf,
 }
 
 /// Bridge setup for one exec (see [`crate::rebase::helper`]).
@@ -502,6 +510,8 @@ impl NativeEngine {
 		};
 		let session = session
 			.unwrap_or_else(|| git_dir.join("gitui").join("rebase"));
+		let bridge =
+			session.join(format!("bridge-{}", std::process::id()));
 
 		// Pre-2.22 git lacks the flag; sha1 is the honest
 		// default there (CAS creation-only still holds for
@@ -531,6 +541,7 @@ impl NativeEngine {
 			generation: AtomicU64::new(0),
 			extra_env: Vec::new(),
 			bridge_exe_override: None,
+			bridge,
 		})
 	}
 
@@ -544,10 +555,18 @@ impl NativeEngine {
 
 	/// Where this engine's session lives (the same directory
 	/// the [`Engine::session_dir`] seam reports; engines
-	/// sharing a session directory share one bridge).
+	/// sharing a session directory share one journal).
 	#[must_use]
 	pub fn session_dir(&self) -> &Path {
 		&self.session
+	}
+
+	/// This instance's editor-bridge directory (diagnostics
+	/// and tests; the helper learns it through the
+	/// environment).
+	#[must_use]
+	pub fn bridge_dir(&self) -> &Path {
+		&self.bridge
 	}
 
 	/// Add environment variables for every child process.
@@ -573,9 +592,13 @@ impl NativeEngine {
 		self
 	}
 
-	/// `<session>/bridge`, the per-exec protocol directory.
+	/// This process's bridge directory, unique per gitui
+	/// process: a second gitui on the same repository gets
+	/// its own protocol space, and a crashed process leaves
+	/// its directory behind — harmless, small, never
+	/// interfering with a live run.
 	fn bridge_path(&self) -> PathBuf {
-		self.session.join("bridge")
+		self.bridge.clone()
 	}
 
 	fn ensure_session(&self) -> Result<()> {
@@ -1277,6 +1300,31 @@ mod tests {
 	use std::sync::Arc;
 	use std::time::Duration;
 
+	/// Serializes tests that mutate this process's environment
+	/// (ambient `GIT_DIR`, `GITUI_GIT_PATH`): parallel tests
+	/// spawn engines and must not observe each other's vars.
+	static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+	/// [`crate::rebase::testutil::git_in`] with the sandbox's
+	/// hermetic environment (string-typed).
+	fn str_git_in(dir: &Path, args: &[&str], s: &Sandbox) {
+		let env: Vec<(&str, &str)> = s
+			.envs()
+			.iter()
+			.map(|(k, v)| {
+				(k.as_str(), v.to_str().unwrap_or_default())
+			})
+			.collect();
+		crate::rebase::testutil::git_in(dir, args, &env);
+	}
+
+	/// The request file path inside an engine's bridge (tests).
+	fn engine_bridge_request_path(
+		engine: &super::NativeEngine,
+	) -> std::path::PathBuf {
+		engine.bridge_dir().join("request")
+	}
+
 	#[test]
 	fn git_dir_and_default_session_are_resolved() {
 		let s = Sandbox::new();
@@ -1301,6 +1349,20 @@ mod tests {
 		assert_eq!(
 			Engine::session_dir(&engine),
 			engine.session_dir()
+		);
+		// Engines of one process share one bridge directory:
+		// the service's observer must see the exec engine's
+		// pending editor requests to answer them.
+		let engine = s.engine();
+		let other = s.engine();
+		assert_eq!(engine.bridge_dir(), other.bridge_dir());
+		assert!(
+			engine
+				.bridge_dir()
+				.to_string_lossy()
+				.contains(&std::process::id().to_string()),
+			"the bridge directory embeds this process's pid: {:?}",
+			engine.bridge_dir()
 		);
 	}
 
@@ -1474,7 +1536,7 @@ mod tests {
 
 		// The message request appears when git reaches the
 		// reword step; answer it like the UI would.
-		let request = s.path().join("gitui-session/bridge/request");
+		let request = engine_bridge_request_path(&engine);
 		let mut answered = false;
 		for _ in 0..600 {
 			if request.exists() {
@@ -1496,6 +1558,70 @@ mod tests {
 		assert_eq!(
 			s.log_subjects(&format!("{a}..HEAD")),
 			vec!["reworded subject".to_owned()]
+		);
+	}
+
+	/// The exec and observer engines of one service share one
+	/// session directory AND one bridge directory (same
+	/// process): while the exec engine's git is blocked in a
+	/// message request, the observer engine must be able to
+	/// see that request. A second gitui *process* would name
+	/// its own bridge (pid-embedded), which is what keeps
+	/// concurrent instances from clobbering each other.
+	#[test]
+	fn observer_sees_the_exec_engines_bridge_request() {
+		let s = Sandbox::new();
+		let (a, b, _c) = two_step_branch(&s);
+		let engine_a = Arc::new(s.engine_at("shared-session"));
+		let engine_b = Arc::new(s.engine_at("shared-session"));
+		assert_eq!(
+			engine_a.bridge_dir(),
+			engine_b.bridge_dir(),
+			"one process, one bridge"
+		);
+
+		let runner = {
+			let engine = Arc::clone(&engine_a);
+			let todo = todo_of(&[format!("reword {b}")]);
+			let base = Base::Upstream(s.oid(&a));
+			std::thread::spawn(move || {
+				engine.exec(Cmd::Start {
+					todo,
+					options: start_opts(base),
+				})
+			})
+		};
+
+		// The observer engine must discover the pending
+		// request while the exec engine's command is running.
+		let mut observed = false;
+		for _ in 0..600 {
+			if engine_b.observe().unwrap().bridge.is_some() {
+				observed = true;
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(50));
+		}
+		assert!(
+			observed,
+			"the observer engine never saw the pending request"
+		);
+
+		// And the observer engine answers it (correspondence
+		// commands are lock-free): the reword completes.
+		engine_b
+			.exec(Cmd::SetBridgeMessage {
+				message: String::from("reworded subject\n"),
+			})
+			.unwrap();
+
+		let out = runner.join().unwrap().unwrap();
+		assert_eq!(out.code, 0);
+		assert_eq!(out.snapshot.operation, Operation::Clean);
+		assert_eq!(
+			s.log_subjects(&format!("{a}..HEAD")),
+			vec!["reworded subject".to_owned()],
+			"the reword survived the concurrent observer"
 		);
 	}
 
@@ -1678,6 +1804,366 @@ mod tests {
 		assert!(
 			!s.exists("new.txt"),
 			"untracked files move into the stash"
+		);
+	}
+
+	/// Hostile `GITUI_GIT_PATH` values fail at construction,
+	/// never mid-rebase.
+	#[test]
+	fn hostile_git_executables_fail_at_construction() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let s = Sandbox::new();
+		let (a, _b, _c) = two_step_branch(&s);
+		let repo = RepoPath::Workdir {
+			gitdir: s.path().join(".git"),
+			workdir: s.path(),
+		};
+
+		// a binary that exists but is not git
+		std::env::set_var("GITUI_GIT_PATH", "/bin/false");
+		let result = super::NativeEngine::new(repo.clone(), None);
+		assert!(
+			result.is_err(),
+			"/bin/false must not build an engine"
+		);
+
+		// a binary that does not exist
+		std::env::set_var(
+			"GITUI_GIT_PATH",
+			"/nonexistent/gitui-probe-git-binary",
+		);
+		let result = super::NativeEngine::new(repo.clone(), None);
+		assert!(result.is_err(), "missing binary must not build");
+
+		std::env::remove_var("GITUI_GIT_PATH");
+		// the valid setup still builds afterwards
+		let engine = s.engine_on(repo, "gitui-session-env");
+		let picks = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Upstream(s.oid(&a)),
+				rebase_merges: false,
+			})
+			.unwrap()
+			.generated_todo
+			.unwrap()
+			.instructions()
+			.filter(|(_, i)| i.is_pick_family())
+			.count();
+		assert_eq!(picks, 2);
+	}
+
+	/// Ambient repo-redirecting environment must not leak into
+	/// the engine's children: a hostile `GIT_DIR` pointing at
+	/// another repository is stripped for every command.
+	#[test]
+	fn ambient_git_dir_is_stripped_from_children() {
+		let _guard = ENV_LOCK.lock().unwrap();
+		let s = Sandbox::new();
+		let (a, _b, c) = two_step_branch(&s);
+
+		// a second repository the hostile variable points at
+		let foreign = s.path().join("foreign");
+		std::fs::create_dir_all(&foreign).unwrap();
+		crate::rebase::testutil::git_in(
+			&foreign,
+			&["init", "-q", "--initial-branch=main"],
+			&[],
+		);
+
+		let engine = s.engine();
+		std::env::set_var("GIT_DIR", foreign.join(".git"));
+		let observed = engine.observe();
+		std::env::remove_var("GIT_DIR");
+		let observed = observed.unwrap();
+		assert_eq!(observed.branch.as_deref(), Some("main"));
+		assert_eq!(observed.head, Some(s.oid(&c)));
+
+		// a full flow under the hostile ambient variable
+		std::env::set_var("GIT_DIR", foreign.join(".git"));
+		let todo_flow = engine.exec(Cmd::GenerateTodo {
+			base: Base::Upstream(s.oid(&a)),
+			rebase_merges: false,
+		});
+		std::env::remove_var("GIT_DIR");
+		let picks = todo_flow
+			.unwrap()
+			.generated_todo
+			.unwrap()
+			.instructions()
+			.filter(|(_, i)| i.is_pick_family())
+			.count();
+		assert_eq!(picks, 2, "the flow stayed in the sandbox repo");
+	}
+
+	/// A hostile `GIT_SEQUENCE_EDITOR` in the environment is
+	/// overridden for bridge runs: the capture editor refuses,
+	/// the hostile editor never executes.
+	#[test]
+	fn hostile_sequence_editor_is_overridden() {
+		let s = Sandbox::new();
+		let (a, _b, _c) = two_step_branch(&s);
+		let marker = s.path().join("hostile-editor-ran");
+		let editor = format!("touch {}", marker.display());
+		let engine = s.engine().with_extra_env(vec![(
+			String::from("GIT_SEQUENCE_EDITOR"),
+			editor.into(),
+		)]);
+		let out = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Upstream(s.oid(&a)),
+				rebase_merges: false,
+			})
+			.unwrap();
+		assert_eq!(out.code, 1, "capture mode must refuse");
+		assert!(
+			out.generated_todo.is_some(),
+			"the bridge captured the todo"
+		);
+		assert!(
+			!marker.exists(),
+			"the hostile editor must never run"
+		);
+		assert_eq!(out.snapshot.operation, Operation::Clean);
+	}
+
+	/// Repository shapes that must refuse or degrade cleanly:
+	/// a bare repository observes nothing and effects fail.
+	#[test]
+	fn bare_repo_errors_instead_of_hanging() {
+		let s = Sandbox::new();
+		let (_a, _b, _c) = two_step_branch(&s);
+		let bare = s.path().join("bare.git");
+		assert!(Command::new("git")
+			.args(["clone", "--bare", "-q"])
+			.arg(s.path())
+			.arg(&bare)
+			.output()
+			.unwrap()
+			.status
+			.success());
+
+		let engine =
+			super::NativeEngine::new(
+				RepoPath::Path(bare.clone()),
+				None,
+			)
+			.unwrap_or_else(|e| {
+				panic!("a bare repo must construct (workdir = gitdir): {e}")
+			});
+		// observation fails cleanly and fast (no hang, no panic)
+		let observed = engine.observe();
+		assert!(
+			observed.is_err(),
+			"bare status must fail, not pretend: {observed:?}"
+		);
+		// the effect itself refuses (a nonzero outcome), and
+		// the follow-up observation of the unusable repository
+		// may also fail: both are clean errors, never hangs
+		let stashed = engine.exec(Cmd::StashCreate {
+			include_untracked: false,
+		});
+		match stashed {
+			Ok(out) => {
+				assert_ne!(
+					out.code, 0,
+					"stash create must fail on a bare repo"
+				);
+				assert!(out.stash.is_none());
+			}
+			Err(error) => {
+				assert!(
+					error.to_string().contains("status"),
+					"the failure must be the observation: {error}"
+				);
+			}
+		}
+	}
+
+	/// An unborn HEAD observes fine; the rebase itself refuses
+	/// (git's own refusal, surfaced as an outcome).
+	#[test]
+	fn unborn_head_observes_but_the_rebase_refuses() {
+		let s = Sandbox::new();
+		let empty = s.path().join("empty");
+		std::fs::create_dir_all(&empty).unwrap();
+		str_git_in(
+			&empty,
+			&["init", "-q", "--initial-branch=main"],
+			&s,
+		);
+		let engine = super::NativeEngine::new(
+			RepoPath::Workdir {
+				gitdir: empty.join(".git"),
+				workdir: empty.clone(),
+			},
+			None,
+		)
+		.unwrap();
+		let observed = engine.observe().unwrap();
+		assert_eq!(observed.head, None, "unborn");
+		assert_eq!(observed.branch.as_deref(), Some("main"));
+
+		// the rebase refuses cleanly (git itself refuses; the
+		// engine reports it as an outcome, not an error)
+		let out = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Root,
+				rebase_merges: false,
+			})
+			.unwrap();
+		assert_ne!(out.code, 0, "an unborn HEAD cannot rebase");
+		assert!(out.generated_todo.is_none());
+		assert_eq!(observed.operation, Operation::Clean);
+	}
+
+	#[test]
+	fn detached_head_supports_the_full_flow() {
+		let s = Sandbox::new();
+		let (_a, _b, _c) = two_step_branch(&s);
+		let tip = s.head();
+		s.git_ok(&["checkout", "-q", "--detach"]);
+		let engine = s.engine();
+		let observed = engine.observe().unwrap();
+		assert_eq!(observed.branch, None, "detached");
+		assert_eq!(observed.head, Some(s.oid(&tip)));
+		let out = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Root,
+				rebase_merges: false,
+			})
+			.unwrap();
+		assert_eq!(out.code, 1, "capture refuses by design");
+		assert!(out.generated_todo.is_some());
+	}
+
+	/// A sha256 repository: the engine constructs (probes are
+	/// oid-agnostic) but observation refuses with a verdict
+	/// that names the limitation — this build's `CommitId`
+	/// cannot represent sha256 oids at all.
+	#[test]
+	fn sha256_repository_is_refused_with_a_named_verdict() {
+		let s = Sandbox::new();
+		let sha = s.path().join("sha256");
+		std::fs::create_dir_all(&sha).unwrap();
+		str_git_in(
+			&sha,
+			&["init", "-q", "--object-format=sha256"],
+			&s,
+		);
+		str_git_in(
+			&sha,
+			&["commit", "-q", "--allow-empty", "-m", "i"],
+			&s,
+		);
+		let engine = super::NativeEngine::new(
+			RepoPath::Workdir {
+				gitdir: sha.join(".git"),
+				workdir: sha.clone(),
+			},
+			None,
+		)
+		.unwrap();
+		let error = engine
+			.observe()
+			.err()
+			.expect("sha256 must not observe cleanly");
+		assert!(
+			error.to_string().contains("sha256"),
+			"the verdict must name the limitation: {error}"
+		);
+	}
+
+	/// A linked worktree (`.git` is a file) resolves its real
+	/// git dir and runs the full capture flow.
+	#[test]
+	fn linked_worktree_runs_the_full_flow() {
+		let s = Sandbox::new();
+		let (a, b, _c) = two_step_branch(&s);
+		let wt = s.path().join("linked-wt");
+		s.git_ok(&[
+			"worktree",
+			"add",
+			"-q",
+			&wt.to_string_lossy(),
+			&b,
+		]);
+		let engine = s.engine_on(
+			RepoPath::Workdir {
+				gitdir: wt.join(".git"),
+				workdir: wt.clone(),
+			},
+			"gitui-session-wt",
+		);
+		// the linked git dir resolves through the .git file
+		assert!(
+			engine.git_dir().is_absolute()
+				&& engine.git_dir() != wt.join(".git"),
+			"the git dir must be the real linked dir: {:?}",
+			engine.git_dir()
+		);
+		let out = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Upstream(s.oid(&a)),
+				rebase_merges: false,
+			})
+			.unwrap();
+		assert_eq!(out.code, 1);
+		// the worktree is checked out at `b`: the scope a..b
+		// holds exactly that one commit
+		let picks = out
+			.generated_todo
+			.unwrap()
+			.instructions()
+			.filter(|(_, i)| i.is_pick_family())
+			.count();
+		assert_eq!(picks, 1, "the worktree sees the same history");
+	}
+
+	/// A read-only `.git`: reads keep working, and a start
+	/// attempt hits git's notorious quirk — it *prints* the
+	/// permission error yet **exits 0** without ever opening
+	/// the editor. The engine cannot fix git's exit code, so
+	/// this test locks the observable truth (nothing started,
+	/// no half-written state) that the service must interpret
+	/// honestly: `began` may not trust `code == 0` alone.
+	#[test]
+	fn read_only_git_dir_lies_about_the_exit_code() {
+		let s = Sandbox::new();
+		let (a, _b, _c) = two_step_branch(&s);
+		let git_dir = s.path().join(".git");
+		let mut permissions =
+			std::fs::metadata(&git_dir).unwrap().permissions();
+		let original = permissions.clone();
+		std::os::unix::fs::PermissionsExt::set_mode(
+			&mut permissions,
+			0o555,
+		);
+		std::fs::set_permissions(&git_dir, permissions).unwrap();
+
+		let engine = s.engine();
+		let read_ok = engine.observe().is_ok();
+		let out = engine
+			.exec(Cmd::GenerateTodo {
+				base: Base::Upstream(s.oid(&a)),
+				rebase_merges: false,
+			})
+			.unwrap();
+		// restore first: the sandbox cleaner needs write access
+		std::fs::set_permissions(&git_dir, original).unwrap();
+
+		assert!(read_ok, "reads must survive a read-only git dir");
+		assert_eq!(
+			out.code, 0,
+			"git exits 0 despite the permission error (the quirk)"
+		);
+		assert!(
+			out.generated_todo.is_none(),
+			"the editor never ran: nothing was captured"
+		);
+		assert_eq!(
+			engine.observe().unwrap().operation,
+			Operation::Clean,
+			"nothing half-started is left behind"
 		);
 	}
 

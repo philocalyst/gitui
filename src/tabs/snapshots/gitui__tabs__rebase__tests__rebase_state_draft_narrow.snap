@@ -1,0 +1,19 @@
+---
+source: src/tabs/rebase.rs
+expression: "draw_tab(&tab, 40, 15)"
+---
+"main → 0000008 · draft · not started    "
+"┌Plan [↑↓ move] 6/6────────────────────┐"
+"│○ PICK   0000001 subject 1            █"
+"│○ FIXUP  0000002  └ subject 2         ║"
+"│○ REWORD 0000004 subject 4 → announce…║"
+"│× DROP   0000003 subject 3            ║"
+"│! ????           a newer git wrote th…║"
+"│○ BREAK          break                ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"└──────────────────────────────────────┘"

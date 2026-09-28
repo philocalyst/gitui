@@ -405,8 +405,7 @@ impl Watcher {
 		let stop = Arc::new(AtomicBool::new(false));
 		let flag = Arc::clone(&stop);
 		let handle = std::thread::spawn(move || {
-			let request =
-				engine.session_dir().join("bridge").join("request");
+			let request = engine.bridge_dir().join("request");
 			let mut answered = 0;
 			while !flag.load(Ordering::SeqCst) && answered < 16 {
 				if request.exists() {
@@ -1178,9 +1177,11 @@ fn kill_during_start_is_observable_and_abortable() {
 		.unwrap();
 
 	// Wait for the rebase state to appear, then kill git.
+	// Generous budget: under a loaded parallel test run the
+	// spawn itself can take seconds.
 	let merge_dir = s.path().join(".git").join("rebase-merge");
 	let mut appeared = false;
-	for _ in 0..200 {
+	for _ in 0..800 {
 		if merge_dir.is_dir() {
 			appeared = true;
 			break;
@@ -1264,4 +1265,106 @@ fn determinism() {
 		first, second,
 		"seed {seed}: the harness must be deterministic",
 	);
+}
+
+/// The SIGKILL matrix, randomized: kill the git child at a
+/// random moment in 20 trials of a conflicting start, then a
+/// fresh engine must observe a sane repository and abort back
+/// to the exact original tip. Whatever git managed to write
+/// before the kill, observe + abort recover it — that is the
+/// crash protocol's core promise. Delays sweep 1..=1500 ms
+/// (seeded, deterministic per trial) to cover the whole
+/// bookkeeping window: before `rebase-merge/` exists, between
+/// its creation and the editor call, and inside the editor
+/// wait.
+#[test]
+fn kill_matrix_recovers_the_exact_tip() {
+	use crate::rebase::engine::Cmd;
+	use crate::rebase::testutil::conflicting_branch;
+
+	let s = Sandbox::new();
+	let (_a, _b, _c, x) = conflicting_branch(&s);
+	let tip_before = s.head();
+
+	// A sequence editor that never returns, so every kill
+	// lands somewhere inside git's start bookkeeping or the
+	// editor wait.
+	let editor = s.path().join("sleep-editor-kill.sh");
+	fs::write(&editor, "#!/bin/sh\nsleep 30\n").unwrap();
+	fs::set_permissions(
+		&editor,
+		std::fs::Permissions::from_mode(0o755),
+	)
+	.unwrap();
+
+	for trial in 0..20u64 {
+		let delay_ms = Rng(0xD1FF_5EED + trial).next() % 1500 + 1;
+		let mut child = Command::new("git")
+			.args(["rebase", "-i", "--empty=stop", &x])
+			.current_dir(s.path())
+			.envs(
+				s.envs()
+					.iter()
+					.map(|(k, v)| (k.as_str(), v.as_os_str())),
+			)
+			.env_remove("GIT_EDITOR")
+			.env_remove("GIT_SEQUENCE_EDITOR")
+			.env_remove("VISUAL")
+			.env(
+				"GIT_SEQUENCE_EDITOR",
+				editor.canonicalize().unwrap(),
+			)
+			.spawn()
+			.unwrap_or_else(|e| {
+				panic!("trial {trial}: spawn failed: {e}")
+			});
+		std::thread::sleep(Duration::from_millis(delay_ms));
+		let _ = child.kill();
+		child.wait().unwrap();
+
+		// A fresh engine observes whatever git left behind;
+		// neither observe nor abort may fail or hang.
+		let engine = s.engine_at("gitui-session-kill-matrix");
+		let observed = engine.observe().unwrap_or_else(|e| {
+			panic!("trial {trial}: observe failed: {e}")
+		});
+		match observed.operation {
+			Operation::RebaseInteractive => {
+				let aborted =
+					engine.exec(Cmd::Abort).unwrap_or_else(|e| {
+						panic!("trial {trial}: abort failed: {e}")
+					});
+				assert_eq!(
+					aborted.code,
+					0,
+					"trial {trial}: abort must succeed: {}",
+					String::from_utf8_lossy(&aborted.stderr)
+				);
+				assert_eq!(
+					s.head(),
+					tip_before,
+					"trial {trial}: abort must restore the tip"
+				);
+				assert_eq!(
+					aborted.snapshot.operation,
+					Operation::Clean,
+					"trial {trial}: abort must end clean"
+				);
+			}
+			Operation::Clean => {
+				// git died before creating any state; the tip
+				// must be untouched.
+				assert_eq!(
+					s.head(),
+					tip_before,
+					"trial {trial}: nothing may have moved"
+				);
+			}
+			other => {
+				panic!(
+					"trial {trial}: unexpected operation {other:?}"
+				);
+			}
+		}
+	}
 }

@@ -1,0 +1,19 @@
+---
+source: src/tabs/rebase.rs
+expression: "draw_tab(&tab, 40, 15)"
+---
+"main → 0000008 · stopped: conflicts (2) "
+"┌Plan [↑↓ move] 4/4────────────────────┐"
+"│✓ PICK   0000001 subject 1            █"
+"│! PICK   0000002 subject 2            ║"
+"│○ PICK   0000003 subject 3            ║"
+"│○ PICK   0000004 subject 4            ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"│                                      ║"
+"└──────────────────────────────────────┘"
