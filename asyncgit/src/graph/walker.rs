@@ -187,25 +187,58 @@ fn overlay_cell(
 	}
 }
 
+/// What the walk learned about one commit, indexed by its
+/// [`CommitAlias`]. Aliases are dense `0..n`, so the facts live in a
+/// flat vector instead of a map.
+#[derive(Clone, Copy, Debug, Default)]
+struct CommitFacts {
+	/// Whether the commit has already been folded into the buffer.
+	///
+	/// [`GraphWalker::mint_drawable_parent`] refuses to mint an
+	/// [`UnwalkedAlias`] for one of these: a lane waiting on a commit
+	/// the walk has already passed would stay open to the end of the
+	/// log, drawing a line that never reaches anything.
+	processed: bool,
+
+	/// Whether Git reports more than one parent for this commit, which
+	/// is what makes it draw a merge marker.
+	///
+	/// A merge can legitimately end up with a single drawn edge — an
+	/// octopus merge past its second parent, a duplicated parent
+	/// entry, or a second parent the walk reached first — and keeping
+	/// this apart from the lanes lets the marker stay honest about
+	/// what the commit is in all three cases.
+	is_merge: bool,
+
+	/// The second parent that was given a lane of its own, which is
+	/// the far end of the row's merge bridge.
+	second_parent: Option<CommitAlias>,
+}
+
 #[derive(Default)]
 pub struct GraphWalker {
 	pub buffer: Buffer,
 	pub oids: GraphOids,
 
-	/// For each merge commit's alias, the alias of its second parent.
-	/// Indexed directly by alias: aliases are dense `0..n`, so no
-	/// hashing is needed.
-	pub merge_parents: Vec<Option<CommitAlias>>,
-
-	/// Whether an alias has already been folded into the buffer;
-	/// consulted by [`Self::mint_drawable_parent`], which refuses to
-	/// mint an [`UnwalkedAlias`] for any of them. Indexed by alias.
-	pub processed: Vec<bool>,
+	/// What the walk knows about each commit, indexed by alias.
+	facts: Vec<CommitFacts>,
 }
 
 impl GraphWalker {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	fn facts(&self, alias: CommitAlias) -> CommitFacts {
+		self.facts.get(*alias).copied().unwrap_or_default()
+	}
+
+	fn facts_mut(&mut self, alias: CommitAlias) -> &mut CommitFacts {
+		let index = *alias;
+		if self.facts.len() <= index {
+			self.facts.resize(index + 1, CommitFacts::default());
+		}
+		&mut self.facts[index]
 	}
 
 	/// Mint the drawable alias for a parent commit, or `None` if the
@@ -215,19 +248,49 @@ impl GraphWalker {
 		id: &CommitId,
 	) -> Option<UnwalkedAlias> {
 		let alias = self.oids.get_or_insert(id);
-		(!self.is_processed(alias)).then_some(UnwalkedAlias(alias))
+		(!self.facts(alias).processed).then_some(UnwalkedAlias(alias))
 	}
 
-	fn is_processed(&self, alias: CommitAlias) -> bool {
-		self.processed.get(*alias).copied().unwrap_or(false)
-	}
+	/// The parents this commit draws an edge to: the first two
+	/// distinct parents the walk has not already passed.
+	///
+	/// Every parent left out is one that no lane will wait for, and
+	/// that is the point. Git lets a commit name the same parent twice
+	/// and lets an octopus merge name more than two, and a walk
+	/// ordered by commit time can reach a parent before its child. A
+	/// lane opened for any of those could never be closed by a later
+	/// row, so it would hang off the bottom of the log as a line that
+	/// goes nowhere.
+	fn drawable_parents(
+		&mut self,
+		parents: &[CommitId],
+	) -> [Option<UnwalkedAlias>; 2] {
+		let mut drawn: [Option<UnwalkedAlias>; 2] = [None, None];
+		let mut found = 0;
 
-	fn mark_processed(&mut self, alias: CommitAlias) {
-		let index = *alias;
-		if self.processed.len() <= index {
-			self.processed.resize(index + 1, false);
+		for parent_id in parents {
+			if found == drawn.len() {
+				break;
+			}
+
+			let Some(parent) = self.mint_drawable_parent(parent_id)
+			else {
+				continue;
+			};
+
+			let repeated = drawn[..found]
+				.iter()
+				.flatten()
+				.any(|seen| **seen == *parent);
+			if repeated {
+				continue;
+			}
+
+			drawn[found] = Some(parent);
+			found += 1;
 		}
-		self.processed[index] = true;
+
+		drawn
 	}
 
 	pub fn process(
@@ -237,14 +300,14 @@ impl GraphWalker {
 	) {
 		let commit_alias = self.oids.get_or_insert(&commit_id);
 
-		let mut drawable_parents =
-			parents.iter().filter_map(|parent_id| {
-				self.mint_drawable_parent(parent_id)
-			});
+		// Mark the commit walked before resolving its parents, so that
+		// a parent entry naming the commit itself is turned down like
+		// any other already-walked parent instead of opening a lane
+		// that waits for the commit which just closed it.
+		self.facts_mut(commit_alias).processed = true;
 
-		// We explicitly cap support at 2 parents, ignoring octo/mega merges.
-		let first_parent = drawable_parents.next();
-		let second_parent = drawable_parents.next();
+		let [first_parent, second_parent] =
+			self.drawable_parents(parents);
 
 		let chunk = match (first_parent, second_parent) {
 			(Some(parent), Some(second)) => LaneSlot::FlowingMerge {
@@ -256,30 +319,24 @@ impl GraphWalker {
 				alias: commit_alias,
 				parent,
 			},
-			(None, None) => LaneSlot::Settled {
+			// `drawable_parents` fills its slots left to right, so
+			// there is no second parent without a first.
+			(None, _) => LaneSlot::Settled {
 				alias: commit_alias,
 			},
-			(None, Some(_)) => unreachable!(
-				"second_parent is only ever Some once first_parent \
-				 has already been consumed from the identical \
-				 iterator, so a merge always has both parents"
-			),
 		};
 
-		if let LaneSlot::FlowingMerge { second, .. } = &chunk {
-			let second = **second;
-			let index = *commit_alias;
-			if self.merge_parents.len() <= index {
-				self.merge_parents.resize(index + 1, None);
-			}
-			self.merge_parents[index] = Some(second);
+		let second = second_parent.map(|second| *second);
+		let facts = self.facts_mut(commit_alias);
+		facts.is_merge = parents.len() > 1;
+		facts.second_parent = second;
 
+		if let Some(second) = second {
 			if !self.has_lane_to_parent(second) {
 				self.buffer.track_merge_commit(commit_alias);
 			}
 		}
 
-		self.mark_processed(commit_alias);
 		self.buffer.update(&chunk);
 	}
 
@@ -356,13 +413,10 @@ impl GraphWalker {
 		let Some((source_lane, target_lane)) = merge_bridge else {
 			return;
 		};
-		// A commit that lists the same parent twice (git allows
-		// duplicate parent entries, however rare in practice) makes
-		// its own lane await its second parent's alias too, so the
-		// search in `calculate_merge_bridge` can land back on
-		// `commit_lane` itself. There is no separate lane to bridge
-		// to in that case, so skip drawing rather than laying a
-		// zero-length span.
+		// `drawable_parents` keeps the two parents distinct, so the
+		// search in `calculate_merge_bridge` cannot land back on the
+		// merge's own lane. The guard stays because the alternative
+		// is overwriting the commit marker with a zero-length span.
 		if source_lane == target_lane {
 			return;
 		}
@@ -445,14 +499,14 @@ impl GraphWalker {
 			.collect()
 	}
 
-	/// Whether a lane is already waiting for `target_parent`, making
-	/// a second lane for it both redundant and wrong.
+	/// Whether a lane is already waiting for `target_parent`, making a
+	/// second lane for it both redundant and wrong.
 	///
 	/// This has to agree exactly with the two other places that go
 	/// looking for a lane by the parent it awaits: the one that places
 	/// a commit, and the one that picks the far end of a merge bridge.
-	/// Both take the *first* such lane. So if this said no while a
-	/// lane was in fact waiting, the reservation opened on the
+	/// Both of them take the *first* such lane. So if this said no
+	/// while a lane was in fact waiting, the reservation opened on the
 	/// strength of that answer would be left over — the bridge would
 	/// be drawn to the lane that was already there, and the reserved
 	/// column would draw a line with nothing above it.
@@ -464,9 +518,9 @@ impl GraphWalker {
 			.any(|slot| slot.awaits() == Some(target_parent))
 	}
 
-	/// Whether the lane in `target_lane` is the same lane the row
-	/// above had there, which is what lets a bridge end draw a
-	/// junction into it instead of a corner.
+	/// Whether the lane in `target_lane` is the same lane the row above
+	/// had there, which is what lets a bridge end draw a junction into
+	/// it instead of a corner.
 	fn lane_continues_upwards(
 		target_lane: usize,
 		current_snapshot: &[Option<LaneSlot>],
@@ -542,13 +596,14 @@ impl GraphWalker {
 	) -> GraphRow {
 		let commit_alias = self.oids.get(commit_id);
 		let head_alias = head_id.and_then(|id| self.oids.get(id));
-		let second_parent_alias = commit_alias.and_then(|alias| {
-			self.merge_parents.get(*alias).copied().flatten()
-		});
+		let facts = commit_alias
+			.map_or_else(CommitFacts::default, |alias| {
+				self.facts(alias)
+			});
 
 		let commit_lane =
 			Self::find_commit_lane(current_snapshot, commit_alias);
-		let is_merge = second_parent_alias.is_some();
+		let is_merge = facts.is_merge;
 		let is_branch_tip = branch_tips.contains(commit_id);
 		let is_stash = stashes.contains(commit_id);
 
@@ -558,7 +613,7 @@ impl GraphWalker {
 		);
 
 		let merge_bridge =
-			second_parent_alias.and_then(|parent_alias| {
+			facts.second_parent.and_then(|parent_alias| {
 				commit_lane.and_then(|cl| {
 					Self::calculate_merge_bridge(
 						current_snapshot,
@@ -615,11 +670,8 @@ impl GraphWalker {
 			)
 		});
 
-		let active_lane_count =
-			current_snapshot.iter().flatten().count();
-
 		GraphRow {
-			lane_count: active_lane_count.into(),
+			lane_count: LaneIndex::from(lanes.len()),
 			commit_lane: LaneIndex::from(commit_lane.unwrap_or(0)),
 			is_merge,
 			is_branch_tip,
@@ -669,7 +721,15 @@ impl GraphWalker {
 			})
 	}
 
-	/// Identifies lanes that existed in the previous row but terminated before the current row.
+	/// Columns whose lane drew a line into the row above and has no
+	/// occupant now: each one closed into this row's commit and needs
+	/// a bridge drawn across to its lane.
+	///
+	/// A column the row above held a root commit in is not one of
+	/// them. [`LaneSlot::Settled`] draws a marker and no line
+	/// downward, so there would be nothing above for the bridge to
+	/// join, and drawing one would invent an edge between two
+	/// unrelated histories.
 	fn find_branching_lanes(
 		current_snapshot: &[Option<LaneSlot>],
 		previous_snapshot: Option<&[Option<LaneSlot>]>,
@@ -682,7 +742,8 @@ impl GraphWalker {
 			.iter()
 			.enumerate()
 			.filter_map(|(index, previous_chunk)| {
-				(previous_chunk.is_some()
+				(previous_chunk
+					.is_some_and(|chunk| chunk.awaits().is_some())
 					&& current_snapshot
 						.get(index)
 						.is_none_or(Option::is_none))
@@ -733,6 +794,12 @@ impl GraphWalker {
 	/// Lay the horizontal run of a bridge over the lanes strictly
 	/// between its two ends, merging with whatever each cell already
 	/// shows.
+	///
+	/// These cells are passed *through*, never joined — a bridge's two
+	/// ends are drawn by the callers — so the run is recorded as a
+	/// crossing. That is what keeps an unrelated lane drawn whole
+	/// underneath it, and what stops it from swallowing a junction
+	/// another bridge left in the same cell.
 	fn draw_bridge_span(
 		lanes: &mut [Option<(ConnectionType, LaneIndex)>],
 		from: usize,
@@ -744,7 +811,6 @@ impl GraphWalker {
 		}
 	}
 }
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -933,7 +999,7 @@ mod tests {
 		//1 to 2 must be dropped instead of
 		// opening a lane that waits for 2 until the end of the walk.
 		let rows = render(&[(2, &[3]), (1, &[2, 3]), (3, &[])]);
-		assert_eq!(rows, vec!["o", "┃ o", "o━┛"]);
+		assert_eq!(rows, vec!["o", "┃ M", "o━┛"]);
 	}
 
 	#[test]
@@ -944,7 +1010,7 @@ mod tests {
 		let history: &[(usize, &[usize])] =
 			&[(2, &[4]), (3, &[4]), (1, &[2, 3]), (4, &[])];
 
-		assert_eq!(render(history), vec!["o", "┃ o", "┃ ┃ o", "o━┛"]);
+		assert_eq!(render(history), vec!["o", "┃ o", "┃ ┃ M", "o━┛"]);
 
 		let mut walker = GraphWalker::new();
 		for (commit, parents) in history {

@@ -8,11 +8,17 @@ pub use walker::GraphWalker;
 /// The maximum number of colors to use for graph lanes
 pub const MAX_LANE_COLORS: usize = 16;
 
-// Yes, there are repositories where this is exceeded
-// Are they very rare? Yes.
-// On most terminals can more than 256 lanes even be represneted usefully? Not really.
+/// A lane's column within a row, or its slot in the color palette.
+///
+/// Repositories that open more lanes than this can hold do exist, and
+/// no terminal can show that many columns usefully, so the conversion
+/// from a column index saturates rather than wrapping. It is sized so
+/// that the clamp is out of reach of any history a person scrolls
+/// through, because past the clamp every lane reports the same column:
+/// a width that is merely too large is cosmetic, while a column index
+/// that is wrong misplaces an edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaneIndex(u8);
+pub struct LaneIndex(u16);
 
 /// Numeric alias assigned to each commit in the graph.
 ///
@@ -48,7 +54,7 @@ impl From<usize> for CommitAlias {
 
 impl From<usize> for LaneIndex {
 	fn from(lane: usize) -> Self {
-		Self(u8::try_from(lane).unwrap_or(u8::MAX))
+		Self(u16::try_from(lane).unwrap_or(u16::MAX))
 	}
 }
 
@@ -97,9 +103,16 @@ impl ConnectionType {
 	}
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphRow {
-	/// Number of active lanes at this commit row
+	/// How many lane columns this row spans, counting any column it
+	/// leaves blank between two lanes.
+	///
+	/// This is the width the row needs, which is what the log view
+	/// sizes its graph column from. It is deliberately not a count of
+	/// live lanes: a row whose middle lanes have closed still has to
+	/// reserve the columns to the right of the gap, and sizing from a
+	/// count would hide them behind the truncation marker.
 	pub lane_count: LaneIndex,
 
 	/// Which lane index this commit sits on
