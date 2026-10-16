@@ -425,7 +425,9 @@ impl GraphWalker {
 		})
 	}
 
-	/// Determines if a lane should draw an upward-connecting corner.
+	/// Whether the lane in `target_lane` is the same lane the row
+	/// above had there, which is what lets a bridge end draw a
+	/// junction into it instead of a corner.
 	fn lane_continues_upwards(
 		target_lane: usize,
 		current_snapshot: &[Option<LaneSlot>],
@@ -435,9 +437,12 @@ impl GraphWalker {
 			return false;
 		};
 
-		let current = current_snapshot.get(target_lane);
-		current.is_some()
-			&& previous_snapshot.get(target_lane) == current
+		let occupant = |snapshot: &[Option<LaneSlot>]| {
+			snapshot.get(target_lane).copied().flatten()
+		};
+
+		let current = occupant(current_snapshot);
+		current.is_some() && occupant(previous_snapshot) == current
 	}
 
 	/// Uses `Ordering` to elegantly map spatial relationships to visual bitmasks.

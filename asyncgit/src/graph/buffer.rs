@@ -1,22 +1,30 @@
 use super::chunk::LaneSlot;
-use super::CommitAlias;
+use super::{CommitAlias, UnwalkedAlias};
 use std::collections::BTreeMap;
 
 /// A single mutation of the lane state, recorded while processing one
 /// commit.
-#[derive(Clone, Debug)]
+///
+/// A lane's column index *is* its visual identity. Rows are drawn one
+/// at a time and joined to their neighbours by column, and the glyph
+/// set has no diagonal, so a lane that moved sideways between two rows
+/// could only be drawn as two segments that do not meet. These three
+/// operations are therefore the only edits the walk may make:
+/// [`Self::Set`] leaves a column where it is, and [`Self::Push`] and
+/// [`Self::Pop`] only ever touch the right-hand end. No sequence of
+/// them can shift a lane that is still open, which is why there is no
+/// operation here for inserting or removing a column in the middle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeltaOp {
-	Insert {
+	/// Put `slot` into the existing column `index`.
+	Set {
 		index: usize,
-		item: Option<LaneSlot>,
+		slot: Option<LaneSlot>,
 	},
-	Remove {
-		index: usize,
-	},
-	Replace {
-		index: usize,
-		new: Option<LaneSlot>,
-	},
+	/// Append a new rightmost column, holding `slot`.
+	Push { slot: LaneSlot },
+	/// Drop the rightmost column, which is always vacant.
+	Pop,
 }
 
 /// All lane-state mutations caused by processing a single commit.
@@ -49,10 +57,15 @@ pub struct Buffer {
 
 	/// Aliases of merge commits whose second parent still needs a new
 	/// lane.
-	pub merge_commits: Vec<CommitAlias>,
+	merge_commits: Vec<CommitAlias>,
 
-	/// Scratch list of the [`DeltaOp`]s recorded for processing commit
-	pub pending_delta: Vec<DeltaOp>,
+	/// The [`DeltaOp`]s recorded so far for the commit in flight.
+	pending_delta: Vec<DeltaOp>,
+
+	/// Which columns the row above the commit in flight leaves blank,
+	/// so a lane may start in one of them without a line above it to
+	/// join. Rebuilt at the start of every step.
+	blank_above: Vec<bool>,
 }
 
 impl Buffer {
@@ -63,6 +76,8 @@ impl Buffer {
 	}
 
 	pub fn update(&mut self, new_chunk: &LaneSlot) {
+		self.start_step();
+
 		let placement_index = self.place_chunk(new_chunk);
 
 		if let Some(alias) = new_chunk.alias() {
@@ -76,18 +91,41 @@ impl Buffer {
 		self.commit_delta();
 	}
 
+	/// Note which columns the row above draws nothing in.
+	///
+	/// A column that is vacant *now* is not the same thing: the ones
+	/// emptied while this very commit is being processed still have a
+	/// lane drawn in the row above, and are the reason
+	/// [`Self::reserve_lane_right_of`] cannot simply look for a hole.
+	///
+	/// A root commit's column is not blank. [`LaneSlot::Settled`]
+	/// draws a marker and no line below it, so the column is dead for
+	/// the rest of the walk, and it stays occupied on purpose: a
+	/// commit marker drawn directly beneath another one, with no line
+	/// between them, is how a lane draws two consecutive commits, so
+	/// handing the column to an unrelated history would read as
+	/// joining the two.
+	fn start_step(&mut self) {
+		self.blank_above.clear();
+		self.blank_above
+			.extend(self.current.iter().map(Option::is_none));
+	}
+
 	fn place_chunk(&mut self, new_chunk: &LaneSlot) -> usize {
 		// Prefer a lane whose current occupant awaits this chunk's
-		// commit as its primary parent.
+		// commit as its primary parent, then the leftmost column the
+		// row above leaves blank, and only then a new column. All
+		// three land the chunk somewhere no open lane is drawn, so
+		// nothing already on screen has to move.
 		let target = self
 			.find_lane_awaiting_parent(new_chunk.alias())
 			.or_else(|| self.first_empty_lane())
 			.unwrap_or(self.current.len());
 
 		if target < self.current.len() {
-			self.record_replace(target, Some(*new_chunk));
+			self.record_set(target, Some(*new_chunk));
 		} else {
-			self.record_insert(target, Some(*new_chunk));
+			self.record_push(*new_chunk);
 		}
 		target
 	}
@@ -109,6 +147,17 @@ impl Buffer {
 		self.current.iter().position(Option::is_none)
 	}
 
+	/// The column holding `alias`, with its slot.
+	fn lane_of(
+		&self,
+		alias: CommitAlias,
+	) -> Option<(usize, LaneSlot)> {
+		self.current.iter().enumerate().find_map(|(index, slot)| {
+			let chunk = (*slot)?;
+			(chunk.alias() == Some(alias)).then_some((index, chunk))
+		})
+	}
+
 	fn consume_alias_in_other_chunks(
 		&mut self,
 		alias: CommitAlias,
@@ -120,7 +169,7 @@ impl Buffer {
 			}
 
 			// `LaneSlot` is `Copy`; matching by value lets us read
-			// the slot out before `record_replace` mutates `current`.
+			// the slot out before `record_set` mutates `current`.
 			let new_chunk = match self.current[index] {
 				Some(
 					LaneSlot::Flowing { parent, .. }
@@ -147,23 +196,13 @@ impl Buffer {
 				_ => continue,
 			};
 
-			self.record_replace(index, new_chunk);
+			self.record_set(index, new_chunk);
 		}
 	}
 
 	fn flush_merge_commits(&mut self) {
 		while let Some(alias) = self.merge_commits.pop() {
-			// Search for an occupied slot that matches the target alias.
-			// If found, extract its index and a clone of the chunk.
-			let Some((index, chunk)) =
-				self.current.iter().enumerate().find_map(
-					|(index, slot)| {
-						let chunk = *slot.as_ref()?;
-						(chunk.alias() == Some(alias))
-							.then_some((index, chunk))
-					},
-				)
-			else {
+			let Some((index, chunk)) = self.lane_of(alias) else {
 				continue;
 			};
 
@@ -178,7 +217,7 @@ impl Buffer {
 				continue;
 			};
 
-			self.record_replace(
+			self.record_set(
 				index,
 				Some(LaneSlot::Flowing {
 					alias: merge_alias,
@@ -186,21 +225,49 @@ impl Buffer {
 				}),
 			);
 
-			// Always append the merge's second-parent lane to
-			// the end instead of reusing an existing empty slot,
-			// so the new visual column does not collapse
-			// spatial ordering of lanes already in existence.
-			self.record_insert(
-				self.current.len(),
-				Some(LaneSlot::Reserved { parent: second }),
-			);
+			self.reserve_lane_right_of(index, second);
+		}
+	}
+
+	/// Open the lane that a merge's second parent will arrive in,
+	/// somewhere to the right of the merge itself.
+	///
+	/// The nearest column the row above leaves blank wins, which keeps
+	/// the bridge short; failing that the lane goes on the right-hand
+	/// end. A column that only *became* blank while this very commit
+	/// was processed is not a candidate: the row above still draws a
+	/// lane there, and taking the column over would replace that
+	/// lane's closing corner with this one's, erasing an edge.
+	///
+	/// Columns to the left are left alone even when they are free.
+	/// Reusing them would be just as sound, but it would put a merged
+	/// branch on the far side of the history it was merged into, and
+	/// `place_chunk` claims those columns for new branch tips anyway.
+	fn reserve_lane_right_of(
+		&mut self,
+		merge_lane: usize,
+		parent: UnwalkedAlias,
+	) {
+		let slot = LaneSlot::Reserved { parent };
+		let reusable =
+			(merge_lane + 1..self.current.len()).find(|&index| {
+				self.current[index].is_none()
+					&& self
+						.blank_above
+						.get(index)
+						.copied()
+						.unwrap_or(false)
+			});
+
+		match reusable {
+			Some(index) => self.record_set(index, Some(slot)),
+			None => self.record_push(slot),
 		}
 	}
 
 	fn commit_delta(&mut self) {
 		while matches!(self.current.last(), Some(None)) {
-			let last = self.current.len() - 1;
-			self.record_remove(last);
+			self.record_pop();
 		}
 
 		self.deltas
@@ -212,27 +279,19 @@ impl Buffer {
 		}
 	}
 
-	fn record_replace(
-		&mut self,
-		index: usize,
-		new: Option<LaneSlot>,
-	) {
-		self.pending_delta.push(DeltaOp::Replace { index, new });
-		self.current[index] = new;
+	fn record_set(&mut self, index: usize, slot: Option<LaneSlot>) {
+		self.pending_delta.push(DeltaOp::Set { index, slot });
+		self.current[index] = slot;
 	}
 
-	fn record_insert(
-		&mut self,
-		index: usize,
-		item: Option<LaneSlot>,
-	) {
-		self.pending_delta.push(DeltaOp::Insert { index, item });
-		self.current.insert(index, item);
+	fn record_push(&mut self, slot: LaneSlot) {
+		self.pending_delta.push(DeltaOp::Push { slot });
+		self.current.push(Some(slot));
 	}
 
-	fn record_remove(&mut self, index: usize) {
-		self.pending_delta.push(DeltaOp::Remove { index });
-		self.current.remove(index);
+	fn record_pop(&mut self) {
+		self.pending_delta.push(DeltaOp::Pop);
+		self.current.pop();
 	}
 
 	pub fn decompress(
@@ -277,15 +336,11 @@ impl Buffer {
 		delta: &Delta,
 	) {
 		for op in &delta.0 {
-			match op {
-				DeltaOp::Insert { index, item } => {
-					state.insert(*index, *item);
-				}
-				DeltaOp::Remove { index } => {
-					state.remove(*index);
-				}
-				DeltaOp::Replace { index, new } => {
-					state[*index].clone_from(new);
+			match *op {
+				DeltaOp::Set { index, slot } => state[index] = slot,
+				DeltaOp::Push { slot } => state.push(Some(slot)),
+				DeltaOp::Pop => {
+					state.pop();
 				}
 			}
 		}
