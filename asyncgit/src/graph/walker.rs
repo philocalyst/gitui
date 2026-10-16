@@ -20,12 +20,20 @@ bitflags! {
 	/// The neighboring cells a lane joins to. Overlapping lines
 	/// are merged through this representation rather than
 	/// a naive overwrite for readability.
+	///
+	/// [`Self::LEFT`] and [`Self::RIGHT`] are a horizontal run that
+	/// *joins* this cell; [`Self::CROSS`] is one that runs past it
+	/// without joining. Keeping the two apart is what lets a bridge be
+	/// drawn behind an unrelated lane, while a bridge that really ends
+	/// on a lane still gets its junction even when a third line
+	/// crosses the same cell.
 	#[derive(Clone, Copy, Default)]
 	struct Directions: u8 {
-		const UP = 0b0001;
-		const DOWN = 0b0010;
-		const LEFT = 0b0100;
-		const RIGHT = 0b1000;
+		const UP = 0b0_0001;
+		const DOWN = 0b0_0010;
+		const LEFT = 0b0_0100;
+		const RIGHT = 0b0_1000;
+		const CROSS = 0b1_0000;
 	}
 }
 
@@ -75,6 +83,12 @@ fn connection_to_directions(
 		ConnectionType::TeeDown => {
 			Directions::DOWN | Directions::LEFT | Directions::RIGHT
 		}
+		ConnectionType::Cross => {
+			Directions::UP
+				| Directions::DOWN
+				| Directions::LEFT
+				| Directions::RIGHT
+		}
 		ConnectionType::CommitNormal
 		| ConnectionType::CommitBranch
 		| ConnectionType::CommitMerge
@@ -83,36 +97,57 @@ fn connection_to_directions(
 	})
 }
 
+const fn vertical_connection(dotted: bool) -> ConnectionType {
+	if dotted {
+		ConnectionType::VerticalDotted
+	} else {
+		ConnectionType::Vertical
+	}
+}
+
 /// Synthesize a connection glyph from direction components.
-/// Vertical lines take precedence in crossed cells.
-/// Yet the horizontal bridge continues in
-/// the spacer columns either side, so we retain wholeness.
 const fn directions_to_connection(
 	dirs: Directions,
 	dotted: bool,
 ) -> ConnectionType {
 	let up = dirs.contains(Directions::UP);
 	let down = dirs.contains(Directions::DOWN);
-	let left = dirs.contains(Directions::LEFT);
-	let right = dirs.contains(Directions::RIGHT);
+	let joins_left = dirs.contains(Directions::LEFT);
+	let joins_right = dirs.contains(Directions::RIGHT);
+	let crossed = dirs.contains(Directions::CROSS);
+
+	// A lane running straight through the cell. A bridge that merely
+	// crosses it is drawn behind it, which keeps the lane readable and
+	// is the whole reason a crossing is tracked apart from a join. A
+	// bridge that ends on the lane needs a junction instead, and when
+	// the cell is both joined and crossed there is nothing left to
+	// hide the join behind, so it takes the full cross. Drawing that
+	// case as a plain vertical, which is all a single horizontal bit
+	// could do, loses the merge edge out of the picture entirely.
+	if up && down {
+		return match (joins_left, joins_right, crossed) {
+			(false, false, _) => vertical_connection(dotted),
+			(true, false, false) => ConnectionType::TeeLeft,
+			(false, true, false) => ConnectionType::TeeRight,
+			_ => ConnectionType::Cross,
+		};
+	}
+
+	// Below here the cell has at most one vertical end, so a crossing
+	// and a join on the same side are drawn alike.
+	let left = joins_left || crossed;
+	let right = joins_right || crossed;
+
 	match (up, down, left, right) {
-		(true, true, true, false) => ConnectionType::TeeLeft,
-		(true, true, false, true) => ConnectionType::TeeRight,
-		(true, false, true, true) => ConnectionType::TeeUp,
-		(false, true, true, true) => ConnectionType::TeeDown,
-		(true, false, true, false) => ConnectionType::BranchUp,
-		(true, false, false, true) => ConnectionType::BranchUpRight,
-		(false, true, true, false) => {
-			ConnectionType::MergeBridgeStart
-		}
-		(false, true, false, true) => ConnectionType::MergeBridgeEnd,
+		(true, _, true, true) => ConnectionType::TeeUp,
+		(_, true, true, true) => ConnectionType::TeeDown,
+		(true, _, true, false) => ConnectionType::BranchUp,
+		(true, _, false, true) => ConnectionType::BranchUpRight,
+		(_, true, true, false) => ConnectionType::MergeBridgeStart,
+		(_, true, false, true) => ConnectionType::MergeBridgeEnd,
 		(false, false, _, _) => ConnectionType::MergeBridgeMid,
-		(true, true, _, _) | (_, false | true, false, false) => {
-			if dotted {
-				ConnectionType::VerticalDotted
-			} else {
-				ConnectionType::Vertical
-			}
+		(true | false, _, false, false) => {
+			vertical_connection(dotted)
 		}
 	}
 }
@@ -701,11 +736,7 @@ impl GraphWalker {
 		color: LaneIndex,
 	) {
 		for lane in lanes.iter_mut().take(to).skip(from + 1) {
-			overlay_cell(
-				lane,
-				Directions::LEFT | Directions::RIGHT,
-				color,
-			);
+			overlay_cell(lane, Directions::CROSS, color);
 		}
 	}
 }
@@ -737,6 +768,7 @@ mod tests {
 			ConnectionType::TeeRight => '┣',
 			ConnectionType::TeeUp => '┻',
 			ConnectionType::TeeDown => '┳',
+			ConnectionType::Cross => '╋',
 		}
 	}
 

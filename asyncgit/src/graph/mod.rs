@@ -86,6 +86,8 @@ pub enum ConnectionType {
 	TeeUp,
 	/// a lane starting downward while a bridge passes through
 	TeeDown,
+	/// a lane a bridge joins at a cell another bridge runs through
+	Cross,
 }
 
 impl ConnectionType {

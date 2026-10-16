@@ -1,11 +1,4 @@
-use super::utils::graphrow::{
-	SYM_BRANCH_UP, SYM_BRANCH_UP_RIGHT, SYM_COMMIT,
-	SYM_COMMIT_BRANCH, SYM_COMMIT_MERGE, SYM_COMMIT_STASH,
-	SYM_COMMIT_UNCOMMITTED, SYM_HORIZONTAL, SYM_MERGE_BRIDGE_END,
-	SYM_MERGE_BRIDGE_MID, SYM_MERGE_BRIDGE_START, SYM_SPACE,
-	SYM_TEE_DOWN, SYM_TEE_LEFT, SYM_TEE_RIGHT, SYM_TEE_UP,
-	SYM_VERTICAL, SYM_VERTICAL_DOTTED,
-};
+use super::utils::graphrow::{symbol, SYM_HORIZONTAL, SYM_SPACE};
 use super::utils::logitems::{ItemBatch, LogEntry};
 use crate::{
 	app::Environment,
@@ -519,47 +512,11 @@ impl CommitList {
 			}
 			let (sym, graph_color) = match conn {
 				None => (SYM_SPACE, Color::Reset),
-				Some((conn_type, color_idx)) => {
-					let color = GRAPH_COLORS[usize::from(*color_idx)
-						% GRAPH_COLORS.len()];
-					let sym = match conn_type {
-						ConnectionType::Vertical => SYM_VERTICAL,
-						ConnectionType::VerticalDotted => {
-							SYM_VERTICAL_DOTTED
-						}
-						ConnectionType::TeeLeft => SYM_TEE_LEFT,
-						ConnectionType::TeeRight => SYM_TEE_RIGHT,
-						ConnectionType::TeeUp => SYM_TEE_UP,
-						ConnectionType::TeeDown => SYM_TEE_DOWN,
-						ConnectionType::BranchUpRight => {
-							SYM_BRANCH_UP_RIGHT
-						}
-						ConnectionType::CommitNormal => SYM_COMMIT,
-						ConnectionType::CommitBranch => {
-							SYM_COMMIT_BRANCH
-						}
-						ConnectionType::CommitMerge => {
-							SYM_COMMIT_MERGE
-						}
-						ConnectionType::CommitStash => {
-							SYM_COMMIT_STASH
-						}
-						ConnectionType::CommitUncommitted => {
-							SYM_COMMIT_UNCOMMITTED
-						}
-						ConnectionType::MergeBridgeStart => {
-							SYM_MERGE_BRIDGE_START
-						}
-						ConnectionType::MergeBridgeMid => {
-							SYM_MERGE_BRIDGE_MID
-						}
-						ConnectionType::MergeBridgeEnd => {
-							SYM_MERGE_BRIDGE_END
-						}
-						ConnectionType::BranchUp => SYM_BRANCH_UP,
-					};
-					(sym, color)
-				}
+				Some((conn_type, color_idx)) => (
+					symbol(*conn_type),
+					GRAPH_COLORS[usize::from(*color_idx)
+						% GRAPH_COLORS.len()],
+				),
 			};
 			spans.push(Span::styled(
 				sym,
@@ -1174,6 +1131,7 @@ impl Component for CommitList {
 
 #[cfg(test)]
 mod tests {
+	use super::super::utils::graphrow::SYM_COMMIT;
 	use asyncgit::sync::CommitInfo;
 
 	use super::*;

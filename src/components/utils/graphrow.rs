@@ -15,7 +15,33 @@ pub const SYM_TEE_LEFT: &str = "┫";
 pub const SYM_TEE_RIGHT: &str = "┣";
 pub const SYM_TEE_UP: &str = "┻";
 pub const SYM_TEE_DOWN: &str = "┳";
+pub const SYM_CROSS: &str = "╋";
 pub const SYM_SPACE: &str = " ";
+
+/// The glyph the graph column draws for `conn`.
+pub const fn symbol(conn: ConnectionType) -> &'static str {
+	match conn {
+		ConnectionType::Vertical => SYM_VERTICAL,
+		ConnectionType::VerticalDotted => SYM_VERTICAL_DOTTED,
+		ConnectionType::CommitNormal => SYM_COMMIT,
+		ConnectionType::CommitBranch => SYM_COMMIT_BRANCH,
+		ConnectionType::CommitMerge => SYM_COMMIT_MERGE,
+		ConnectionType::CommitStash => SYM_COMMIT_STASH,
+		ConnectionType::CommitUncommitted => SYM_COMMIT_UNCOMMITTED,
+		ConnectionType::MergeBridgeStart => SYM_MERGE_BRIDGE_START,
+		ConnectionType::MergeBridgeMid => SYM_MERGE_BRIDGE_MID,
+		ConnectionType::MergeBridgeEnd => SYM_MERGE_BRIDGE_END,
+		ConnectionType::BranchUp => SYM_BRANCH_UP,
+		ConnectionType::BranchUpRight => SYM_BRANCH_UP_RIGHT,
+		ConnectionType::TeeLeft => SYM_TEE_LEFT,
+		ConnectionType::TeeRight => SYM_TEE_RIGHT,
+		ConnectionType::TeeUp => SYM_TEE_UP,
+		ConnectionType::TeeDown => SYM_TEE_DOWN,
+		ConnectionType::Cross => SYM_CROSS,
+	}
+}
+
+use asyncgit::graph::ConnectionType;
 
 #[cfg(test)]
 mod tests {
@@ -41,6 +67,7 @@ mod tests {
 			SYM_TEE_RIGHT,
 			SYM_TEE_UP,
 			SYM_TEE_DOWN,
+			SYM_CROSS,
 			SYM_SPACE,
 		];
 
