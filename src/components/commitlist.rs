@@ -1,4 +1,3 @@
-use super::utils::graphrow::{symbol, SYM_HORIZONTAL, SYM_SPACE};
 use super::utils::logitems::{ItemBatch, LogEntry};
 use crate::{
 	app::Environment,
@@ -506,63 +505,26 @@ impl CommitList {
 	) -> Vec<Span<'a>> {
 		let mut spans = Vec::new();
 
-		for (lane_index, conn) in row.lanes.iter().enumerate() {
+		for (lane_index, column) in row.columns().enumerate() {
 			if empty_lanes.contains(&lane_index) {
 				continue;
 			}
-			let (sym, graph_color) = match conn {
-				None => (SYM_SPACE, Color::Reset),
-				Some((conn_type, color_idx)) => (
-					symbol(*conn_type),
-					GRAPH_COLORS[usize::from(*color_idx)
-						% GRAPH_COLORS.len()],
-				),
-			};
-			spans.push(Span::styled(
-				sym,
-				Style::default().fg(graph_color),
-			));
-
-			// Spacer
-			let mut is_bridge_lane = false;
-			let mut spacer_color = graph_color;
-
-			let commit_lane = usize::from(row.commit_lane);
-
-			let edges = row
-				.merge_bridge
-				.into_iter()
-				.chain(row.branches.iter().copied());
-
-			for (st, fin) in edges {
-				let (start, finish) =
-					(usize::from(st), usize::from(fin));
-
-				if (start..finish).contains(&lane_index) {
-					is_bridge_lane = true;
-					let target_lane = if commit_lane == start {
-						finish
-					} else {
-						start
-					};
-					spacer_color = GRAPH_COLORS
-						[target_lane % GRAPH_COLORS.len()];
-				}
+			for cell in column {
+				spans.push(match cell {
+					Some((connection, color)) => Span::styled(
+						connection.symbol(),
+						Style::default()
+							.fg(GRAPH_COLORS[usize::from(color)
+								% GRAPH_COLORS.len()]),
+					),
+					None => Span::raw(" "),
+				});
 			}
-
-			if is_bridge_lane {
-				spans.push(Span::styled(
-					SYM_HORIZONTAL,
-					Style::default().fg(spacer_color),
-				));
-				continue;
-			}
-			spans.push(Span::raw(SYM_SPACE));
 		}
 
 		let current_width = spans.len();
 		for _ in current_width..graph_col_width {
-			spans.push(Span::raw(SYM_SPACE));
+			spans.push(Span::raw(" "));
 		}
 
 		spans
@@ -1131,7 +1093,6 @@ impl Component for CommitList {
 
 #[cfg(test)]
 mod tests {
-	use super::super::utils::graphrow::SYM_COMMIT;
 	use asyncgit::sync::CommitInfo;
 
 	use super::*;
@@ -1312,7 +1273,6 @@ mod tests {
 	#[test]
 	fn test_build_graph_spans() {
 		let row = GraphRow {
-			lane_count: 1.into(),
 			commit_lane: 0.into(),
 			is_merge: false,
 			is_branch_tip: false,
@@ -1331,7 +1291,32 @@ mod tests {
 		);
 
 		assert_eq!(spans.len(), 2);
-		assert_eq!(spans[0].content, Cow::from(SYM_COMMIT));
-		assert_eq!(spans[1].content, Cow::from(SYM_SPACE));
+		assert_eq!(spans[0].content, Cow::from("o"));
+		assert_eq!(spans[1].content, Cow::from(" "));
+	}
+
+	#[test]
+	fn graph_spans_keep_bridge_color_when_empty_columns_are_hidden() {
+		let row = GraphRow {
+			commit_lane: 0.into(),
+			lanes: vec![
+				Some((ConnectionType::CommitMerge, 0.into())),
+				Some((ConnectionType::MergeBridgeMid, 2.into())),
+				Some((ConnectionType::MergeBridgeStart, 2.into())),
+			],
+			merge_bridge: Some((0.into(), 2.into())),
+			..GraphRow::default()
+		};
+		let spans = CommitList::build_graph_spans(
+			&row,
+			6,
+			&std::collections::HashSet::from([1]),
+		);
+		let text: String =
+			spans.iter().map(|span| span.content.as_ref()).collect();
+		assert_eq!(text, "M━┓   ");
+		assert_eq!(spans[0].style.fg, Some(GRAPH_COLORS[0]));
+		assert_eq!(spans[1].style.fg, Some(GRAPH_COLORS[2]));
+		assert_eq!(spans[2].style.fg, Some(GRAPH_COLORS[2]));
 	}
 }

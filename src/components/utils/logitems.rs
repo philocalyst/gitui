@@ -156,7 +156,7 @@ impl ItemBatch {
 	pub fn set_graph_rows(&mut self, rows: Vec<GraphRow>) {
 		let mut max: usize = 0;
 		for (entry, row) in self.items.iter_mut().zip(rows) {
-			max = max.max(row.lane_count.into());
+			max = max.max(row.lane_count());
 			entry.graph = Some(row);
 		}
 		self.max_lane = max;

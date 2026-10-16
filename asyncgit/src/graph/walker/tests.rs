@@ -1,7 +1,5 @@
 use super::*;
-use crate::graph::harness::{
-	assert_lane_index_exact, oid, walk_generated, Scene, Shape,
-};
+use crate::graph::harness::{oid, walk_generated, Scene, Shape};
 
 #[test]
 fn linear_history() {
@@ -438,10 +436,9 @@ fn a_wide_history_reports_every_column() {
 	let scene = Scene::walk(&borrowed);
 	let last = &scene.rows[LANES - 1];
 
-	assert_eq!(usize::from(last.lane_count), LANES);
+	assert_eq!(last.lane_count(), LANES);
 	assert_eq!(usize::from(last.commit_lane), LANES - 1);
 	assert_eq!(scene.open_lane_count(), LANES);
-	assert_lane_index_exact(LANES - 1);
 }
 
 #[test]

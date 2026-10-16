@@ -427,7 +427,6 @@ impl GraphWalker {
 		});
 
 		GraphRow {
-			lane_count: LaneIndex::from(lanes.len()),
 			commit_lane: LaneIndex::from(commit_lane.unwrap_or(0)),
 			is_merge,
 			is_branch_tip,

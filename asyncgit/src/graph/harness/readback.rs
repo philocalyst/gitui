@@ -238,3 +238,54 @@ impl Picture {
 		dangling
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::graph::ConnectionType;
+
+	#[test]
+	fn renderer_symbols_are_single_recognized_cells() {
+		use ConnectionType::{
+			BranchUp, BranchUpRight, CommitBranch, CommitMerge,
+			CommitNormal, CommitStash, CommitUncommitted, Cross,
+			MergeBridgeEnd, MergeBridgeMid, MergeBridgeStart,
+			TeeDown, TeeLeft, TeeRight, TeeUp, Vertical,
+			VerticalDotted,
+		};
+		for connection in [
+			Vertical,
+			VerticalDotted,
+			CommitNormal,
+			CommitBranch,
+			CommitMerge,
+			CommitStash,
+			CommitUncommitted,
+			MergeBridgeStart,
+			MergeBridgeMid,
+			MergeBridgeEnd,
+			BranchUp,
+			BranchUpRight,
+			TeeLeft,
+			TeeRight,
+			TeeUp,
+			TeeDown,
+			Cross,
+		] {
+			let glyphs =
+				connection.symbol().chars().collect::<Vec<_>>();
+			assert_eq!(
+				glyphs.len(),
+				1,
+				"{connection:?} occupies more than one cell"
+			);
+			let cell = classify(glyphs[0]);
+			assert_ne!(
+				cell,
+				Cell::Blank,
+				"unrecognized glyph for {connection:?}"
+			);
+			assert_eq!(cell == Cell::Node, connection.is_commit());
+		}
+	}
+}

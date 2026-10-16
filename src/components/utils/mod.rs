@@ -4,7 +4,6 @@ use unicode_width::UnicodeWidthStr;
 #[cfg(feature = "ghemoji")]
 pub mod emoji;
 pub mod filetree;
-pub mod graphrow;
 pub mod logitems;
 pub mod scroll_horizontal;
 pub mod scroll_vertical;

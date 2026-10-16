@@ -13,16 +13,9 @@ pub use walker::GraphWalker;
 pub const MAX_LANE_COLORS: usize = 16;
 
 /// A lane's column within a row, or its slot in the color palette.
-///
-/// Repositories that open more lanes than this can hold do exist, and
-/// no terminal can show that many columns usefully, so the conversion
-/// from a column index saturates rather than wrapping. It is sized so
-/// that the clamp is out of reach of any history a person scrolls
-/// through, because past the clamp every lane reports the same column:
-/// a width that is merely too large is cosmetic, while a column index
-/// that is wrong misplaces an edge.
+/// Column indices are lossless even when the graph is wider than a terminal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LaneIndex(u16);
+pub struct LaneIndex(usize);
 
 /// Numeric alias assigned to each commit in the graph.
 ///
@@ -58,13 +51,13 @@ impl From<usize> for CommitAlias {
 
 impl From<usize> for LaneIndex {
 	fn from(lane: usize) -> Self {
-		Self(u16::try_from(lane).unwrap_or(u16::MAX))
+		Self(lane)
 	}
 }
 
 impl From<LaneIndex> for usize {
 	fn from(lane: LaneIndex) -> Self {
-		lane.0 as Self
+		lane.0
 	}
 }
 
@@ -101,9 +94,26 @@ pub enum ConnectionType {
 }
 
 impl ConnectionType {
-	/// Whether this connection is a dotted vertical line.
-	pub const fn is_dotted(self) -> bool {
-		matches!(self, Self::VerticalDotted)
+	/// The terminal glyph used by both the log view and graph readback tests.
+	pub const fn symbol(self) -> &'static str {
+		match self {
+			Self::Vertical => "┃",
+			Self::VerticalDotted => "╏",
+			Self::CommitNormal => "o",
+			Self::CommitBranch | Self::CommitStash => "*",
+			Self::CommitMerge => "M",
+			Self::CommitUncommitted => "+",
+			Self::MergeBridgeStart => "┓",
+			Self::MergeBridgeMid => "━",
+			Self::MergeBridgeEnd => "┏",
+			Self::BranchUp => "┛",
+			Self::BranchUpRight => "┗",
+			Self::TeeLeft => "┫",
+			Self::TeeRight => "┣",
+			Self::TeeUp => "┻",
+			Self::TeeDown => "┳",
+			Self::Cross => "╋",
+		}
 	}
 
 	/// Whether this is a commit marker rather than a line.
@@ -125,20 +135,10 @@ impl ConnectionType {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GraphRow {
-	/// How many lane columns this row spans, counting any column it
-	/// leaves blank between two lanes.
-	///
-	/// This is the width the row needs, which is what the log view
-	/// sizes its graph column from. It is deliberately not a count of
-	/// live lanes: a row whose middle lanes have closed still has to
-	/// reserve the columns to the right of the gap, and sizing from a
-	/// count would hide them behind the truncation marker.
-	pub lane_count: LaneIndex,
-
 	/// Which lane index this commit sits on
 	pub commit_lane: LaneIndex,
 
-	/// Whether this is a merge commit (two parents)
+	/// Whether Git reports more than one parent for this commit
 	pub is_merge: bool,
 
 	/// Whether this commit is a branch tip
@@ -150,7 +150,7 @@ pub struct GraphRow {
 	/// Connections emitted per lane:
 	/// None = empty space
 	/// Some((ConnectionType, `color_index`)) = draw this connector in this color
-	pub lanes: Vec<Option<(ConnectionType, LaneIndex)>>,
+	pub lanes: Vec<GraphCell>,
 
 	/// Horizontal merge bridge: if this commit merges rightward,
 	/// (`from_lane`, `to_lane`) — the span to draw ─ ╭ ╮ across
@@ -163,3 +163,53 @@ pub struct GraphRow {
 
 /// A glyph and its lane color, or an empty terminal cell.
 pub type GraphCell = Option<(ConnectionType, LaneIndex)>;
+
+impl GraphRow {
+	/// Number of lane columns, including gaps between open lanes.
+	pub const fn lane_count(&self) -> usize {
+		self.lanes.len()
+	}
+
+	/// Two terminal cells per lane: its connector and the horizontal
+	/// bridge segment (or blank) immediately to its right.
+	pub fn columns(
+		&self,
+	) -> impl Iterator<Item = [GraphCell; 2]> + '_ {
+		self.lanes.iter().enumerate().map(|(lane, &cell)| {
+			let spacer = self
+				.merge_bridge
+				.into_iter()
+				.chain(self.branches.iter().copied())
+				.rfind(|&(from, to)| {
+					(usize::from(from)..usize::from(to))
+						.contains(&lane)
+				})
+				.map(|(from, to)| {
+					let target = if from == self.commit_lane {
+						to
+					} else {
+						from
+					};
+					(
+						ConnectionType::MergeBridgeMid,
+						LaneIndex::from(
+							usize::from(target) % MAX_LANE_COLORS,
+						),
+					)
+				});
+			[cell, spacer]
+		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn lane_indices_preserve_columns_beyond_u16() {
+		for column in [usize::from(u16::MAX) + 1, usize::MAX] {
+			assert_eq!(usize::from(LaneIndex::from(column)), column);
+		}
+	}
+}

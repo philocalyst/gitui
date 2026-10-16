@@ -29,9 +29,7 @@ pub use generated::{walk_generated, Shape};
 
 use super::buffer::DeltaOp;
 use super::chunk::LaneSlot;
-use super::{
-	CommitAlias, ConnectionType, GraphRow, GraphWalker, LaneIndex,
-};
+use super::{CommitAlias, GraphRow, GraphWalker};
 use crate::sync::CommitId;
 use readback::{side_name, Cursor, Picture};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -47,36 +45,6 @@ const EXHAUSTIVE_WINDOW_ROWS: usize = 64;
 pub fn oid(n: usize) -> CommitId {
 	CommitId::from_str_unchecked(&format!("{n:040x}"))
 		.expect("valid oid")
-}
-
-/// The character the log view draws for a connection.
-///
-/// This mirrors the symbol table in
-/// `gitui::components::utils::graphrow`, including the fact that a
-/// stash and a branch tip share one marker, so the drawings in these
-/// tests are the picture a terminal shows rather than a prettier
-/// stand-in. Which marker a row drew is pinned separately, by
-/// [`Scene::assert_rows_are_well_formed`].
-pub fn glyph(conn: ConnectionType) -> char {
-	match conn {
-		ConnectionType::Vertical => '┃',
-		ConnectionType::VerticalDotted => '╏',
-		ConnectionType::CommitNormal => 'o',
-		ConnectionType::CommitBranch
-		| ConnectionType::CommitStash => '*',
-		ConnectionType::CommitMerge => 'M',
-		ConnectionType::CommitUncommitted => '+',
-		ConnectionType::MergeBridgeStart => '┓',
-		ConnectionType::MergeBridgeMid => '━',
-		ConnectionType::MergeBridgeEnd => '┏',
-		ConnectionType::BranchUp => '┛',
-		ConnectionType::BranchUpRight => '┗',
-		ConnectionType::TeeLeft => '┫',
-		ConnectionType::TeeRight => '┣',
-		ConnectionType::TeeUp => '┻',
-		ConnectionType::TeeDown => '┳',
-		ConnectionType::Cross => '╋',
-	}
 }
 
 /// One walked history: the rows it draws, and the lane state behind
@@ -173,22 +141,15 @@ impl Scene {
 		self.rows
 			.iter()
 			.map(|row| {
-				let mut cells =
-					Vec::with_capacity(row.lanes.len() * 2);
-				for (lane, conn) in row.lanes.iter().enumerate() {
-					cells.push(conn.map_or(' ', |(c, _)| glyph(c)));
-
-					let in_bridge = row
-						.merge_bridge
-						.into_iter()
-						.chain(row.branches.iter().copied())
-						.any(|(from, to)| {
-							lane >= usize::from(from)
-								&& lane < usize::from(to)
-						});
-					cells.push(if in_bridge { '━' } else { ' ' });
-				}
-				cells
+				row.columns()
+					.flatten()
+					.flat_map(|cell| {
+						cell.map_or(" ", |(connection, _)| {
+							connection.symbol()
+						})
+						.chars()
+					})
+					.collect()
 			})
 			.collect()
 	}
@@ -436,11 +397,6 @@ impl Scene {
 	fn assert_rows_are_well_formed(&self) {
 		for (index, row) in self.rows.iter().enumerate() {
 			let width = row.lanes.len();
-			assert_eq!(
-				usize::from(row.lane_count),
-				width,
-				"row {index} reports a width it did not draw"
-			);
 
 			let markers = row
 				.lanes
@@ -697,14 +653,4 @@ impl Union {
 			self.0[left] = right;
 		}
 	}
-}
-
-/// Assert a `LaneIndex` round-trips the column it was built from, so a
-/// wide graph is reported honestly rather than clamped.
-pub fn assert_lane_index_exact(column: usize) {
-	assert_eq!(
-		usize::from(LaneIndex::from(column)),
-		column,
-		"column {column} does not survive a LaneIndex round trip"
-	);
 }
