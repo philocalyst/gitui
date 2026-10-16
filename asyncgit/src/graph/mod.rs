@@ -1,4 +1,5 @@
 pub mod buffer;
+mod cell;
 pub mod chunk;
 pub mod oids;
 pub mod walker;
@@ -159,3 +160,6 @@ pub struct GraphRow {
 	/// spans to draw ─ ╭ ╮ across
 	pub branches: Vec<(LaneIndex, LaneIndex)>,
 }
+
+/// A glyph and its lane color, or an empty terminal cell.
+pub type GraphCell = Option<(ConnectionType, LaneIndex)>;

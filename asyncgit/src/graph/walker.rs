@@ -1,4 +1,5 @@
 use super::buffer::Buffer;
+use super::cell::{Cell, Directions};
 use super::chunk::{lane_awaiting_parent, LaneSlot};
 use super::oids::GraphOids;
 use super::{
@@ -12,179 +13,6 @@ use std::collections::HashSet;
 /// Get the lane's color index, which cycles through the color palette.
 fn lane_color(lane: usize) -> LaneIndex {
 	LaneIndex::from(lane % MAX_LANE_COLORS)
-}
-
-use bitflags::bitflags;
-
-bitflags! {
-	/// The neighboring cells a lane joins to. Overlapping lines
-	/// are merged through this representation rather than
-	/// a naive overwrite for readability.
-	///
-	/// [`Self::LEFT`] and [`Self::RIGHT`] are a horizontal run that
-	/// *joins* this cell; [`Self::CROSS`] is one that runs past it
-	/// without joining. Keeping the two apart is what lets a bridge be
-	/// drawn behind an unrelated lane, while a bridge that really ends
-	/// on a lane still gets its junction even when a third line
-	/// crosses the same cell.
-	#[derive(Clone, Copy, Default)]
-	struct Directions: u8 {
-		const UP = 0b0_0001;
-		const DOWN = 0b0_0010;
-		const LEFT = 0b0_0100;
-		const RIGHT = 0b0_1000;
-		const CROSS = 0b1_0000;
-	}
-}
-
-impl Directions {
-	#[allow(clippy::missing_const_for_fn)]
-	fn merge(self, other: Self) -> Self {
-		Self::from_bits_retain(self.bits() | other.bits())
-	}
-
-	#[allow(clippy::missing_const_for_fn)]
-	fn vertical(self) -> bool {
-		self.intersects(Self::UP | Self::DOWN)
-	}
-}
-
-/// Extract direction components from a connection glyph.
-/// Returns `None` for commit markers, which are never drawn over.
-fn connection_to_directions(
-	conn: ConnectionType,
-) -> Option<Directions> {
-	Some(match conn {
-		ConnectionType::Vertical | ConnectionType::VerticalDotted => {
-			Directions::UP | Directions::DOWN
-		}
-		ConnectionType::MergeBridgeMid => {
-			Directions::LEFT | Directions::RIGHT
-		}
-		ConnectionType::MergeBridgeStart => {
-			Directions::DOWN | Directions::LEFT
-		}
-		ConnectionType::MergeBridgeEnd => {
-			Directions::DOWN | Directions::RIGHT
-		}
-		ConnectionType::BranchUp => Directions::UP | Directions::LEFT,
-		ConnectionType::BranchUpRight => {
-			Directions::UP | Directions::RIGHT
-		}
-		ConnectionType::TeeLeft => {
-			Directions::UP | Directions::DOWN | Directions::LEFT
-		}
-		ConnectionType::TeeRight => {
-			Directions::UP | Directions::DOWN | Directions::RIGHT
-		}
-		ConnectionType::TeeUp => {
-			Directions::UP | Directions::LEFT | Directions::RIGHT
-		}
-		ConnectionType::TeeDown => {
-			Directions::DOWN | Directions::LEFT | Directions::RIGHT
-		}
-		ConnectionType::Cross => {
-			Directions::UP
-				| Directions::DOWN
-				| Directions::LEFT
-				| Directions::RIGHT
-		}
-		ConnectionType::CommitNormal
-		| ConnectionType::CommitBranch
-		| ConnectionType::CommitMerge
-		| ConnectionType::CommitStash
-		| ConnectionType::CommitUncommitted => return None,
-	})
-}
-
-const fn vertical_connection(dotted: bool) -> ConnectionType {
-	if dotted {
-		ConnectionType::VerticalDotted
-	} else {
-		ConnectionType::Vertical
-	}
-}
-
-/// Synthesize a connection glyph from direction components.
-const fn directions_to_connection(
-	dirs: Directions,
-	dotted: bool,
-) -> ConnectionType {
-	let up = dirs.contains(Directions::UP);
-	let down = dirs.contains(Directions::DOWN);
-	let joins_left = dirs.contains(Directions::LEFT);
-	let joins_right = dirs.contains(Directions::RIGHT);
-	let crossed = dirs.contains(Directions::CROSS);
-
-	// A lane running straight through the cell. A bridge that merely
-	// crosses it is drawn behind it, which keeps the lane readable and
-	// is the whole reason a crossing is tracked apart from a join. A
-	// bridge that ends on the lane needs a junction instead, and when
-	// the cell is both joined and crossed there is nothing left to
-	// hide the join behind, so it takes the full cross. Drawing that
-	// case as a plain vertical, which is all a single horizontal bit
-	// could do, loses the merge edge out of the picture entirely.
-	if up && down {
-		return match (joins_left, joins_right, crossed) {
-			(false, false, _) => vertical_connection(dotted),
-			(true, false, false) => ConnectionType::TeeLeft,
-			(false, true, false) => ConnectionType::TeeRight,
-			_ => ConnectionType::Cross,
-		};
-	}
-
-	// Below here the cell has at most one vertical end, so a crossing
-	// and a join on the same side are drawn alike.
-	let left = joins_left || crossed;
-	let right = joins_right || crossed;
-
-	match (up, down, left, right) {
-		(true, _, true, true) => ConnectionType::TeeUp,
-		(_, true, true, true) => ConnectionType::TeeDown,
-		(true, _, true, false) => ConnectionType::BranchUp,
-		(true, _, false, true) => ConnectionType::BranchUpRight,
-		(_, true, true, false) => ConnectionType::MergeBridgeStart,
-		(_, true, false, true) => ConnectionType::MergeBridgeEnd,
-		(false, false, _, _) => ConnectionType::MergeBridgeMid,
-		(true | false, _, false, false) => {
-			vertical_connection(dotted)
-		}
-	}
-}
-
-/// Draw `add` into a cell, merging with whatever is already there.
-/// The line with a vertical component is the chosen way with color
-/// ensuring lanes stay visually continuous
-fn overlay_cell(
-	cell: &mut Option<(ConnectionType, LaneIndex)>,
-	add: Directions,
-	color: LaneIndex,
-) {
-	if let Some((conn, existing_color)) = cell {
-		// `connection_to_directions` returns `None` for commit markers, which must
-		// never be drawn over; when that happens this branch is
-		// skipped and `cell` is left untouched.
-		if let Some(existing) = connection_to_directions(*conn) {
-			let is_dotted = conn.is_dotted();
-
-			let resolved_color =
-				if existing.vertical() || !add.vertical() {
-					*existing_color
-				} else {
-					color
-				};
-
-			*cell = Some((
-				directions_to_connection(
-					existing.merge(add),
-					is_dotted,
-				),
-				resolved_color,
-			));
-		}
-	} else {
-		*cell = Some((directions_to_connection(add, false), color));
-	}
 }
 
 /// What the walk learned about one commit, indexed by its
@@ -358,7 +186,7 @@ impl GraphWalker {
 	}
 
 	fn draw_merge_bridge(
-		lanes: &mut [Option<(ConnectionType, LaneIndex)>],
+		lanes: &mut [Cell],
 		merge_bridge: Option<(usize, usize)>,
 		commit_lane: usize,
 		current_snapshot: &[Option<LaneSlot>],
@@ -395,12 +223,8 @@ impl GraphWalker {
 		);
 
 		// Replace the plain vertical fill with the precise corner/junction
-		lanes[destination_lane] = None;
-		overlay_cell(
-			&mut lanes[destination_lane],
-			target_directions,
-			connection_color,
-		);
+		lanes[destination_lane] =
+			Cell::line(target_directions, connection_color, false);
 
 		Self::draw_bridge_span(
 			lanes,
@@ -411,7 +235,7 @@ impl GraphWalker {
 	}
 
 	fn draw_branching_lanes(
-		lanes: &mut Vec<Option<(ConnectionType, LaneIndex)>>,
+		lanes: &mut Vec<Cell>,
 		branching_lanes: &[usize],
 		commit_lane: usize,
 	) -> Vec<(LaneIndex, LaneIndex)> {
@@ -439,11 +263,8 @@ impl GraphWalker {
 						start_lane,
 						end_lane,
 					);
-				overlay_cell(
-					&mut lanes[branch_lane],
-					branch_directions,
-					connection_color,
-				);
+				lanes[branch_lane]
+					.overlay(branch_directions, connection_color);
 
 				(
 					LaneIndex::from(start_lane),
@@ -512,11 +333,11 @@ impl GraphWalker {
 	}
 
 	fn ensure_lane_capacity(
-		lanes: &mut Vec<Option<(ConnectionType, LaneIndex)>>,
+		lanes: &mut Vec<Cell>,
 		required_index: usize,
 	) {
 		if lanes.len() <= required_index {
-			lanes.resize(required_index + 1, None);
+			lanes.resize(required_index + 1, Cell::default());
 		}
 	}
 
@@ -558,36 +379,36 @@ impl GraphWalker {
 				})
 			});
 
-		let mut lanes: Vec<Option<(ConnectionType, LaneIndex)>> =
-			current_snapshot
-				.iter()
-				.enumerate()
-				.map(|(lane_index, chunk_option)| {
-					let chunk = chunk_option.as_ref()?;
+		let mut lanes: Vec<Cell> = current_snapshot
+			.iter()
+			.enumerate()
+			.map(|(lane_index, chunk_option)| {
+				let Some(chunk) = chunk_option else {
+					return Cell::default();
+				};
 
-					if commit_alias.is_some()
-						&& chunk.alias() == commit_alias
-					{
-						let connection =
-							Self::determine_commit_connection(
-								is_stash,
-								is_merge,
-								is_branch_tip,
-							);
-						return Some((
-							connection,
-							lane_color(lane_index),
-						));
-					}
+				if commit_alias.is_some()
+					&& chunk.alias() == commit_alias
+				{
+					let connection =
+						Self::determine_commit_connection(
+							is_stash,
+							is_merge,
+							is_branch_tip,
+						);
+					return Cell::commit(
+						connection,
+						lane_color(lane_index),
+					);
+				}
 
-					Self::determine_passthrough_connection(
-						chunk, head_alias,
-					)
-					.map(|connection| {
-						(connection, lane_color(lane_index))
-					})
-				})
-				.collect();
+				Self::determine_passthrough_connection(
+					chunk,
+					head_alias,
+					lane_color(lane_index),
+				)
+			})
+			.collect();
 
 		let branches = commit_lane.map_or_else(Vec::new, |cl| {
 			Self::draw_merge_bridge(
@@ -611,7 +432,7 @@ impl GraphWalker {
 			is_merge,
 			is_branch_tip,
 			is_stash,
-			lanes,
+			lanes: lanes.into_iter().map(Cell::finish).collect(),
 			merge_bridge: merge_bridge.map(|(source, target)| {
 				(LaneIndex::from(source), LaneIndex::from(target))
 			}),
@@ -699,10 +520,11 @@ impl GraphWalker {
 	fn determine_passthrough_connection(
 		chunk: &LaneSlot,
 		head_alias: Option<CommitAlias>,
-	) -> Option<ConnectionType> {
+		color: LaneIndex,
+	) -> Cell {
 		// A settled lane draws nothing below its commit.
 		if matches!(chunk, LaneSlot::Settled { .. }) {
-			return None;
+			return Cell::default();
 		}
 
 		// Dot the segment of any lane, not just lane 0, that is
@@ -712,11 +534,11 @@ impl GraphWalker {
 		let is_dotted =
 			head_alias.is_some() && chunk.awaits() == head_alias;
 
-		if is_dotted {
-			Some(ConnectionType::VerticalDotted)
-		} else {
-			Some(ConnectionType::Vertical)
-		}
+		Cell::line(
+			Directions::UP | Directions::DOWN,
+			color,
+			is_dotted,
+		)
 	}
 
 	/// Lay the horizontal run of a bridge over the lanes strictly
@@ -729,13 +551,13 @@ impl GraphWalker {
 	/// underneath it, and what stops it from swallowing a junction
 	/// another bridge left in the same cell.
 	fn draw_bridge_span(
-		lanes: &mut [Option<(ConnectionType, LaneIndex)>],
+		lanes: &mut [Cell],
 		from: usize,
 		to: usize,
 		color: LaneIndex,
 	) {
 		for lane in lanes.iter_mut().take(to).skip(from + 1) {
-			overlay_cell(lane, Directions::CROSS, color);
+			lane.overlay(Directions::CROSS, color);
 		}
 	}
 }
