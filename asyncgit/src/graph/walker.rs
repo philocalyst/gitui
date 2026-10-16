@@ -531,7 +531,11 @@ impl GraphWalker {
 		};
 
 		let occupant = |snapshot: &[Option<LaneSlot>]| {
-			snapshot.get(target_lane).copied().flatten()
+			snapshot
+				.get(target_lane)
+				.copied()
+				.flatten()
+				.map(|slot| slot.identity())
 		};
 
 		let current = occupant(current_snapshot);
@@ -859,6 +863,37 @@ mod tests {
 			(6, &[]),
 		])
 		.assert_drawing(&["o", "┃ o", "M━┫", "o ┃", "┃ o", "o━┛"]);
+	}
+
+	#[test]
+	fn merge_into_a_lane_that_stops_owing_a_parent_keeps_flowing() {
+		// Commit 2 is a merge that found a lane already heading for
+		// its second parent, so its own lane keeps that debt open.
+		// Commit 4 settles it — commit 4 *is* that second parent — and
+		// in the same row merges the commit that lane is waiting for,
+		// so its bridge ends there. That lane runs through the row,
+		// which makes the bridge end a junction; it is only the slot's
+		// shape that changed, not the lane.
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[6, 4]),
+			(3, &[7]),
+			(4, &[5, 6]),
+			(5, &[8]),
+			(6, &[8]),
+			(7, &[8]),
+			(8, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┣━M",
+			"┃ ┃ o",
+			"M━┫ ┃",
+			"o ┃ ┃",
+			"┃ o ┃",
+			"┃ ┃ o",
+			"o━┻━┛",
+		]);
 	}
 
 	#[test]
@@ -1246,9 +1281,14 @@ mod tests {
 	fn generated_histories_hold_every_invariant() {
 		// Scene::walk holds each of these to every invariant, so this
 		// is the broad sweep behind the drawings above: the shapes
-		// cover long-lived branches, short topics, disjoint roots, and
-		// the parent lists Git permits but a naive walk mishandles.
-		const COMMITS: usize = 70;
+		// cover long-lived branches, short topics, disjoint roots,
+		// mainlines that skip over the branches they merge, and the
+		// parent lists Git permits but a naive walk mishandles.
+		//
+		// Long enough that each history crosses a lane-state
+		// checkpoint, and that the shapes reach the states a short
+		// history never gets into.
+		const COMMITS: usize = 120;
 		const SEEDS: u64 = 10;
 
 		for shape in Shape::ALL {
@@ -1259,3 +1299,4 @@ mod tests {
 		}
 	}
 }
+

@@ -738,6 +738,16 @@ pub enum Shape {
 	Topics,
 	/// Several disjoint histories, each ending in its own root.
 	ManyRoots,
+	/// Merges whose own first parent is a commit later merges reach
+	/// too.
+	///
+	/// Both parents are drawn from the same spread, so a mainline can
+	/// skip over a side branch the way a real one does. Shapes whose
+	/// first parent is always the very next commit cannot produce
+	/// that, and so cannot produce a lane that is left waiting for a
+	/// commit while another merge still owes it — which is the state a
+	/// merge bridge has to reach into.
+	Entangled,
 	/// Parent lists Git permits and a walk has to survive: duplicated
 	/// entries, octopus merges, and parents a clock-skewed walk
 	/// reaches before their children.
@@ -745,11 +755,12 @@ pub enum Shape {
 }
 
 impl Shape {
-	pub const ALL: [Self; 5] = [
+	pub const ALL: [Self; 6] = [
 		Self::Linear,
 		Self::MergeHeavy,
 		Self::Topics,
 		Self::ManyRoots,
+		Self::Entangled,
 		Self::Adversarial,
 	];
 }
@@ -807,6 +818,15 @@ pub fn generate(
 			Shape::ManyRoots => {
 				if !rng.chance(8) {
 					push_later(&mut parents, name, left, 1);
+				}
+			}
+			Shape::Entangled => {
+				const SPAN: usize = 10;
+				let offset = 1 + rng.below(SPAN);
+				push_later(&mut parents, name, left, offset);
+				if rng.chance(2) {
+					let offset = 1 + rng.below(SPAN);
+					push_later(&mut parents, name, left, offset);
 				}
 			}
 			Shape::Adversarial => {

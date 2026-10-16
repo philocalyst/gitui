@@ -59,6 +59,21 @@ impl LaneSlot {
 		}
 	}
 
+	/// What makes this the same lane from one row to the next: the
+	/// commit it belongs to, together with the parent it waits for.
+	///
+	/// Whole slots cannot answer that question. A merge that still
+	/// owes a second parent keeps its lane when that parent is
+	/// finally placed, but stops being a [`Self::FlowingMerge`] in
+	/// the process, and comparing slots by value calls the result a
+	/// different lane — which cuts the lane's line at exactly the row
+	/// where a bridge is reaching it.
+	pub fn identity(
+		&self,
+	) -> (Option<CommitAlias>, Option<CommitAlias>) {
+		(self.alias(), self.awaits())
+	}
+
 	/// Whether this lane's [`Self::awaits`] alias is `alias` — the
 	/// parent of a `Flowing`/`FlowingMerge` lane, or the reservation
 	/// held by a `Reserved` lane.
