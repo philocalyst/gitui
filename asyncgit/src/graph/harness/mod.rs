@@ -24,12 +24,13 @@
 
 mod generated;
 mod readback;
+mod tests;
 
 pub use generated::{walk_generated, Shape};
 
 use super::buffer::DeltaOp;
 use super::chunk::LaneSlot;
-use super::{CommitAlias, GraphRow, GraphWalker};
+use super::{CommitAlias, ConnectionType, GraphRow, GraphWalker};
 use crate::sync::CommitId;
 use readback::{side_name, Cursor, Picture};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -99,9 +100,11 @@ impl Scene {
 		let mut ids = Vec::new();
 		let mut parents = Vec::new();
 		let mut row_of = HashMap::new();
+		let mut snapshots = Vec::new();
 
 		for (commit, commit_parents) in history {
 			walker.process(commit, &commit_parents);
+			snapshots.push(walker.buffer.current.clone());
 			row_of.entry(commit).or_insert(ids.len());
 			ids.push(commit);
 			parents.push(commit_parents);
@@ -114,11 +117,6 @@ impl Scene {
 			&stashes,
 			head.as_ref(),
 		);
-		let snapshots = ids
-			.len()
-			.checked_sub(1)
-			.map(|last| walker.buffer.decompress(0, last))
-			.unwrap_or_default();
 
 		let scene = Self {
 			walker,
@@ -227,11 +225,9 @@ impl Scene {
 	/// The parents this row was entitled to draw an edge to: the first
 	/// two distinct parents the walk had not already passed.
 	///
-	/// Stating the rule here, from the parent lists alone, is what
-	/// makes it testable. Anything left out could only be drawn as a
-	/// lane no later row can close — a duplicated parent entry, an
-	/// octopus merge's third parent and up, or a parent a clock-skewed
-	/// walk reached before its child.
+	/// This policy is stated independently of the walker's parent
+	/// selection. Each row supports at most one merge bridge; repeated,
+	/// self-naming, and already-walked parents must not open lanes.
 	fn drawn_parents(&self, index: usize) -> Vec<CommitId> {
 		let id = &self.ids[index];
 		let mut drawn: Vec<CommitId> = Vec::new();
@@ -269,19 +265,25 @@ impl Scene {
 impl Scene {
 	fn assert_invariants(&self) {
 		self.assert_snapshots_track_the_walk();
+		self.assert_frontier_matches_the_walk();
 		self.assert_delta_stream_is_well_formed();
 		self.assert_columns_hold_still();
 		self.assert_rows_are_well_formed();
 		self.assert_windows_decompress_exactly();
 
-		let picture = Picture::new(&self.cells());
+		self.assert_picture_preserves_history(&Picture::new(
+			&self.cells(),
+		));
+	}
+
+	fn assert_picture_preserves_history(&self, picture: &Picture) {
 		let joined = (0..self.rows.len())
 			.map(|index| {
 				picture.commits_joined_to(self.marker(index))
 			})
 			.collect::<Vec<_>>();
 
-		self.assert_no_dangling_lines(&picture);
+		self.assert_no_dangling_lines(picture);
 		self.assert_every_parent_edge_is_drawn(&joined);
 		self.assert_unrelated_histories_stay_apart(&joined);
 		self.assert_stacked_commits_are_parent_and_child();
@@ -292,17 +294,53 @@ impl Scene {
 		assert_eq!(
 			self.snapshots.len(),
 			self.ids.len(),
-			"decompressing the whole walk lost rows"
+			"the walk lost snapshots"
 		);
 		assert_eq!(
 			self.walker.processed_commit_count(),
 			self.ids.len(),
 			"the buffer holds a delta count the walk did not produce"
 		);
+		if let Some(last) = self.ids.len().checked_sub(1) {
+			assert_eq!(
+				self.walker.buffer.decompress(0, last), self.snapshots,
+				"delta replay differs from the states recorded during the walk"
+			);
+		}
+
 		if let Some(last) = self.snapshots.last() {
 			assert_eq!(
 				last, &self.walker.buffer.current,
-				"the last decompressed row is not the live state"
+				"the last recorded snapshot is not the live state"
+			);
+		}
+	}
+
+	/// The raw history determines which parents are still ahead of
+	/// each row. Every one needs a lane, and no lane may await anything
+	/// else, including a parent the walk has already passed.
+	fn assert_frontier_matches_the_walk(&self) {
+		let mut expected = HashSet::new();
+		for (index, snapshot) in self.snapshots.iter().enumerate() {
+			expected.remove(&self.alias(index));
+			for parent in self.drawn_parents(index) {
+				expected.insert(
+					self.walker
+						.oids
+						.get(&parent)
+						.expect("a drawable parent has an alias"),
+				);
+			}
+			let actual = snapshot
+				.iter()
+				.flatten()
+				.filter_map(LaneSlot::awaits)
+				.collect::<HashSet<_>>();
+			assert_eq!(
+				actual,
+				expected,
+				"row {index} awaits the wrong parents\n{}",
+				self.picture()
 			);
 		}
 	}
@@ -429,6 +467,23 @@ impl Scene {
 				row.is_stash,
 				self.stashes.contains(&self.ids[index]),
 				"row {index} disagrees about being a stash"
+			);
+			let expected_marker =
+				if self.stashes.contains(&self.ids[index]) {
+					ConnectionType::CommitStash
+				} else if self.parents[index].len() > 1 {
+					ConnectionType::CommitMerge
+				} else if self.branch_tips.contains(&self.ids[index])
+				{
+					ConnectionType::CommitBranch
+				} else {
+					ConnectionType::CommitNormal
+				};
+			assert_eq!(
+				row.lanes[usize::from(row.commit_lane)]
+					.map(|(connection, _)| connection),
+				Some(expected_marker),
+				"row {index} draws the wrong commit marker"
 			);
 
 			for (from, to) in row
@@ -570,8 +625,27 @@ impl Scene {
 				continue;
 			}
 
-			for start in (0..=total - length).step_by(stride) {
+			let mut starts = (0..=total - length)
+				.step_by(stride)
+				.collect::<BTreeSet<_>>();
+			starts.insert(total - length);
+			for &checkpoint in self.walker.buffer.checkpoints.keys() {
+				for start in
+					checkpoint.saturating_sub(1)..=checkpoint + 2
+				{
+					if start + length <= total {
+						starts.insert(start);
+					}
+				}
+			}
+
+			for start in starts {
 				let end = start + length;
+				assert_eq!(
+					self.walker.buffer.decompress(start, end - 1),
+					self.snapshots[start..end],
+					"lane states {start}..{end} differ from the recorded walk"
+				);
 				let window = self.walker.compute_rows(
 					&self.ids[start..end],
 					start,

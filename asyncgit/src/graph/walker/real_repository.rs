@@ -19,9 +19,9 @@ use std::collections::HashSet;
 #[test]
 #[ignore = "needs GITUI_GRAPH_PARENTS; see the module docs"]
 fn holds_every_invariant() {
-	let Ok(path) = std::env::var("GITUI_GRAPH_PARENTS") else {
-		return;
-	};
+	let path = std::env::var("GITUI_GRAPH_PARENTS").expect(
+		"set GITUI_GRAPH_PARENTS to a rev-list --parents output file",
+	);
 	let text = std::fs::read_to_string(&path)
 		.expect("GITUI_GRAPH_PARENTS names a readable file");
 
@@ -38,6 +38,7 @@ fn holds_every_invariant() {
 		.collect::<Vec<_>>();
 
 	let total = history.len();
+	assert!(total > 0, "the repository history is empty");
 	Scene::walk_ids(history, HashSet::new(), HashSet::new(), None);
 	eprintln!("{total} commits drawn; every invariant holds");
 }

@@ -205,9 +205,8 @@ impl Picture {
 
 	/// Every line end that points at a cell with nothing to take it.
 	///
-	/// A stub pointing off the edge of the picture is left alone: the
-	/// log view shows a window onto a longer history, so lines running
-	/// off the top and bottom are the normal case.
+	/// Lines may continue off the top and bottom of a history window.
+	/// A horizontal line must end inside the picture.
 	pub fn dangling_ends(&self) -> Vec<(Cursor, u8)> {
 		let mut dangling = Vec::new();
 
@@ -226,9 +225,12 @@ impl Picture {
 						continue;
 					}
 					let cursor = (row, column);
-					if self.neighbour(cursor, side).is_some()
-						&& self.step(cursor, side).is_none()
+					if matches!(side, UP | DOWN)
+						&& self.neighbour(cursor, side).is_none()
 					{
+						continue;
+					}
+					if self.step(cursor, side).is_none() {
 						dangling.push((cursor, side));
 					}
 				}
@@ -243,6 +245,15 @@ impl Picture {
 mod tests {
 	use super::*;
 	use crate::graph::ConnectionType;
+
+	fn picture(rows: &[&str]) -> Picture {
+		Picture::new(
+			&rows
+				.iter()
+				.map(|row| row.chars().collect())
+				.collect::<Vec<_>>(),
+		)
+	}
 
 	#[test]
 	fn renderer_symbols_are_single_recognized_cells() {
@@ -287,5 +298,54 @@ mod tests {
 			);
 			assert_eq!(cell == Cell::Node, connection.is_commit());
 		}
+	}
+
+	#[test]
+	fn crossing_preserves_two_separate_paths() {
+		let graph = picture(&["  o", "o━┃━o", "  o"]);
+		assert_eq!(
+			graph.commits_joined_to((0, 2)),
+			BTreeSet::from([(2, 2)])
+		);
+		assert_eq!(
+			graph.commits_joined_to((1, 0)),
+			BTreeSet::from([(1, 4)])
+		);
+		assert_eq!(graph.dangling_ends(), Vec::<(Cursor, u8)>::new());
+	}
+
+	#[test]
+	fn junction_joins_all_four_paths() {
+		let graph = picture(&["  o", "o━╋━o", "  o"]);
+		assert_eq!(
+			graph.commits_joined_to((0, 2)),
+			BTreeSet::from([(1, 0), (1, 4), (2, 2)])
+		);
+		assert_eq!(graph.dangling_ends(), Vec::<(Cursor, u8)>::new());
+	}
+
+	#[test]
+	fn commits_stop_paths() {
+		let graph = picture(&["o", "o", "o"]);
+		assert_eq!(
+			graph.commits_joined_to((0, 0)),
+			BTreeSet::from([(1, 0)])
+		);
+	}
+
+	#[test]
+	fn only_vertical_paths_can_leave_the_window() {
+		assert_eq!(
+			picture(&["┃"]).dangling_ends(),
+			Vec::<(Cursor, u8)>::new()
+		);
+		assert_eq!(
+			picture(&["━"]).dangling_ends(),
+			vec![((0, 0), LEFT), ((0, 0), RIGHT)]
+		);
+		assert_eq!(
+			picture(&["o", "  ┃"]).dangling_ends(),
+			vec![((1, 2), UP)]
+		);
 	}
 }
