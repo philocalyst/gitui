@@ -1,5 +1,5 @@
 use super::buffer::Buffer;
-use super::chunk::LaneSlot;
+use super::chunk::{lane_awaiting_parent, LaneSlot};
 use super::oids::GraphOids;
 use super::{
 	CommitAlias, ConnectionType, GraphRow, LaneIndex, UnwalkedAlias,
@@ -192,26 +192,14 @@ fn overlay_cell(
 /// flat vector instead of a map.
 #[derive(Clone, Copy, Debug, Default)]
 struct CommitFacts {
-	/// Whether the commit has already been folded into the buffer.
-	///
-	/// [`GraphWalker::mint_drawable_parent`] refuses to mint an
-	/// [`UnwalkedAlias`] for one of these: a lane waiting on a commit
-	/// the walk has already passed would stay open to the end of the
-	/// log, drawing a line that never reaches anything.
+	/// Already folded into the buffer; cannot be awaited by a new lane.
 	processed: bool,
 
-	/// Whether Git reports more than one parent for this commit, which
-	/// is what makes it draw a merge marker.
-	///
-	/// A merge can legitimately end up with a single drawn edge — an
-	/// octopus merge past its second parent, a duplicated parent
-	/// entry, or a second parent the walk reached first — and keeping
-	/// this apart from the lanes lets the marker stay honest about
-	/// what the commit is in all three cases.
+	/// Derived from Git's parent count, independently of drawable edges.
 	is_merge: bool,
 
-	/// The second parent that was given a lane of its own, which is
-	/// the far end of the row's merge bridge.
+	/// The drawable second parent at the far end of the merge bridge.
+	/// It may share a lane that already leads to the same parent.
 	second_parent: Option<CommitAlias>,
 }
 
@@ -254,13 +242,8 @@ impl GraphWalker {
 	/// The parents this commit draws an edge to: the first two
 	/// distinct parents the walk has not already passed.
 	///
-	/// Every parent left out is one that no lane will wait for, and
-	/// that is the point. Git lets a commit name the same parent twice
-	/// and lets an octopus merge name more than two, and a walk
-	/// ordered by commit time can reach a parent before its child. A
-	/// lane opened for any of those could never be closed by a later
-	/// row, so it would hang off the bottom of the log as a line that
-	/// goes nowhere.
+	/// A row has at most one merge bridge. Duplicated, self-naming,
+	/// and already-walked parents must not leave uncloseable lanes.
 	fn drawable_parents(
 		&mut self,
 		parents: &[CommitId],
@@ -309,35 +292,13 @@ impl GraphWalker {
 		let [first_parent, second_parent] =
 			self.drawable_parents(parents);
 
-		let chunk = match (first_parent, second_parent) {
-			(Some(parent), Some(second)) => LaneSlot::FlowingMerge {
-				alias: commit_alias,
-				parent,
-				second,
-			},
-			(Some(parent), None) => LaneSlot::Flowing {
-				alias: commit_alias,
-				parent,
-			},
-			// `drawable_parents` fills its slots left to right, so
-			// there is no second parent without a first.
-			(None, _) => LaneSlot::Settled {
-				alias: commit_alias,
-			},
-		};
-
 		let second = second_parent.map(|second| *second);
 		let facts = self.facts_mut(commit_alias);
 		facts.is_merge = parents.len() > 1;
 		facts.second_parent = second;
 
-		if let Some(second) = second {
-			if !self.has_lane_to_parent(second) {
-				self.buffer.track_merge_commit(commit_alias);
-			}
-		}
-
-		self.buffer.update(&chunk);
+		self.buffer
+			.update(commit_alias, first_parent, second_parent);
 	}
 
 	/// Number of commits already folded into the graph buffer.
@@ -357,15 +318,8 @@ impl GraphWalker {
 			return Vec::new();
 		}
 
-		// Decompress one row before the range to establish predecessor
-		// state. `snapshot_start_index` is usually `global_start_index
-		// - 1`, which also makes `snapshot_end_index` equal to
-		// `snapshot_start_index + commit_range.len()`. But at the very
-		// start of the walk `saturating_sub` clamps to `0` instead of
-		// going negative, since there is no predecessor row to fetch
-		// there; `index_offset` below (`0` in that case, `1`
-		// otherwise) accounts for the difference between the two
-		// cases when indexing into `snapshots`.
+		// Include a predecessor for bridge routing. At the beginning
+		// of the walk there is no predecessor, so the offset is zero.
 		let snapshot_start_index =
 			global_start_index.saturating_sub(1);
 		let snapshot_end_index =
@@ -499,25 +453,6 @@ impl GraphWalker {
 			.collect()
 	}
 
-	/// Whether a lane is already waiting for `target_parent`, making a
-	/// second lane for it both redundant and wrong.
-	///
-	/// This has to agree exactly with the two other places that go
-	/// looking for a lane by the parent it awaits: the one that places
-	/// a commit, and the one that picks the far end of a merge bridge.
-	/// Both of them take the *first* such lane. So if this said no
-	/// while a lane was in fact waiting, the reservation opened on the
-	/// strength of that answer would be left over — the bridge would
-	/// be drawn to the lane that was already there, and the reserved
-	/// column would draw a line with nothing above it.
-	fn has_lane_to_parent(&self, target_parent: CommitAlias) -> bool {
-		self.buffer
-			.current
-			.iter()
-			.flatten()
-			.any(|slot| slot.awaits() == Some(target_parent))
-	}
-
 	/// Whether the lane in `target_lane` is the same lane the row above
 	/// had there, which is what lets a bridge end draw a junction into
 	/// it instead of a corner.
@@ -531,18 +466,14 @@ impl GraphWalker {
 		};
 
 		let occupant = |snapshot: &[Option<LaneSlot>]| {
-			snapshot
-				.get(target_lane)
-				.copied()
-				.flatten()
-				.map(|slot| slot.identity())
+			snapshot.get(target_lane).copied().flatten()
 		};
 
 		let current = occupant(current_snapshot);
 		current.is_some() && occupant(previous_snapshot) == current
 	}
 
-	/// Uses `Ordering` to elegantly map spatial relationships to visual bitmasks.
+	/// Directions at the receiving end of a merge bridge.
 	fn calculate_merge_directions(
 		commit_lane: usize,
 		target_lane: usize,
@@ -710,13 +641,7 @@ impl GraphWalker {
 		commit_lane: usize,
 		second_parent_alias: CommitAlias,
 	) -> Option<(usize, usize)> {
-		current_snapshot
-			.iter()
-			.position(|chunk_option| {
-				chunk_option.as_ref().is_some_and(|chunk| {
-					chunk.waits_for_second_parent(second_parent_alias)
-				})
-			})
+		lane_awaiting_parent(current_snapshot, second_parent_alias)
 			.map(|target_lane| {
 				(
 					commit_lane.min(target_lane),
@@ -784,9 +709,8 @@ impl GraphWalker {
 		// heading toward HEAD: HEAD is not guaranteed to sit on the
 		// leftmost lane, e.g. once earlier lanes have closed and a
 		// later one has taken their place.
-		let is_dotted = head_alias.is_some()
-			&& (chunk.awaits() == head_alias
-				|| chunk.second() == head_alias);
+		let is_dotted =
+			head_alias.is_some() && chunk.awaits() == head_alias;
 
 		if is_dotted {
 			Some(ConnectionType::VerticalDotted)

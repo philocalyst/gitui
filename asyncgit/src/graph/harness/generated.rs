@@ -48,9 +48,8 @@ pub enum Shape {
 	/// Both parents are drawn from the same spread, so a mainline can
 	/// skip over a side branch the way a real one does. Shapes whose
 	/// first parent is always the very next commit cannot produce
-	/// that, and so cannot produce a lane that is left waiting for a
-	/// commit while another merge still owes it — which is the state a
-	/// merge bridge has to reach into.
+	/// that, and miss merges whose second-parent lanes are shared
+	/// across several rows.
 	Entangled,
 	/// Parent lists Git permits and a walk has to survive: duplicated
 	/// entries, octopus merges, and parents a clock-skewed walk

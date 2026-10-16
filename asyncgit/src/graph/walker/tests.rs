@@ -12,7 +12,7 @@ fn linear_history() {
 #[test]
 fn history_with_multiple_roots() {
 	// Two independent commit chains, each terminating in its own
-	// root (a commit with no parents), STAY IN THEIR LANE! A root
+	// root (a commit with no parents), keep separate lanes. A root
 	// draws a marker and no line below it, so handing its column
 	// to the next history would stack two commit markers in one
 	// column — which is exactly how a lane draws two consecutive
@@ -46,14 +46,9 @@ fn merge_into_tracked_lane_continues_through_corner() {
 }
 
 #[test]
-fn merge_into_a_lane_that_stops_owing_a_parent_keeps_flowing() {
-	// Commit 2 is a merge that found a lane already heading for
-	// its second parent, so its own lane keeps that debt open.
-	// Commit 4 settles it — commit 4 *is* that second parent — and
-	// in the same row merges the commit that lane is waiting for,
-	// so its bridge ends there. That lane runs through the row,
-	// which makes the bridge end a junction; it is only the slot's
-	// shape that changed, not the lane.
+fn merging_a_shared_second_parent_preserves_the_other_lane() {
+	// Commit 2 reuses commit 1's lane for parent 4. When 4 merges
+	// parent 6, its bridge must join commit 2's continuing lane.
 	Scene::walk(&[
 		(1, &[4]),
 		(2, &[6, 4]),
@@ -200,14 +195,8 @@ fn second_parent_lane_skips_a_column_this_commit_freed() {
 
 #[test]
 fn merge_bridges_to_the_lane_its_second_parent_already_has() {
-	// Commit 2 is a merge that found a lane already heading for
-	// its second parent, so it owes that parent nothing and keeps
-	// a lane of its own open for it. Commit 3 then merges the
-	// same commit 6 that commit 2's lane is waiting for: it has to
-	// bridge into that lane, not reserve a second column for a
-	// parent only one lane can receive. A second column would be
-	// left drawing a line that starts out of nothing, because the
-	// bridge is always drawn to the first lane waiting.
+	// Commit 2 reuses the lane already heading for 5. Commit 3 must
+	// likewise reuse commit 2's lane for 6, even though 2 is a merge.
 	Scene::walk(&[
 		(1, &[5]),
 		(2, &[6, 5]),
@@ -271,7 +260,7 @@ fn skewed_parent_before_child_leaves_no_phantom_lane() {
 fn complete_walk_settles_all_lanes() {
 	// Both parents of 1 appear before it in the walk (clock
 	// skew). After a complete walk no lane may still wait on a
-	// parent, creating the evil phantom lines
+	// parent.
 	let scene =
 		Scene::walk(&[(2, &[4]), (3, &[4]), (1, &[2, 3]), (4, &[])]);
 	scene.assert_drawing(&["o", "┃ o", "┃ ┃ M", "o━┛"]);
@@ -335,6 +324,31 @@ fn head_lane_is_dotted_in_any_column() {
 }
 
 #[test]
+fn merging_head_dots_only_the_lane_heading_for_head() {
+	Scene::walk_marked(
+		&[
+			(1, &[4]),
+			(2, &[5, 4]),
+			(3, &[6]),
+			(4, &[6]),
+			(5, &[6]),
+			(6, &[]),
+		],
+		&[],
+		&[],
+		Some(4),
+	)
+	.assert_drawing(&[
+		"o",
+		"┣━M",
+		"╏ ┃ o",
+		"o ┃ ┃",
+		"┃ o ┃",
+		"o━┻━┛",
+	]);
+}
+
+#[test]
 fn branch_tip_and_stash_markers_leave_the_lines_alone() {
 	Scene::walk_marked(
 		&[(1, &[2]), (2, &[3]), (3, &[])],
@@ -386,7 +400,7 @@ fn branch_bridge_crosses_unrelated_lane_keeps_own_color() {
 	]);
 
 	// row of commit 5: lane 1 is crossed by the branch bridge but
-	// keeps both its vertical glyph and its own lane color (visual identity mans)
+	// keeps both its vertical glyph and its own lane color (its visual identity)
 	let crossed = scene.rows[3].lanes[1]
 		.expect("crossed lane should not be empty");
 	assert_eq!(crossed.0, ConnectionType::Vertical);
