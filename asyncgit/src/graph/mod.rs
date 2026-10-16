@@ -3,6 +3,9 @@ pub mod chunk;
 pub mod oids;
 pub mod walker;
 
+#[cfg(test)]
+mod harness;
+
 pub use walker::GraphWalker;
 
 /// The maximum number of colors to use for graph lanes
@@ -100,6 +103,22 @@ impl ConnectionType {
 	/// Whether this connection is a dotted vertical line.
 	pub const fn is_dotted(self) -> bool {
 		matches!(self, Self::VerticalDotted)
+	}
+
+	/// Whether this is a commit marker rather than a line.
+	///
+	/// A marker carries no line of its own and is never drawn over:
+	/// whether a line reaches it from above, or leaves it below, is a
+	/// fact about the commit's lane and not about the glyph.
+	pub const fn is_commit(self) -> bool {
+		matches!(
+			self,
+			Self::CommitNormal
+				| Self::CommitBranch
+				| Self::CommitMerge
+				| Self::CommitStash
+				| Self::CommitUncommitted
+		)
 	}
 }
 
