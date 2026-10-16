@@ -11,7 +11,10 @@ use crate::{
 	ui::style::SharedTheme,
 };
 use anyhow::{bail, Ok, Result};
-use asyncgit::sync::commit::commit_message_prettify;
+use asyncgit::sync::commit::{
+	commit_message_comment_char, commit_message_prettify,
+	commit_message_prettify_without_comments,
+};
 use asyncgit::{
 	cached,
 	sync::{
@@ -31,7 +34,7 @@ use ratatui::{
 use std::{
 	fmt::Write as _,
 	fs::{read_to_string, File},
-	io::{Read, Write},
+	io::Write,
 	path::PathBuf,
 	str::FromStr,
 };
@@ -66,6 +69,28 @@ pub struct CommitPopup {
 }
 
 const FIRST_LINE_LIMIT: usize = 50;
+
+fn strip_editor_comments(
+	message: &str,
+	comment_char: char,
+) -> String {
+	message
+		.lines()
+		.filter(|line| !line.starts_with(comment_char))
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
+fn changed_file_editor_comment(
+	change: &StatusItem,
+	comment_char: char,
+) -> String {
+	let status_char = CommitPopup::item_status_char(change.status);
+	format!(
+		"\n{comment_char}\t{status_char}: {}",
+		change.path.escape_debug()
+	)
+}
 
 impl CommitPopup {
 	///
@@ -163,6 +188,7 @@ impl CommitPopup {
 	) -> Result<()> {
 		let file_path = sync::repo_dir(&self.repo.borrow())?
 			.join("COMMIT_EDITMSG");
+		let comment_char = self.commit_comment_char()?;
 
 		{
 			let mut file = File::create(&file_path)?;
@@ -170,40 +196,56 @@ impl CommitPopup {
 				"{}\n",
 				self.input.get_text()
 			))?;
-			file.write_all(
+			let comment_char_string = comment_char.to_string();
+			let instructions =
 				strings::commit_editor_msg(&self.key_config)
-					.as_bytes(),
-			)?;
+					.replace('#', &comment_char_string);
+			file.write_all(instructions.as_bytes())?;
 
-			file.write_all(b"\n#\n# Changes to be committed:")?;
+			writeln!(file, "\n{comment_char}\n{comment_char} Changes to be committed:")?;
 
 			for change in changes {
-				let status_char =
-					Self::item_status_char(change.status);
-				let message =
-					format!("\n#\t{status_char}: {}", change.path);
+				let message = changed_file_editor_comment(
+					&change,
+					comment_char,
+				);
 				file.write_all(message.as_bytes())?;
 			}
 		}
 
-		ExternalEditorPopup::open_file_in_editor(
+		let editor_result = ExternalEditorPopup::open_file_in_editor(
 			&self.repo.borrow(),
 			&file_path,
-		)?;
+		);
 
-		let mut message = String::new();
-
-		let mut file = File::open(&file_path)?;
-		file.read_to_string(&mut message)?;
-		drop(file);
-		std::fs::remove_file(&file_path)?;
-
-		message =
-			commit_message_prettify(&self.repo.borrow(), message)?;
-		self.input.set_text(message);
+		// Keep COMMIT_EDITMSG in place even when the editor exits with an
+		// error (or the message is cancelled), so users can recover their work.
+		let message = read_to_string(&file_path)?;
+		let message = strip_editor_comments(&message, comment_char);
+		let message =
+			commit_message_prettify_without_comments(message)?;
+		let cancelled = self.set_editor_message(message);
 		self.input.show()?;
+		editor_result?;
+
+		if cancelled {
+			self.input.set_text(String::new());
+			return Ok(());
+		}
 
 		Ok(())
+	}
+
+	fn set_editor_message(&mut self, message: String) -> bool {
+		self.input.set_text(message);
+		self.input.get_text().trim().is_empty()
+	}
+
+	fn commit_comment_char(&self) -> Result<char> {
+		Ok(commit_message_comment_char(
+			&self.repo.borrow(),
+			self.input.get_text(),
+		)?)
 	}
 
 	fn commit(&mut self) -> Result<()> {
@@ -494,6 +536,10 @@ impl DrawableComponent for CommitPopup {
 }
 
 impl Component for CommitPopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.input.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -589,7 +635,6 @@ impl Component for CommitPopup {
 						self.queue.push(
 							InternalEvent::OpenExternalEditor(None),
 						);
-						self.hide();
 						true
 					} else if key_match(
 						e,
@@ -637,5 +682,128 @@ impl Component for CommitPopup {
 	fn show(&mut self) -> Result<()> {
 		self.open(None)?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		changed_file_editor_comment, commit_message_prettify,
+		commit_message_prettify_without_comments,
+		strip_editor_comments, CommitPopup, CommitResult,
+	};
+	use crate::app::Environment;
+	use asyncgit::{StatusItem, StatusItemType};
+	use std::{fs::File, io::Write, path::Path};
+
+	#[test]
+	fn removes_git_comment_lines_and_keeps_edited_message() {
+		assert_eq!(
+			strip_editor_comments(
+				"A subject\n\nBody\n# editor help\n# changed files",
+				'#'
+			),
+			"A subject\n\nBody"
+		);
+	}
+
+	#[test]
+	fn alternate_comment_character_is_respected() {
+		assert_eq!(
+			strip_editor_comments("Subject\n; help\nbody", ';'),
+			"Subject\nbody"
+		);
+	}
+
+	#[test]
+	fn comment_only_editor_message_clears_the_commit_modal() {
+		let env = Environment::test_env();
+		let mut popup = CommitPopup::new(&env);
+		let message = strip_editor_comments(
+			"# Edit your commit message\n\n# Changes to be committed:",
+			'#',
+		);
+
+		assert!(popup.set_editor_message(message));
+		assert!(popup.input.get_text().is_empty());
+		assert!(popup.set_editor_message(String::new()));
+	}
+
+	#[test]
+	fn generated_change_comments_escape_newline_file_names() {
+		let change = StatusItem {
+			path: "safe-name\nInjected commit body".to_owned(),
+			status: StatusItemType::Modified,
+		};
+		let comments = format!(
+			"# Changes to be committed:{}",
+			changed_file_editor_comment(&change, '#')
+		);
+		assert_eq!(
+			strip_editor_comments(&comments, '#'),
+			String::new()
+		);
+		assert!(comments.contains("safe-name\\nInjected commit body"));
+	}
+
+	#[test]
+	fn auto_comment_editor_pipeline_preserves_hash_and_a_lines() {
+		let (temp, repo) = git2_testing::repo_init_empty();
+		repo.config()
+			.expect("repository config")
+			.set_str("core.commentChar", "auto")
+			.expect("set automatic comment character");
+		let env = Environment::test_env();
+		*env.repo.borrow_mut() = temp.path().to_path_buf().into();
+		let mut popup = CommitPopup::new(&env);
+		popup.input.set_text("#keep\na legitimate line".to_owned());
+
+		let comment_char =
+			popup.commit_comment_char().expect("comment character");
+		assert_ne!(comment_char, '#');
+		let edited_message = format!(
+			"#keep\na legitimate line\n{comment_char} editor help"
+		);
+		let message =
+			strip_editor_comments(&edited_message, comment_char);
+		let message =
+			commit_message_prettify_without_comments(message)
+				.expect("normalize editor message");
+		popup.set_editor_message(message);
+		let submitted = commit_message_prettify(
+			&env.repo.borrow(),
+			popup.input.get_text().to_owned(),
+		)
+		.expect("normalize message again for commit submission");
+
+		assert_eq!(
+			popup.input.get_text(),
+			"#keep\na legitimate line\n"
+		);
+		assert_eq!(submitted, "#keep\na legitimate line\n");
+
+		File::create(temp.path().join("tracked"))
+			.expect("create staged file")
+			.write_all(b"tracked content")
+			.expect("write staged file");
+		asyncgit::sync::stage_add_file(
+			&env.repo.borrow(),
+			Path::new("tracked"),
+		)
+		.expect("stage test file");
+		assert!(matches!(
+			popup
+				.commit_with_msg(submitted)
+				.expect("submit edited message"),
+			CommitResult::CommitDone
+		));
+		let committed = repo
+			.head()
+			.expect("repository head")
+			.peel_to_commit()
+			.expect("head commit");
+		let committed_message =
+			committed.message().expect("commit message");
+		assert_eq!(committed_message, "#keep\na legitimate line\n");
 	}
 }

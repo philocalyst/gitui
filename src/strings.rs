@@ -97,6 +97,12 @@ pub fn tab_rebase(key_config: &SharedKeyConfig) -> String {
 		key_config.get_hint(key_config.keys.tab_rebase)
 	)
 }
+pub fn tab_branches(key_config: &SharedKeyConfig) -> String {
+	format!(
+		"Branches [{}]",
+		key_config.get_hint(key_config.keys.tab_branches)
+	)
+}
 pub fn tab_divider(_key_config: &SharedKeyConfig) -> String {
 	" | ".to_string()
 }
@@ -548,6 +554,137 @@ pub mod commands {
 	static CMD_GROUP_LOG: &str = "-- Log --";
 	static CMD_GROUP_BRANCHES: &str = "-- Branches --";
 
+	/// Enter or leave the current list's range-selection mode.
+	pub fn selection_mode(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Select [{}]",
+				key_config.get_hint(key_config.keys.select_mode)
+			),
+			"begin or end selection mode",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.select_mode)
+	}
+
+	/// Clear the current list's marks or selection range.
+	pub fn selection_clear(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Clear selection [{}]",
+				key_config.get_hint(key_config.keys.select_clear)
+			),
+			"clear selected items",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.select_clear)
+	}
+
+	/// Select every item supported by the focused list.
+	pub fn selection_all(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Select all [{}]",
+				key_config.get_hint(key_config.keys.select_all)
+			),
+			"select all items in this pane (loaded commits only)",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.select_all)
+	}
+
+	/// Toggle the highlighted row in a multi-item selection.
+	pub fn selection_item(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Toggle item [{}]",
+				key_config.get_hint(key_config.keys.select_item)
+			),
+			"toggle the highlighted item in the selection",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.select_item)
+	}
+
+	/// Move focus to the next pane.
+	pub fn focus_next(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Next pane [{}]",
+				key_config.get_hint(key_config.keys.focus_next)
+			),
+			"move focus to the next pane",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.focus_next)
+	}
+
+	/// Move focus to the previous pane.
+	pub fn focus_previous(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Previous pane [{}]",
+				key_config.get_hint(key_config.keys.focus_previous)
+			),
+			"move focus to the previous pane",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.focus_previous)
+	}
+
+	/// Open the command palette.
+	pub fn command_palette(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Commands [{}]",
+				key_config.get_hint(key_config.keys.command_palette)
+			),
+			"search available commands",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.command_palette)
+	}
+
+	/// Enter the goto prefix.
+	pub fn goto_prefix(key_config: &SharedKeyConfig) -> CommandText {
+		CommandText::new(
+			format!(
+				"Goto [{}]",
+				key_config.get_hint(key_config.keys.goto_prefix)
+			),
+			"choose a tab or location",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.goto_prefix)
+	}
+
+	/// Enter the common actions prefix.
+	pub fn action_prefix(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Actions [{}]",
+				key_config.get_hint(key_config.keys.action_prefix)
+			),
+			"choose a common action",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.action_prefix)
+	}
+
 	pub fn toggle_tabs(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
 			format!(
@@ -557,6 +694,7 @@ pub mod commands {
 			"switch to next tab",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.tab_toggle)
 	}
 	pub fn find_file(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -567,6 +705,7 @@ pub mod commands {
 			"find file in tree",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.file_find)
 	}
 	pub fn find_branch(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -577,20 +716,23 @@ pub mod commands {
 			"find branch in list",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.branch_find)
 	}
 	pub fn toggle_tabs_direct(
 		key_config: &SharedKeyConfig,
 	) -> CommandText {
 		CommandText::new(
 			format!(
-				"Tab [{}{}{}{}{}]",
+				"Tabs [{}, {}, {}, {}, {}, {}, {}]",
 				key_config.get_hint(key_config.keys.tab_status),
 				key_config.get_hint(key_config.keys.tab_log),
 				key_config.get_hint(key_config.keys.tab_files),
 				key_config.get_hint(key_config.keys.tab_stashing),
 				key_config.get_hint(key_config.keys.tab_stashes),
+				key_config.get_hint(key_config.keys.tab_rebase),
+				key_config.get_hint(key_config.keys.tab_branches),
 			),
-			"switch top level tabs directly",
+			"open a tab with the goto prefix",
 			CMD_GROUP_GENERAL,
 		)
 	}
@@ -605,6 +747,7 @@ pub mod commands {
 			"open options popup",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.open_options)
 	}
 	pub fn help_open(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -615,6 +758,7 @@ pub mod commands {
 			"open this help screen",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.open_help)
 	}
 	pub fn navigate_commit_message(
 		key_config: &SharedKeyConfig,
@@ -668,6 +812,7 @@ pub mod commands {
 			"mark multiple commits",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.log_mark_commit)
 	}
 	pub fn copy(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -678,6 +823,7 @@ pub mod commands {
 			"copy selected lines to clipboard",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.copy)
 	}
 	pub fn copy_hash(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -688,6 +834,7 @@ pub mod commands {
 			"copy selected commit hash to clipboard",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.copy)
 	}
 	pub fn copy_path(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -698,6 +845,7 @@ pub mod commands {
 			"copy selected file path to clipboard",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.copy)
 	}
 	pub fn push_tags(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -708,6 +856,7 @@ pub mod commands {
 			"push tags to remote",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.push)
 	}
 	pub fn toggle_option(
 		key_config: &SharedKeyConfig,
@@ -720,6 +869,7 @@ pub mod commands {
 			"toggle search option selected",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_mark_commit)
 	}
 	pub fn show_tag_annotation(
 		key_config: &SharedKeyConfig,
@@ -732,6 +882,7 @@ pub mod commands {
 			"show tag annotation",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.move_right)
 	}
 	pub fn diff_hunk_next(
 		key_config: &SharedKeyConfig,
@@ -744,6 +895,7 @@ pub mod commands {
 			"move cursor to next hunk",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.diff_hunk_next)
 	}
 	pub fn diff_hunk_prev(
 		key_config: &SharedKeyConfig,
@@ -756,6 +908,7 @@ pub mod commands {
 			"move cursor to prev hunk",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.diff_hunk_prev)
 	}
 	pub fn diff_home_end(
 		key_config: &SharedKeyConfig,
@@ -784,6 +937,7 @@ pub mod commands {
 			"adds selected hunk to stage",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.stage_unstage_item)
 	}
 	pub fn diff_hunk_revert(
 		key_config: &SharedKeyConfig,
@@ -797,6 +951,7 @@ pub mod commands {
 			"reverts selected hunk",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.status_reset_item)
 	}
 	pub fn diff_lines_revert(
 		key_config: &SharedKeyConfig,
@@ -809,30 +964,43 @@ pub mod commands {
 			"resets selected lines",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.diff_reset_lines)
 	}
 	pub fn diff_lines_stage(
 		key_config: &SharedKeyConfig,
 	) -> CommandText {
+		let binding = if key_config.is_modal() {
+			key_config.keys.stage_unstage_item
+		} else {
+			key_config.keys.diff_stage_lines
+		};
 		CommandText::new(
 			format!(
-				"Stage lines [{}]",
-				key_config.get_hint(key_config.keys.diff_stage_lines),
+				"Stage selected changes [{}]",
+				key_config.get_hint(binding),
 			),
-			"stage selected lines",
+			"stage selected lines or hunk",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(binding)
 	}
 	pub fn diff_lines_unstage(
 		key_config: &SharedKeyConfig,
 	) -> CommandText {
+		let binding = if key_config.is_modal() {
+			key_config.keys.status_unstage_item
+		} else {
+			key_config.keys.diff_stage_lines
+		};
 		CommandText::new(
 			format!(
 				"Unstage lines [{}]",
-				key_config.get_hint(key_config.keys.diff_stage_lines),
+				key_config.get_hint(binding),
 			),
 			"unstage selected lines",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(binding)
 	}
 	pub fn diff_hunk_remove(
 		key_config: &SharedKeyConfig,
@@ -846,6 +1014,7 @@ pub mod commands {
 			"removes selected hunk from stage",
 			CMD_GROUP_DIFF,
 		)
+		.with_binding(key_config.keys.stage_unstage_item)
 	}
 	pub fn close_fuzzy_finder(
 		key_config: &SharedKeyConfig,
@@ -869,6 +1038,7 @@ pub mod commands {
 			"close overlay (e.g commit, help)",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.exit_popup)
 	}
 	pub fn scroll_popup(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -890,6 +1060,7 @@ pub mod commands {
 			"close msg popup (e.g msg)",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 	pub fn validate_msg(key_config: &SharedKeyConfig) -> CommandText {
@@ -901,6 +1072,7 @@ pub mod commands {
 			"validate msg",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 
@@ -913,6 +1085,7 @@ pub mod commands {
 			"abort ongoing merge",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.abort_merge)
 	}
 
 	pub fn abort_revert(key_config: &SharedKeyConfig) -> CommandText {
@@ -924,6 +1097,7 @@ pub mod commands {
 			"abort ongoing revert",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.abort_merge)
 	}
 
 	pub fn view_submodules(
@@ -937,6 +1111,7 @@ pub mod commands {
 			"open submodule view",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.view_submodules)
 	}
 
 	pub fn view_remotes(key_config: &SharedKeyConfig) -> CommandText {
@@ -948,6 +1123,7 @@ pub mod commands {
 			"open remotes view",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.view_remotes)
 	}
 
 	pub fn update_remote_name(
@@ -962,6 +1138,7 @@ pub mod commands {
 			"updates a remote name",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.update_remote_name)
 	}
 
 	pub fn update_remote_url(
@@ -976,6 +1153,7 @@ pub mod commands {
 			"updates a remote url",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.update_remote_url)
 	}
 
 	pub fn create_remote(
@@ -989,6 +1167,7 @@ pub mod commands {
 			"creates a new remote",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.add_remote)
 	}
 
 	pub fn delete_remote_popup(
@@ -1002,6 +1181,7 @@ pub mod commands {
 			"remove a remote",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.delete_remote)
 	}
 
 	pub fn remote_confirm_name_msg(
@@ -1015,6 +1195,7 @@ pub mod commands {
 			"confirm remote name",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 
@@ -1029,6 +1210,7 @@ pub mod commands {
 			"confirm remote url",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 
@@ -1043,6 +1225,7 @@ pub mod commands {
 			"open submodule",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 
 	pub fn open_submodule_parent(
@@ -1057,6 +1240,7 @@ pub mod commands {
 			"open submodule parent repo",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.view_submodule_parent)
 	}
 
 	pub fn update_submodule(
@@ -1070,6 +1254,7 @@ pub mod commands {
 			"update submodule",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.update_submodule)
 	}
 
 	pub fn continue_rebase(
@@ -1083,6 +1268,7 @@ pub mod commands {
 			"continue ongoing rebase",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.rebase_branch)
 	}
 
 	pub fn abort_rebase(key_config: &SharedKeyConfig) -> CommandText {
@@ -1094,6 +1280,7 @@ pub mod commands {
 			"abort ongoing rebase",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.abort_merge)
 	}
 
 	pub fn select_staging(
@@ -1107,6 +1294,7 @@ pub mod commands {
 			"focus/select staging area",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.toggle_workarea)
 	}
 	pub fn select_unstaged(
 		key_config: &SharedKeyConfig,
@@ -1119,6 +1307,7 @@ pub mod commands {
 			"focus/select unstaged area",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.toggle_workarea)
 	}
 	pub fn undo_commit(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1129,6 +1318,7 @@ pub mod commands {
 			"undo last commit",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.undo_commit)
 	}
 	pub fn commit_open(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1139,6 +1329,7 @@ pub mod commands {
 			"open commit popup (available in non-empty stage)",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.open_commit)
 	}
 	pub fn commit_open_editor(
 		key_config: &SharedKeyConfig,
@@ -1152,6 +1343,21 @@ pub mod commands {
 			"open commit editor (available in commit popup)",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.open_commit_editor)
+	}
+	pub fn commit_open_inline(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Inline Commit [{}]",
+				key_config
+					.get_hint(key_config.keys.open_commit_inline),
+			),
+			"open the inline commit editor",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.open_commit_inline)
 	}
 	pub fn commit_next_msg_from_history(
 		key_config: &SharedKeyConfig,
@@ -1165,6 +1371,7 @@ pub mod commands {
 			"use previous commit message from history",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.commit_history_next)
 	}
 	pub fn commit_submit(
 		key_config: &SharedKeyConfig,
@@ -1177,6 +1384,7 @@ pub mod commands {
 			"commit (available when commit message is non-empty)",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.commit)
 		.hide_help()
 	}
 	pub fn newline(key_config: &SharedKeyConfig) -> CommandText {
@@ -1188,6 +1396,7 @@ pub mod commands {
 			"create line break",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.newline)
 		.hide_help()
 	}
 	pub fn toggle_verify(
@@ -1203,7 +1412,7 @@ pub mod commands {
 			),
 			"toggle running on commit hooks (available in commit popup)",
 			CMD_GROUP_COMMIT_POPUP,
-		)
+		).with_binding(key_config.keys.toggle_verify)
 	}
 
 	pub fn commit_amend(key_config: &SharedKeyConfig) -> CommandText {
@@ -1215,6 +1424,7 @@ pub mod commands {
 			"amend last commit (available in commit popup)",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.commit_amend)
 	}
 	pub fn commit_signoff(
 		key_config: &SharedKeyConfig,
@@ -1227,6 +1437,7 @@ pub mod commands {
 			"sign-off commit (-s option)",
 			CMD_GROUP_COMMIT_POPUP,
 		)
+		.with_binding(key_config.keys.toggle_signoff)
 	}
 	pub fn edit_item(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1237,6 +1448,7 @@ pub mod commands {
 			"edit the currently selected file in an external editor",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.edit_file)
 	}
 	pub fn stage_item(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1248,6 +1460,7 @@ pub mod commands {
 			"stage currently selected file or entire path",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.stage_unstage_item)
 	}
 	pub fn stage_all(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1258,17 +1471,20 @@ pub mod commands {
 			"stage all changes (in unstaged files)",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.status_stage_all)
 	}
 	pub fn unstage_item(key_config: &SharedKeyConfig) -> CommandText {
+		let binding = if key_config.is_modal() {
+			key_config.keys.status_unstage_item
+		} else {
+			key_config.keys.stage_unstage_item
+		};
 		CommandText::new(
-			format!(
-				"Unstage [{}]",
-				key_config
-					.get_hint(key_config.keys.stage_unstage_item),
-			),
+			format!("Unstage [{}]", key_config.get_hint(binding)),
 			"unstage currently selected file or entire path",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(binding)
 	}
 	pub fn unstage_all(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1279,6 +1495,7 @@ pub mod commands {
 			"unstage all files (in staged files)",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.status_stage_all)
 	}
 	pub fn reset_item(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1290,6 +1507,7 @@ pub mod commands {
 			"revert changes in selected file or entire path",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.status_reset_item)
 	}
 	pub fn ignore_item(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1301,6 +1519,7 @@ pub mod commands {
 			"Add file or path to .gitignore",
 			CMD_GROUP_CHANGES,
 		)
+		.with_binding(key_config.keys.status_ignore_file)
 	}
 
 	pub fn diff_focus_left(
@@ -1314,6 +1533,7 @@ pub mod commands {
 			"view and select changed files",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.move_left)
 	}
 	pub fn diff_focus_right(
 		key_config: &SharedKeyConfig,
@@ -1326,6 +1546,33 @@ pub mod commands {
 			"inspect file diff",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.move_right)
+	}
+	pub fn diff_view_toggle(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Review/Patch [{}]",
+				key_config.get_hint(key_config.keys.diff_view_toggle)
+			),
+			"toggle the read-only native preview and Git patch view",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.diff_view_toggle)
+	}
+	pub fn diff_zoom_toggle(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Zoom diff [{}]",
+				key_config.get_hint(key_config.keys.diff_zoom_toggle)
+			),
+			"expand the selected diff to the full Status view",
+			CMD_GROUP_GENERAL,
+		)
+		.with_binding(key_config.keys.diff_zoom_toggle)
 	}
 	pub fn quit(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1336,6 +1583,7 @@ pub mod commands {
 			"quit gitui application",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.exit)
 	}
 	pub fn confirm_action(
 		key_config: &SharedKeyConfig,
@@ -1348,6 +1596,7 @@ pub mod commands {
 			"confirm action",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 	pub fn stashing_save(
 		key_config: &SharedKeyConfig,
@@ -1360,6 +1609,7 @@ pub mod commands {
 			"opens stash name input popup",
 			CMD_GROUP_STASHING,
 		)
+		.with_binding(key_config.keys.stashing_save)
 	}
 	pub fn stashing_toggle_indexed(
 		key_config: &SharedKeyConfig,
@@ -1373,6 +1623,7 @@ pub mod commands {
 			"toggle including staged files into stash",
 			CMD_GROUP_STASHING,
 		)
+		.with_binding(key_config.keys.stashing_toggle_index)
 	}
 	pub fn stashing_toggle_untracked(
 		key_config: &SharedKeyConfig,
@@ -1387,6 +1638,7 @@ pub mod commands {
 			"toggle including untracked files into stash",
 			CMD_GROUP_STASHING,
 		)
+		.with_binding(key_config.keys.stashing_toggle_untracked)
 	}
 	pub fn stashing_confirm_msg(
 		key_config: &SharedKeyConfig,
@@ -1399,6 +1651,7 @@ pub mod commands {
 			"save files to stash",
 			CMD_GROUP_STASHING,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 	pub fn stashlist_apply(
 		key_config: &SharedKeyConfig,
@@ -1411,6 +1664,7 @@ pub mod commands {
 			"apply selected stash",
 			CMD_GROUP_STASHES,
 		)
+		.with_binding(key_config.keys.stash_apply)
 	}
 	pub fn stashlist_drop(
 		key_config: &SharedKeyConfig,
@@ -1429,6 +1683,7 @@ pub mod commands {
 			"drop selected stash",
 			CMD_GROUP_STASHES,
 		)
+		.with_binding(key_config.keys.stash_drop)
 	}
 	pub fn stashlist_pop(
 		key_config: &SharedKeyConfig,
@@ -1441,6 +1696,7 @@ pub mod commands {
 			"pop selected stash",
 			CMD_GROUP_STASHES,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 	pub fn stashlist_inspect(
 		key_config: &SharedKeyConfig,
@@ -1453,6 +1709,7 @@ pub mod commands {
 			"open stash commit details (allows to diff files)",
 			CMD_GROUP_STASHES,
 		)
+		.with_binding(key_config.keys.stash_open)
 	}
 	pub fn log_details_toggle(
 		key_config: &SharedKeyConfig,
@@ -1465,6 +1722,7 @@ pub mod commands {
 			"open details of selected commit",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 
 	pub fn commit_details_open(
@@ -1478,6 +1736,7 @@ pub mod commands {
 			"inspect selected commit in detail",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.move_right)
 	}
 
 	pub fn blame_file(key_config: &SharedKeyConfig) -> CommandText {
@@ -1489,6 +1748,7 @@ pub mod commands {
 			"open blame view of selected file",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.blame)
 	}
 	pub fn open_file_history(
 		key_config: &SharedKeyConfig,
@@ -1501,6 +1761,7 @@ pub mod commands {
 			"open history of selected file",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.file_history)
 	}
 	pub fn open_line_number_popup(
 		key_config: &SharedKeyConfig,
@@ -1513,6 +1774,7 @@ pub mod commands {
 			"go to a given line number in the blame view",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.goto_line)
 	}
 	pub fn log_tag_commit(
 		key_config: &SharedKeyConfig,
@@ -1525,6 +1787,7 @@ pub mod commands {
 			"tag commit",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_tag_commit)
 	}
 	pub fn log_checkout_commit(
 		key_config: &SharedKeyConfig,
@@ -1538,6 +1801,7 @@ pub mod commands {
 			"checkout commit",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_checkout_commit)
 	}
 	pub fn inspect_file_tree(
 		key_config: &SharedKeyConfig,
@@ -1550,6 +1814,7 @@ pub mod commands {
 			"inspect file tree at specific revision",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.open_file_tree)
 	}
 	pub fn revert_commit(
 		key_config: &SharedKeyConfig,
@@ -1563,6 +1828,7 @@ pub mod commands {
 			"revert commit",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.status_reset_item)
 	}
 	pub fn log_reset_commit(
 		key_config: &SharedKeyConfig,
@@ -1575,6 +1841,7 @@ pub mod commands {
 			"reset to commit",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_reset_commit)
 	}
 	pub fn log_reword_commit(
 		key_config: &SharedKeyConfig,
@@ -1588,6 +1855,7 @@ pub mod commands {
 			"reword commit message",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_reword_commit)
 	}
 	pub fn log_rewrite_from(
 		key_config: &SharedKeyConfig,
@@ -1600,7 +1868,7 @@ pub mod commands {
 			),
 			"draft an interactive rebase of everything after this commit's parent, including it",
 			CMD_GROUP_LOG,
-		)
+		).with_binding(key_config.keys.log_rewrite_from)
 	}
 	pub fn log_find_commit(
 		key_config: &SharedKeyConfig,
@@ -1613,6 +1881,7 @@ pub mod commands {
 			"start commit search",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.file_find)
 	}
 	pub fn log_close_search(
 		key_config: &SharedKeyConfig,
@@ -1625,6 +1894,7 @@ pub mod commands {
 			"leave search mode",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.exit_popup)
 	}
 
 	pub fn log_toggle_graph(
@@ -1638,6 +1908,7 @@ pub mod commands {
 			"toggle commit graph",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.log_toggle_graph)
 	}
 
 	pub fn reset_commit(key_config: &SharedKeyConfig) -> CommandText {
@@ -1649,6 +1920,7 @@ pub mod commands {
 			"confirm reset",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 
 	pub fn reset_branch(key_config: &SharedKeyConfig) -> CommandText {
@@ -1660,6 +1932,7 @@ pub mod commands {
 			"confirm reset",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.reset_branch)
 	}
 
 	pub fn reset_type(key_config: &SharedKeyConfig) -> CommandText {
@@ -1702,6 +1975,7 @@ pub mod commands {
 			"annotate tag",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.tag_annotate)
 	}
 
 	pub fn create_branch_confirm_msg(
@@ -1715,6 +1989,7 @@ pub mod commands {
 			"create branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 	pub fn open_branch_create_popup(
@@ -1728,6 +2003,7 @@ pub mod commands {
 			"open create branch popup",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.create_branch)
 	}
 	pub fn rename_branch_confirm_msg(
 		key_config: &SharedKeyConfig,
@@ -1740,6 +2016,7 @@ pub mod commands {
 			"rename branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.enter)
 		.hide_help()
 	}
 	pub fn rename_branch_popup(
@@ -1753,6 +2030,7 @@ pub mod commands {
 			"rename branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.rename_branch)
 	}
 	pub fn delete_branch_popup(
 		key_config: &SharedKeyConfig,
@@ -1765,6 +2043,7 @@ pub mod commands {
 			"delete a branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.delete_branch)
 	}
 	pub fn merge_branch_popup(
 		key_config: &SharedKeyConfig,
@@ -1777,6 +2056,7 @@ pub mod commands {
 			"merge a branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.merge_branch)
 	}
 
 	pub fn branch_popup_rebase(
@@ -1790,6 +2070,7 @@ pub mod commands {
 			"rebase a branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.rebase_branch)
 	}
 
 	pub fn compare_with_head(
@@ -1803,6 +2084,7 @@ pub mod commands {
 			"compare with head",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.compare_commits)
 	}
 
 	pub fn compare_commits(
@@ -1816,6 +2098,51 @@ pub mod commands {
 			"compare two marked commits",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.compare_commits)
+	}
+
+	pub fn branches_set_base(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Set base [{}]",
+				key_config
+					.get_hint(key_config.keys.branches_set_base),
+			),
+			"choose the base branch for comparison",
+			CMD_GROUP_BRANCHES,
+		)
+		.with_binding(key_config.keys.branches_set_base)
+	}
+
+	pub fn branches_load_more(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Load 200 More Commits [{}]",
+				key_config
+					.get_hint(key_config.keys.branches_load_more),
+			),
+			"load the next 200 commits into the branch graph",
+			CMD_GROUP_BRANCHES,
+		)
+		.with_binding(key_config.keys.branches_load_more)
+	}
+
+	pub fn branches_create(
+		key_config: &SharedKeyConfig,
+	) -> CommandText {
+		CommandText::new(
+			format!(
+				"Create branch [{}]",
+				key_config.get_hint(key_config.keys.branches_create),
+			),
+			"create a branch from the selected repository state",
+			CMD_GROUP_BRANCHES,
+		)
+		.with_binding(key_config.keys.branches_create)
 	}
 
 	pub fn select_branch_popup(
@@ -1829,6 +2156,7 @@ pub mod commands {
 			"checkout branch",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 	pub fn toggle_branch_popup(
 		key_config: &SharedKeyConfig,
@@ -1843,6 +2171,7 @@ pub mod commands {
 			"toggle branch type (remote/local)",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.tab_toggle)
 	}
 	pub fn open_branch_select_popup(
 		key_config: &SharedKeyConfig,
@@ -1855,6 +2184,7 @@ pub mod commands {
 			"open branch popup",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.select_branch)
 	}
 
 	pub fn open_tags_popup(
@@ -1868,6 +2198,7 @@ pub mod commands {
 			"open tags popup",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.tags)
 	}
 	pub fn delete_tag_popup(
 		key_config: &SharedKeyConfig,
@@ -1880,6 +2211,7 @@ pub mod commands {
 			"delete a tag",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.delete_tag)
 	}
 	pub fn select_tag(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1890,6 +2222,7 @@ pub mod commands {
 			"Select commit in revlog",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.select_tag)
 	}
 
 	pub fn status_push(key_config: &SharedKeyConfig) -> CommandText {
@@ -1901,6 +2234,7 @@ pub mod commands {
 			"push to origin",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.push)
 	}
 	pub fn status_force_push(
 		key_config: &SharedKeyConfig,
@@ -1913,6 +2247,7 @@ pub mod commands {
 			"force push to origin",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.force_push)
 	}
 
 	pub fn status_fetch(key_config: &SharedKeyConfig) -> CommandText {
@@ -1924,6 +2259,7 @@ pub mod commands {
 			"fetch",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.fetch)
 	}
 	pub fn status_pull(key_config: &SharedKeyConfig) -> CommandText {
 		CommandText::new(
@@ -1934,6 +2270,7 @@ pub mod commands {
 			"fetch/merge",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.pull)
 	}
 
 	pub fn fetch_remotes(
@@ -1947,6 +2284,7 @@ pub mod commands {
 			"fetch/prune",
 			CMD_GROUP_BRANCHES,
 		)
+		.with_binding(key_config.keys.fetch)
 	}
 
 	pub fn find_commit_sha(
@@ -1960,6 +2298,7 @@ pub mod commands {
 			"find commit from sha",
 			CMD_GROUP_LOG,
 		)
+		.with_binding(key_config.keys.find_commit_sha)
 	}
 
 	pub fn goto_line(key_config: &SharedKeyConfig) -> CommandText {
@@ -1971,6 +2310,7 @@ pub mod commands {
 			"Go to the given line",
 			CMD_GROUP_GENERAL,
 		)
+		.with_binding(key_config.keys.enter)
 	}
 }
 
@@ -2314,6 +2654,7 @@ pub mod rebase {
 				"start the reviewed rebase",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_start)
 		}
 
 		///
@@ -2328,6 +2669,7 @@ pub mod rebase {
 				"continue the stopped rebase",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.enter)
 		}
 
 		///
@@ -2340,6 +2682,7 @@ pub mod rebase {
 				"skip the stopped step",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_skip)
 		}
 
 		///
@@ -2354,6 +2697,7 @@ pub mod rebase {
 				"keep the commit that became empty",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_keep)
 		}
 
 		///
@@ -2366,6 +2710,7 @@ pub mod rebase {
 				"abort the rebase and restore the original state",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_abort)
 		}
 
 		///
@@ -2389,6 +2734,7 @@ pub mod rebase {
 				"insert a deliberate stop before the selection",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_break)
 		}
 
 		///
@@ -2403,6 +2749,7 @@ pub mod rebase {
 				"insert a shell command before the selection",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_exec)
 		}
 
 		///
@@ -2416,6 +2763,7 @@ pub mod rebase {
 				"compose the selected reword/squash message",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_compose)
 		}
 
 		///
@@ -2428,6 +2776,7 @@ pub mod rebase {
 				"undo the last plan edit",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_undo)
 		}
 
 		///
@@ -2440,6 +2789,7 @@ pub mod rebase {
 				"redo an undone plan edit",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_redo)
 		}
 
 		///
@@ -2470,6 +2820,7 @@ pub mod rebase {
 				"toggle the inspector panel",
 				CMD_GROUP_REBASE,
 			)
+			.with_binding(key_config.keys.rebase_inspector)
 		}
 
 		///
@@ -2490,6 +2841,8 @@ pub mod rebase {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::keys::{KeyConfig, Keymap};
+	use std::rc::Rc;
 
 	#[test]
 	fn test_spaces_are_replaced_by_dashes_in_branch_name() {
@@ -2500,5 +2853,76 @@ mod tests {
 			output,
 			"feature/auto-replace-spaces-in-branch-name"
 		);
+	}
+
+	#[test]
+	fn modal_help_commands_include_the_active_executable_bindings() {
+		let key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let cases = [
+			(
+				commands::selection_mode(&key_config),
+				key_config.keys.select_mode,
+			),
+			(
+				commands::selection_clear(&key_config),
+				key_config.keys.select_clear,
+			),
+			(
+				commands::selection_all(&key_config),
+				key_config.keys.select_all,
+			),
+			(
+				commands::selection_item(&key_config),
+				key_config.keys.select_item,
+			),
+			(
+				commands::focus_next(&key_config),
+				key_config.keys.focus_next,
+			),
+			(
+				commands::focus_previous(&key_config),
+				key_config.keys.focus_previous,
+			),
+			(
+				commands::command_palette(&key_config),
+				key_config.keys.command_palette,
+			),
+			(
+				commands::goto_prefix(&key_config),
+				key_config.keys.goto_prefix,
+			),
+			(
+				commands::action_prefix(&key_config),
+				key_config.keys.action_prefix,
+			),
+			(
+				commands::stage_item(&key_config),
+				key_config.keys.stage_unstage_item,
+			),
+			(
+				commands::unstage_item(&key_config),
+				key_config.keys.status_unstage_item,
+			),
+			(
+				commands::commit_open_inline(&key_config),
+				key_config.keys.open_commit_inline,
+			),
+			(
+				commands::branches_create(&key_config),
+				key_config.keys.branches_create,
+			),
+			(
+				commands::branches_set_base(&key_config),
+				key_config.keys.branches_set_base,
+			),
+			(
+				commands::branches_load_more(&key_config),
+				key_config.keys.branches_load_more,
+			),
+		];
+		for (command, expected) in cases {
+			assert_eq!(command.binding, Some(expected));
+		}
 	}
 }

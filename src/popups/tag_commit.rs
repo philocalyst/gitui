@@ -38,6 +38,10 @@ impl DrawableComponent for TagCommitPopup {
 }
 
 impl Component for TagCommitPopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.input.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,

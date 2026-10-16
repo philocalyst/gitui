@@ -8,13 +8,16 @@ use crate::{
 	strings,
 	ui::{self, style::SharedTheme},
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use asyncgit::sync::{
 	get_config_string, utils::repo_work_dir, RepoPath,
 };
 use crossterm::{
-	event::Event,
-	terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+	event::{DisableMouseCapture, EnableMouseCapture, Event},
+	terminal::{
+		disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
+		LeaveAlternateScreen,
+	},
 	ExecutableCommand,
 };
 use ratatui::{
@@ -23,9 +26,13 @@ use ratatui::{
 	widgets::{Block, BorderType, Borders, Clear, Paragraph},
 	Frame,
 };
-use scopeguard::defer;
-use std::ffi::OsStr;
-use std::{env, io, path::Path, process::Command};
+use std::{
+	env,
+	ffi::OsString,
+	io::{self, Write},
+	path::Path,
+	process::{Command, ExitStatus},
+};
 
 ///
 pub struct ExternalEditorPopup {
@@ -44,78 +51,189 @@ impl ExternalEditorPopup {
 		}
 	}
 
-	/// opens file at given `path` in an available editor
+	/// Opens `path` in the editor configured for this repository.
 	pub fn open_file_in_editor(
 		repo: &RepoPath,
 		path: &Path,
 	) -> Result<()> {
 		let work_dir = repo_work_dir(repo)?;
-
 		let path = if path.is_relative() {
 			Path::new(&work_dir).join(path)
 		} else {
-			path.into()
+			path.to_path_buf()
 		};
 
 		if !path.exists() {
 			bail!("file not found: {path:?}");
 		}
 
-		io::stdout().execute(LeaveAlternateScreen)?;
-		defer! {
-			io::stdout().execute(EnterAlternateScreen).expect("reset terminal");
+		let editor = configured_editor(repo)?;
+		run_editor(&work_dir, &path, &editor)
+	}
+}
+
+fn configured_editor(repo: &RepoPath) -> Result<String> {
+	if let Some(editor) = env::var_os("GIT_EDITOR") {
+		return nonempty_editor(editor, "GIT_EDITOR");
+	}
+	if let Some(editor) = get_config_string(repo, "core.editor")? {
+		return nonempty_editor(editor.into(), "core.editor");
+	}
+	for variable in ["VISUAL", "EDITOR"] {
+		if let Some(editor) = env::var_os(variable) {
+			return nonempty_editor(editor, variable);
 		}
+	}
+	Ok(String::from("vi"))
+}
 
-		let environment_options = ["GIT_EDITOR", "VISUAL", "EDITOR"];
+fn nonempty_editor(value: OsString, source: &str) -> Result<String> {
+	let editor = value
+		.into_string()
+		.map_err(|_| anyhow!("{source} is not valid UTF-8"))?;
+	if editor.trim().is_empty() {
+		bail!("editor command from {source} is empty");
+	}
+	Ok(editor)
+}
 
-		let editor = env::var(environment_options[0])
-			.ok()
-			.or_else(|| {
-				get_config_string(repo, "core.editor").ok()?
-			})
-			.or_else(|| env::var(environment_options[1]).ok())
-			.or_else(|| env::var(environment_options[2]).ok())
-			.unwrap_or_else(|| String::from("vi"));
+fn run_editor(
+	work_dir: &str,
+	path: &Path,
+	editor: &str,
+) -> Result<()> {
+	let status = with_terminal_suspended(|| {
+		run_editor_process(work_dir, path, editor)
+	})?;
+	check_editor_status(editor, status)
+}
 
-		// TODO: proper handling arguments containing whitespaces
-		// This does not do the right thing if the input is `editor --something "with spaces"`
-
-		// deal with "editor name with spaces" p1 p2 p3
-		// and with "editor_no_spaces" p1 p2 p3
-		// does not address spaces in pn
-		let mut echars = editor.chars().peekable();
-
-		let first_char = *echars.peek().ok_or_else(|| {
-			anyhow!(
-				"editor env variable found empty: {}",
-				environment_options.join(" or ")
-			)
-		})?;
-		let command: String = if first_char == '\"' {
-			echars
-				.by_ref()
-				.skip(1)
-				.take_while(|c| *c != '\"')
-				.collect()
-		} else {
-			echars.by_ref().take_while(|c| *c != ' ').collect()
-		};
-
-		let remainder_str = echars.collect::<String>();
-		let remainder = remainder_str.split_whitespace();
-
-		let mut args: Vec<&OsStr> =
-			remainder.map(OsStr::new).collect();
-
-		args.push(path.as_os_str());
-
-		Command::new(command.clone())
+fn run_editor_process(
+	work_dir: &str,
+	path: &Path,
+	editor: &str,
+) -> Result<ExitStatus> {
+	#[cfg(unix)]
+	{
+		let shell_command = format!("{editor} \"$@\"");
+		Command::new("sh")
+			.arg("-c")
+			.arg(shell_command)
+			.arg("gitui-editor")
+			.arg(path)
 			.current_dir(work_dir)
-			.args(args)
 			.status()
-			.map_err(|e| anyhow!("\"{command}\": {e}"))?;
+			.with_context(|| {
+				format!("failed to launch editor {editor:?}")
+			})
+	}
+	#[cfg(windows)]
+	{
+		Command::new("cmd")
+			.args(["/D", "/S", "/C"])
+			.arg(format!("{editor} \"%GITUI_EDITOR_FILE%\""))
+			.env("GITUI_EDITOR_FILE", path)
+			.current_dir(work_dir)
+			.status()
+			.with_context(|| {
+				format!("failed to launch editor {editor:?}")
+			})
+	}
+}
 
+fn check_editor_status(
+	editor: &str,
+	status: ExitStatus,
+) -> Result<()> {
+	if status.success() {
 		Ok(())
+	} else {
+		bail!("editor {editor:?} exited with status {status}")
+	}
+}
+
+fn with_terminal_suspended<T>(
+	run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+	let mut stdout = io::stdout();
+	let mut keyboard_flags_popped = false;
+	let mut raw_mode_disabled = false;
+	let mut mouse_capture_disabled = false;
+	let mut alternate_screen_left = false;
+	let suspend_result = (|| -> Result<()> {
+		crate::pop_keyboard_enhancement_flags(&mut stdout)
+			.context("failed to pop keyboard enhancement flags")?;
+		keyboard_flags_popped = true;
+		disable_raw_mode()
+			.context("failed to disable terminal raw mode")?;
+		raw_mode_disabled = true;
+		stdout
+			.execute(DisableMouseCapture)
+			.context("failed to disable mouse capture")?;
+		mouse_capture_disabled = true;
+		stdout
+			.execute(LeaveAlternateScreen)
+			.context("failed to leave alternate screen")?;
+		alternate_screen_left = true;
+		stdout.flush()?;
+		Ok(())
+	})();
+
+	let run_result = match suspend_result {
+		Ok(()) => run(),
+		Err(error) => Err(error),
+	};
+	let mut restore_errors = Vec::new();
+	let mut alternate_screen_active = !alternate_screen_left;
+	if alternate_screen_left {
+		match stdout
+			.execute(EnterAlternateScreen)
+			.context("failed to restore alternate screen")
+		{
+			Ok(_) => alternate_screen_active = true,
+			Err(error) => restore_errors.push(error),
+		}
+	}
+	if raw_mode_disabled {
+		if let Err(error) = enable_raw_mode()
+			.context("failed to restore terminal raw mode")
+		{
+			restore_errors.push(error);
+		}
+	}
+	if mouse_capture_disabled {
+		if let Err(error) = stdout
+			.execute(EnableMouseCapture)
+			.context("failed to restore mouse capture")
+		{
+			restore_errors.push(error);
+		}
+	}
+	if keyboard_flags_popped && alternate_screen_active {
+		if let Err(error) =
+			crate::push_keyboard_enhancement_flags(&mut stdout)
+				.context(
+					"failed to restore keyboard enhancement flags",
+				) {
+			restore_errors.push(error);
+		}
+	}
+	if let Err(error) = stdout.flush() {
+		restore_errors.push(error.into());
+	}
+	let resume_result = restore_errors
+		.into_iter()
+		.next()
+		.map_or_else(|| Ok(()), Err);
+
+	match (run_result, resume_result) {
+		(Ok(value), Ok(())) => Ok(value),
+		(Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+		(Err(error), Err(restore_error)) => {
+			Err(error.context(format!(
+				"also failed to restore terminal: {restore_error}"
+			)))
+		}
 	}
 }
 
@@ -183,5 +301,78 @@ impl Component for ExternalEditorPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use super::{check_editor_status, run_editor_process};
+	use std::{fs, os::unix::fs::PermissionsExt};
+
+	fn make_executable(path: &std::path::Path, contents: &str) {
+		fs::write(path, contents).expect("write fake editor");
+		let mut permissions = fs::metadata(path)
+			.expect("editor metadata")
+			.permissions();
+		permissions.set_mode(0o755);
+		fs::set_permissions(path, permissions)
+			.expect("make editor executable");
+	}
+
+	#[test]
+	fn shell_expansion_quoted_args_and_path_with_spaces_are_safe() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let editor_path = dir.path().join("fake editor");
+		let marker_path = dir.path().join("marker");
+		let message_path =
+			dir.path().join("message $(touch marker) with spaces");
+		make_executable(
+			&editor_path,
+			"#!/bin/sh\ntest \"$1\" = 'argument with spaces' || exit 19\ntest \"$2\" = \"$HOME\" || exit 20\ntest -f \"$3\" || exit 21\nprintf 'edited' > \"$3\"\n",
+		);
+		fs::write(&message_path, "initial").expect("create message");
+
+		let editor = format!(
+			"\"{}\" 'argument with spaces' \"$HOME\"",
+			editor_path.display()
+		);
+		let status = run_editor_process(
+			dir.path().to_str().expect("UTF-8 path"),
+			&message_path,
+			&editor,
+		)
+		.expect("launch fake editor");
+		check_editor_status(&editor, status)
+			.expect("editor exits successfully");
+		assert_eq!(
+			fs::read_to_string(message_path).expect("read message"),
+			"edited"
+		);
+		assert!(!marker_path.exists());
+	}
+
+	#[test]
+	fn surfaces_editor_failure_and_keeps_recoverable_message() {
+		let dir = tempfile::tempdir().expect("temporary directory");
+		let editor_path = dir.path().join("fake-editor");
+		let message_path = dir.path().join("message");
+		make_executable(
+			&editor_path,
+			"#!/bin/sh\nprintf 'edited' > \"$1\"\nexit 23\n",
+		);
+		fs::write(&message_path, "recover me")
+			.expect("create message");
+		let editor = format!("\"{}\"", editor_path.display());
+		let status = run_editor_process(
+			dir.path().to_str().expect("UTF-8 path"),
+			&message_path,
+			&editor,
+		)
+		.expect("launch fake editor");
+		assert!(check_editor_status(&editor, status).is_err());
+		assert_eq!(
+			fs::read_to_string(message_path).expect("read message"),
+			"edited"
+		);
 	}
 }

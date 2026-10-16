@@ -182,6 +182,17 @@ pub fn get_commits_info(
 	scope_time!("get_commits_info");
 
 	let repo = repo(repo_path)?;
+	get_commits_info_from_repo(&repo, ids, message_length_limit)
+}
+
+/// Decode commit presentation metadata using an already-open repository.
+/// Background walkers use this to avoid reopening the repository for every
+/// requested viewport page.
+pub fn get_commits_info_from_repo(
+	repo: &git2::Repository,
+	ids: &[CommitId],
+	message_length_limit: usize,
+) -> Result<Vec<CommitInfo>> {
 	let mailmap = repo.mailmap()?;
 
 	let commits = ids

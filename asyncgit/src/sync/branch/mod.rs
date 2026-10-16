@@ -127,9 +127,58 @@ pub fn get_branches_info(
 	local: bool,
 ) -> Result<Vec<BranchInfo>> {
 	scope_time!("get_branches_info");
-
 	let repo = repo(repo_path)?;
+	get_branches_info_repo(&repo, local)
+}
 
+/// Return the local branches and HEAD identity from the same repository read.
+pub fn get_branches_info_with_head(
+	repo_path: &RepoPath,
+) -> Result<(Vec<BranchInfo>, crate::branches::HeadIdentity)> {
+	let repo = repo(repo_path)?;
+	let branches = get_branches_info_repo(&repo, true)?;
+	let head = get_head_identity_repo(&repo)?;
+	Ok((branches, head))
+}
+
+fn get_head_identity_repo(
+	repo: &Repository,
+) -> Result<crate::branches::HeadIdentity> {
+	let head = repo.find_reference("HEAD")?;
+	let symbolic_target = head.symbolic_target()?.map(str::to_owned);
+	let detached = symbolic_target.is_none();
+	let target = if let Some(reference) = &symbolic_target {
+		match repo.find_reference(reference) {
+			Ok(reference) => match reference.resolve() {
+				Ok(reference) => reference.target(),
+				Err(error)
+					if error.code() == git2::ErrorCode::NotFound =>
+				{
+					None
+				}
+				Err(error) => return Err(error.into()),
+			},
+			Err(error)
+				if error.code() == git2::ErrorCode::NotFound =>
+			{
+				None
+			}
+			Err(error) => return Err(error.into()),
+		}
+	} else {
+		head.resolve()?.target()
+	};
+	Ok(crate::branches::HeadIdentity {
+		reference: symbolic_target,
+		target: target.map(Into::into),
+		detached,
+	})
+}
+
+fn get_branches_info_repo(
+	repo: &Repository,
+	local: bool,
+) -> Result<Vec<BranchInfo>> {
 	let (filter, remotes_with_tracking) = if local {
 		(BranchType::Local, HashSet::default())
 	} else {
@@ -535,7 +584,7 @@ mod tests_branches {
 		rename_branch,
 		tests::{
 			debug_cmd_print, repo_clone, repo_init, repo_init_bare,
-			write_commit_file,
+			repo_init_empty, write_commit_file,
 		},
 	};
 
@@ -554,6 +603,73 @@ mod tests_branches {
 				.collect::<Vec<_>>(),
 			vec!["master"]
 		);
+	}
+
+	#[test]
+	fn branch_snapshot_captures_attached_detached_and_unborn_head() {
+		let (_td, repo) = repo_init().unwrap();
+		let root = repo.path().parent().unwrap();
+		let repo_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+		let (branches, attached) =
+			get_branches_info_with_head(repo_path).unwrap();
+		assert_eq!(branches.len(), 1);
+		assert_eq!(
+			attached.reference.as_deref(),
+			Some("refs/heads/master")
+		);
+		assert_eq!(
+			attached.target,
+			Some(repo.head().unwrap().target().unwrap().into())
+		);
+		assert!(!attached.detached);
+
+		repo.reference_symbolic(
+			"refs/aliases/main",
+			"refs/heads/master",
+			false,
+			"test symbolic HEAD chain",
+		)
+		.unwrap();
+		repo.reference_symbolic(
+			"HEAD",
+			"refs/aliases/main",
+			true,
+			"test symbolic HEAD chain",
+		)
+		.unwrap();
+		let (_, chained) =
+			get_branches_info_with_head(repo_path).unwrap();
+		assert_eq!(
+			chained.reference.as_deref(),
+			Some("refs/aliases/main")
+		);
+		assert_eq!(chained.target, attached.target);
+		assert!(!chained.detached);
+
+		repo.set_head_detached(
+			repo.head().unwrap().target().unwrap(),
+		)
+		.unwrap();
+		let (_, detached) =
+			get_branches_info_with_head(repo_path).unwrap();
+		assert_eq!(detached.reference, None);
+		assert_eq!(detached.target, attached.target);
+		assert!(detached.detached);
+
+		let (_empty_td, empty) = repo_init_empty().unwrap();
+		let root = empty.path().parent().unwrap();
+		let empty_path: &RepoPath =
+			&root.as_os_str().to_str().unwrap().into();
+		let (branches, unborn) =
+			get_branches_info_with_head(empty_path).unwrap();
+		assert!(branches.is_empty());
+		assert_eq!(
+			unborn.reference.as_deref(),
+			Some("refs/heads/master")
+		);
+		assert_eq!(unborn.target, None);
+		assert!(!unborn.detached);
 	}
 
 	#[test]

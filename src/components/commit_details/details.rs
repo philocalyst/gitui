@@ -12,8 +12,12 @@ use crate::{
 	ui::style::SharedTheme,
 };
 use anyhow::Result;
-use asyncgit::sync::{
-	self, CommitDetails, CommitId, CommitMessage, RepoPathRef, Tag,
+use asyncgit::{
+	asyncjob::{AsyncJob, AsyncSingleJob, RunParams},
+	sync::{
+		self, CommitDetails, CommitId, CommitMessage, RepoPath, Tag,
+	},
+	AsyncGitNotification,
 };
 use crossterm::event::Event;
 use ratatui::{
@@ -22,13 +26,22 @@ use ratatui::{
 	text::{Line, Span, Text},
 	Frame,
 };
-use std::{borrow::Cow, cell::Cell};
+use std::{
+	borrow::Cow,
+	cell::Cell,
+	sync::{Arc, Mutex},
+};
 use sync::CommitTags;
 
 use super::style::Detail;
 
+type CommitDetailsResult = std::result::Result<CommitDetails, String>;
+type CommitDetailsJobResult = Option<(CommitId, CommitDetailsResult)>;
+
 pub struct DetailsComponent {
-	repo: RepoPathRef,
+	repo: RepoPath,
+	selected_id: Option<CommitId>,
+	commit_details_job: AsyncSingleJob<CommitDetailsJob>,
 	data: Option<CommitDetails>,
 	tags: Vec<Tag>,
 	theme: SharedTheme,
@@ -39,6 +52,44 @@ pub struct DetailsComponent {
 	key_config: SharedKeyConfig,
 }
 
+#[derive(Clone)]
+struct CommitDetailsJob {
+	repo: RepoPath,
+	id: CommitId,
+	result: Arc<Mutex<CommitDetailsJobResult>>,
+}
+
+impl CommitDetailsJob {
+	fn new(repo: RepoPath, id: CommitId) -> Self {
+		Self {
+			repo,
+			id,
+			result: Arc::new(Mutex::new(None)),
+		}
+	}
+
+	fn take_result(&self) -> CommitDetailsJobResult {
+		self.result.lock().ok()?.take()
+	}
+}
+
+impl AsyncJob for CommitDetailsJob {
+	type Notification = AsyncGitNotification;
+	type Progress = ();
+
+	fn run(
+		&mut self,
+		_params: RunParams<Self::Notification, Self::Progress>,
+	) -> asyncgit::Result<Self::Notification> {
+		let result = sync::get_commit_details(&self.repo, self.id)
+			.map_err(|error| error.to_string());
+		if let Ok(mut stored) = self.result.lock() {
+			*stored = Some((self.id, result));
+		}
+		Ok(AsyncGitNotification::CommitDetails)
+	}
+}
+
 type WrappedCommitMessage<'a> =
 	(Vec<Cow<'a, str>>, Vec<Cow<'a, str>>);
 
@@ -46,7 +97,11 @@ impl DetailsComponent {
 	///
 	pub fn new(env: &Environment, focused: bool) -> Self {
 		Self {
-			repo: env.repo.clone(),
+			repo: env.repo.borrow().clone(),
+			selected_id: None,
+			commit_details_job: AsyncSingleJob::new(
+				env.sender_git.clone(),
+			),
 			data: None,
 			tags: Vec::new(),
 			theme: env.theme.clone(),
@@ -63,17 +118,41 @@ impl DetailsComponent {
 		id: Option<CommitId>,
 		tags: Option<CommitTags>,
 	) {
-		self.tags.clear();
-
-		self.data = id.and_then(|id| {
-			sync::get_commit_details(&self.repo.borrow(), id).ok()
-		});
-
-		self.scroll.reset();
-
-		if let Some(tags) = tags {
-			self.tags.extend(tags);
+		if self.selected_id != id {
+			self.selected_id = id;
+			self.data = None;
+			self.tags.clear();
+			self.scroll.reset();
+			self.commit_details_job.cancel();
+			if let Some(id) = id {
+				self.commit_details_job.spawn(CommitDetailsJob::new(
+					self.repo.clone(),
+					id,
+				));
+			}
 		}
+		self.tags = tags.unwrap_or_default();
+		self.poll_commit_details();
+	}
+
+	fn poll_commit_details(&mut self) {
+		let Some(job) = self.commit_details_job.take_last() else {
+			return;
+		};
+		let Some((id, result)) = job.take_result() else {
+			return;
+		};
+		if self.selected_id != Some(id) {
+			return;
+		}
+		match result {
+			Ok(details) => self.data = Some(details),
+			Err(error) => log::error!("commit details {id}: {error}"),
+		}
+	}
+
+	pub fn any_work_pending(&self) -> bool {
+		self.commit_details_job.is_pending()
 	}
 
 	fn wrap_commit_details(
@@ -124,6 +203,39 @@ impl DetailsComponent {
 		wrapped_title.len() + wrapped_message.len()
 	}
 
+	/// Height for the commit summary when it shares a pane with the file list
+	/// and diff. Long messages remain scrollable inside a bounded viewport.
+	pub fn preferred_height(
+		&self,
+		width: u16,
+		max_height: u16,
+	) -> u16 {
+		const MESSAGE_MIN_HEIGHT: u16 = 3;
+		const MESSAGE_MAX_LINES: usize = 4;
+
+		let full_info = self.get_text_info(false);
+		let full_info_height =
+			u16::try_from(full_info.len()).unwrap_or(u16::MAX) + 2;
+		let compact_info = max_height
+			< full_info_height.saturating_add(MESSAGE_MIN_HEIGHT);
+		let info_height =
+			u16::try_from(self.get_text_info(compact_info).len())
+				.unwrap_or(u16::MAX)
+				.saturating_add(2);
+		let message_lines = Self::get_number_of_lines(
+			self.data.as_ref(),
+			usize::from(width.saturating_sub(2)),
+		);
+		let visible_message_lines =
+			message_lines.clamp(1, MESSAGE_MAX_LINES);
+		let message_height = u16::try_from(visible_message_lines)
+			.unwrap_or(u16::MAX)
+			.saturating_add(2)
+			.max(MESSAGE_MIN_HEIGHT);
+
+		info_height.saturating_add(message_height).min(max_height)
+	}
+
 	fn get_theme_for_line(&self, bold: bool) -> Style {
 		if bold {
 			self.theme.text(true, false).add_modifier(Modifier::BOLD)
@@ -156,7 +268,7 @@ impl DetailsComponent {
 	}
 
 	#[allow(clippy::too_many_lines)]
-	fn get_text_info(&self) -> Vec<Line<'_>> {
+	fn get_text_info(&self, compact: bool) -> Vec<Line<'_>> {
 		self.data.as_ref().map_or_else(Vec::new, |data| {
 			let mut res = vec![
 				Line::from(vec![
@@ -240,6 +352,18 @@ impl DetailsComponent {
 				));
 			}
 
+			if compact {
+				// In a short details pane, keep the immutable commit identity
+				// visible and retain the author/date. Optional committer and tag
+				// rows can use the extra space at larger terminal sizes.
+				let sha_index =
+					if data.committer.is_some() { 4 } else { 2 };
+				let sha = res.remove(sha_index);
+				let mut compact = vec![sha];
+				compact.extend(res.into_iter().take(2));
+				return compact;
+			}
+
 			res
 		})
 	}
@@ -254,15 +378,82 @@ impl DetailsComponent {
 }
 
 impl DrawableComponent for DetailsComponent {
+	#[allow(clippy::too_many_lines)]
 	fn draw(&self, f: &mut Frame, rect: Rect) -> Result<()> {
 		const CANSCROLL_STRING: &str = "[\u{2026}]";
 		const EMPTY_STRING: &str = "";
+		const MESSAGE_MIN_HEIGHT: u16 = 3;
 
+		// At very short terminal heights, two bordered panels cannot both be
+		// drawn without their borders colliding. Keep the useful commit message
+		// in one clean panel and let it use the full available height.
+		if rect.height < 8 {
+			let width = rect.width.saturating_sub(2);
+			let height = rect.height.saturating_sub(2);
+			self.current_width.set(width);
+			let number_of_lines = Self::get_number_of_lines(
+				self.data.as_ref(),
+				usize::from(width),
+			);
+			self.scroll.update_no_selection(
+				number_of_lines,
+				usize::from(height),
+			);
+			if self.scroll_to_bottom_next_draw.get() {
+				self.scroll.move_top(ScrollType::End);
+				self.scroll_to_bottom_next_draw.set(false);
+			}
+			let can_scroll = usize::from(height) < number_of_lines;
+			let message_title = format!(
+				"{} {}",
+				strings::commit::details_message_title(
+					&self.key_config
+				),
+				if !self.focused && can_scroll {
+					CANSCROLL_STRING
+				} else {
+					EMPTY_STRING
+				},
+			);
+			f.render_widget(
+				dialog_paragraph(
+					&message_title,
+					Text::from(self.get_wrapped_text_message(
+						usize::from(width),
+						usize::from(height),
+					)),
+					&self.theme,
+					self.focused,
+				),
+				rect,
+			);
+			if self.focused {
+				self.scroll.draw(f, rect, &self.theme);
+			}
+			return Ok(());
+		}
+
+		let full_info = self.get_text_info(false);
+		let full_info_height = u16::try_from(full_info.len())
+			.unwrap_or(u16::MAX)
+			.saturating_add(2);
+		let compact_info = rect.height
+			< full_info_height.saturating_add(MESSAGE_MIN_HEIGHT);
+		let info = if compact_info {
+			self.get_text_info(true)
+		} else {
+			full_info
+		};
+		let info_height = u16::try_from(info.len())
+			.unwrap_or(u16::MAX)
+			.saturating_add(2)
+			.min(rect.height.saturating_sub(MESSAGE_MIN_HEIGHT));
 		let chunks = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[Constraint::Length(8), Constraint::Min(10)].as_ref(),
-			)
+			.constraints([
+				Constraint::Length(info_height),
+				Constraint::Min(0),
+			])
 			.split(rect);
 
 		f.render_widget(
@@ -270,7 +461,7 @@ impl DrawableComponent for DetailsComponent {
 				&strings::commit::details_info_title(
 					&self.key_config,
 				),
-				Text::from(self.get_text_info()),
+				Text::from(info),
 				&self.theme,
 				false,
 			),
@@ -406,6 +597,9 @@ impl Component for DetailsComponent {
 	}
 
 	fn focus(&mut self, focus: bool) {
+		if self.focused == focus {
+			return;
+		}
 		if focus {
 			self.scroll_to_bottom_next_draw.set(true);
 		} else {
@@ -419,6 +613,13 @@ impl Component for DetailsComponent {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{
+		app::Environment,
+		components::{
+			CommitDetailsComponent, Component, DrawableComponent,
+		},
+	};
+	use asyncgit::sync::CommitId;
 
 	fn get_wrapped_lines(
 		message: &CommitMessage,
@@ -485,6 +686,177 @@ mod tests {
 				"line"
 			]
 		);
+	}
+
+	#[test]
+	fn repeating_selected_commit_keeps_cached_details_and_scroll() {
+		let env = Environment::test_env();
+		let mut details = DetailsComponent::new(&env, false);
+		let id = CommitId::default();
+		details.selected_id = Some(id);
+		details.data = Some(CommitDetails {
+			message: Some(CommitMessage::from("cached details")),
+			..CommitDetails::default()
+		});
+		details.scroll.set_top(7);
+
+		details.set_commit(Some(id), None);
+
+		assert_eq!(
+			details
+				.data
+				.as_ref()
+				.and_then(|data| data.message.as_ref())
+				.map(|message| message.subject.as_str()),
+			Some("cached details"),
+		);
+		assert_eq!(details.scroll.get_top(), 7);
+		assert!(!details.any_work_pending());
+	}
+
+	#[test]
+	fn commit_identity_and_subject_fit_compact_inspector_layouts() {
+		const SUBJECT: &str = "inspector compact subject";
+		let (temp, repo) = git2_testing::repo_init_empty();
+		std::fs::write(temp.path().join("file.txt"), "content")
+			.unwrap();
+		let add = std::process::Command::new("git")
+			.args(["add", "file.txt"])
+			.current_dir(temp.path())
+			.output()
+			.unwrap();
+		assert!(add.status.success());
+		let commit = std::process::Command::new("git")
+			.args(["commit", "-m", SUBJECT])
+			.env("GIT_AUTHOR_NAME", "Author")
+			.env("GIT_AUTHOR_EMAIL", "author@example.com")
+			.env("GIT_COMMITTER_NAME", "Author")
+			.env("GIT_COMMITTER_EMAIL", "author@example.com")
+			.current_dir(temp.path())
+			.output()
+			.unwrap();
+		assert!(commit.status.success());
+		let oid = repo.head().unwrap().target().unwrap();
+		let id = CommitId::new(oid);
+		let env = Environment::test_env();
+		env.repo.replace(temp.path().to_path_buf().into());
+		let mut details = CommitDetailsComponent::new(&env);
+		details
+			.set_commits(
+				Some(asyncgit::CommitFilesParams::from(id)),
+				None,
+			)
+			.unwrap();
+		details.show().unwrap();
+		for _ in 0..100 {
+			details.single_details.poll_commit_details();
+			if details.single_details.data.is_some() {
+				break;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert!(details.single_details.data.is_some());
+		let full_hash = id.to_string();
+		let default_backend =
+			ratatui::backend::TestBackend::new(90, 8);
+		let mut default_terminal =
+			ratatui::Terminal::new(default_backend).unwrap();
+		default_terminal
+			.draw(|frame| {
+				details
+					.single_details
+					.draw(frame, Rect::new(0, 0, 90, 8))
+					.unwrap();
+			})
+			.unwrap();
+		let default_rendered = default_terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.map(|cell| cell.symbol())
+			.collect::<String>();
+		assert!(
+			default_rendered.contains(SUBJECT),
+			"default layout lost the commit subject: {default_rendered}"
+		);
+		assert!(
+			default_rendered.contains(&full_hash),
+			"default layout lost the commit SHA: {default_rendered}"
+		);
+		assert!(
+			default_rendered.contains(&strings::commit::details_info_title(
+				&details.single_details.key_config
+			)),
+			"default layout should keep the metadata panel: {default_rendered}"
+		);
+
+		let compact_backend =
+			ratatui::backend::TestBackend::new(90, 6);
+		let mut compact_terminal =
+			ratatui::Terminal::new(compact_backend).unwrap();
+		compact_terminal
+			.draw(|frame| {
+				details
+					.single_details
+					.draw(frame, Rect::new(0, 0, 90, 6))
+					.unwrap();
+			})
+			.unwrap();
+		let compact_rendered = compact_terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.map(|cell| cell.symbol())
+			.collect::<String>();
+		assert!(
+			compact_rendered.contains(SUBJECT),
+			"short layout lost the commit subject: {compact_rendered}"
+		);
+		assert!(
+			!compact_rendered.contains(&strings::commit::details_info_title(
+				&details.single_details.key_config
+			)),
+			"short layout should use one clean message panel: {compact_rendered}"
+		);
+
+		for (width, height) in [(132, 36), (120, 24)] {
+			let backend =
+				ratatui::backend::TestBackend::new(width, height);
+			let mut terminal =
+				ratatui::Terminal::new(backend).unwrap();
+			terminal
+				.draw(|frame| {
+					details
+						.draw(frame, Rect::new(0, 0, width, height))
+						.unwrap();
+				})
+				.unwrap();
+			let rendered = terminal
+				.backend()
+				.buffer()
+				.content
+				.iter()
+				.map(|cell| cell.symbol())
+				.collect::<String>();
+			assert!(
+				rendered.contains(&full_hash),
+				"full SHA is missing at {width}x{height}: {rendered}"
+			);
+			assert!(
+				rendered.contains(SUBJECT),
+				"commit subject is missing at {width}x{height}: {rendered}"
+			);
+		}
+
+		let backend = ratatui::backend::TestBackend::new(16, 4);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| {
+				details.draw(frame, Rect::new(1, 1, 2, 1)).unwrap();
+			})
+			.unwrap();
 	}
 }
 

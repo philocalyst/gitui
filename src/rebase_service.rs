@@ -278,6 +278,8 @@ pub struct RebaseService {
 	pending_adopt: bool,
 	/// Whether an observation is in flight (dedupes requests).
 	observing: bool,
+	/// State of the first repository observation.
+	initial_observation: InitialObservation,
 	/// `--rebase-merges` choice of the current draft (not yet
 	/// persisted; see [`Self::start`]).
 	draft_rebase_merges: bool,
@@ -285,12 +287,18 @@ pub struct RebaseService {
 	errors: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitialObservation {
+	Loading,
+	Ready,
+}
+
 impl RebaseService {
 	/// Create a service for the environment's repository. The
 	/// journal (and any prior session) under
 	/// `<git dir>/gitui/rebase` is loaded and folded; a rebase
-	/// found in the repository without a gitui session is
-	/// adopted read-only at construction.
+	/// found in the repository without a gitui session is adopted
+	/// read-only when the initial observation completes.
 	///
 	/// # Errors
 	///
@@ -327,6 +335,22 @@ impl RebaseService {
 		&self.snapshot
 	}
 
+	/// Whether the initial repository observation has completed.
+	#[must_use]
+	pub const fn is_ready(&self) -> bool {
+		matches!(self.initial_observation, InitialObservation::Ready)
+	}
+
+	/// Whether the initial repository snapshot is still loading.
+	/// Later refreshes do not keep the startup spinner active.
+	#[must_use]
+	pub const fn is_loading(&self) -> bool {
+		matches!(
+			self.initial_observation,
+			InitialObservation::Loading
+		)
+	}
+
 	/// The current projection: `policy(session, snapshot)`
 	/// with the in-flight command merged. While a command runs
 	/// the phase becomes `Executing`, except that a restore in
@@ -337,6 +361,11 @@ impl RebaseService {
 	pub fn policy(&self) -> Policy {
 		let mut projection =
 			policy::policy(&self.session, &self.snapshot);
+		if self.is_loading() {
+			projection.phase = Phase::Reconciling {
+				reason: String::from("repository state is loading"),
+			};
+		}
 		if self.is_busy() {
 			let restoring =
 				self.in_flight.as_deref() == Some(INTENT_STASH_APPLY);
@@ -409,7 +438,10 @@ impl RebaseService {
 						let adopted =
 							self.consume_observation(&snapshot);
 						self.snapshot = snapshot;
-						adopted
+						let became_ready = self.is_loading();
+						self.initial_observation =
+							InitialObservation::Ready;
+						adopted || became_ready
 					}
 					Err(error) => {
 						self.errors.push(error);
@@ -564,6 +596,12 @@ impl RebaseService {
 		empty: EmptyPolicy,
 		update_refs: Vec<String>,
 	) {
+		if self.is_loading() {
+			self.errors.push(String::from(
+				"rebase: repository state is still loading",
+			));
+			return;
+		}
 		if self.is_busy() || self.pending_start.is_some() {
 			self.errors.push(String::from(
 				"rebase: a command is already running",
@@ -597,7 +635,10 @@ impl RebaseService {
 		// observation. The engine mutex is free — we checked
 		// `is_busy` — so this read is fast.
 		match self.engine.observe() {
-			Ok(snapshot) => self.snapshot = snapshot,
+			Ok(snapshot) => {
+				self.snapshot = snapshot;
+				self.initial_observation = InitialObservation::Ready;
+			}
 			Err(error) => {
 				self.errors.push(format!("rebase: {error}"));
 				return;
@@ -774,14 +815,18 @@ impl RebaseService {
 			String::from("GIT_OPTIONAL_LOCKS"),
 			std::ffi::OsString::from("0"),
 		));
-		let mut engine = NativeEngine::new(repo.clone(), None)?;
+		let mut engine = NativeEngine::new(repo, None)?;
 		let session = engine.session_dir().to_path_buf();
 		// Shares the session directory (one journal) with
 		// `engine`, but owns no effects: its observations stay
 		// answerable while an exec blocks. The editor bridge
 		// directories are per-instance (see the engine), so
 		// the observer never touches the exec bridge.
-		let mut observer = NativeEngine::new(repo, Some(session))?;
+		// Reuse the probes already validated by `engine`; creating
+		// a second NativeEngine would synchronously spawn several
+		// more Git processes before the first UI frame.
+		let mut observer = engine.clone_for_observer();
+		debug_assert_eq!(observer.session_dir(), session.as_path());
 		if let Some(exe) = bridge_exe {
 			engine = engine.with_bridge_exe(exe);
 		}
@@ -822,9 +867,8 @@ impl RebaseService {
 				}
 			}
 		}
-		// One synchronous observation: the projection must be
-		// honest from the first frame.
-		let snapshot = engine.observe()?;
+		let (snapshot, defer_initial_observation) =
+			Self::initial_snapshot(&engine, &session, &events)?;
 
 		let mut service = Self {
 			session,
@@ -842,7 +886,15 @@ impl RebaseService {
 			pending_capture: None,
 			pending_start: None,
 			pending_adopt: false,
+			// Fresh journals stay in the guarded loading state, but
+			// do not queue the first worktree scan until App::update
+			// runs after the initial shell frame.
 			observing: false,
+			initial_observation: if defer_initial_observation {
+				InitialObservation::Loading
+			} else {
+				InitialObservation::Ready
+			},
 			draft_rebase_merges: false,
 			errors,
 		};
@@ -854,7 +906,8 @@ impl RebaseService {
 		// of reconciling against an empty one. A sealed
 		// journal never adopts: no effects on unreadable
 		// history.
-		if service.journal.is_some()
+		if !defer_initial_observation
+			&& service.journal.is_some()
 			&& service.session.phase == journal::Phase::Empty
 			&& service
 				.events
@@ -868,8 +921,38 @@ impl RebaseService {
 				]);
 			}
 		}
-
 		Ok(service)
+	}
+
+	fn initial_snapshot(
+		engine: &NativeEngine,
+		session: &Session,
+		events: &[Event],
+	) -> Result<(Snapshot, bool)> {
+		// A fresh journal has no prior session to reconcile; do its
+		// potentially large-worktree observation on the worker. Existing
+		// sessions keep synchronous first-frame reconciliation.
+		let defer = session.phase == journal::Phase::Empty
+			&& events
+				.iter()
+				.all(|event| matches!(event, Event::Schema(_)));
+		let snapshot = if defer {
+			Snapshot {
+				generation: asyncgit::rebase::Generation(0),
+				head: None,
+				branch: None,
+				operation: Operation::Other,
+				staged: Vec::new(),
+				worktree: Vec::new(),
+				conflicts: Vec::new(),
+				untracked: Vec::new(),
+				rebase: None,
+				bridge: None,
+			}
+		} else {
+			engine.observe()?
+		};
+		Ok((snapshot, defer))
 	}
 
 	/// Spawn the exec worker.
@@ -1011,6 +1094,12 @@ impl RebaseService {
 	/// `false` when the intent could not be recorded (nothing
 	/// runs) or the worker is gone.
 	fn dispatch(&mut self, intent: &str, cmd: Cmd) -> bool {
+		if self.is_loading() {
+			self.errors.push(String::from(
+				"rebase: repository state is still loading",
+			));
+			return false;
+		}
 		if !self.record(&Event::Command {
 			intent: String::from(intent),
 		}) {
@@ -1348,6 +1437,23 @@ impl RebaseService {
 	/// confirming an adoption).
 	fn consume_observation(&mut self, snapshot: &Snapshot) -> bool {
 		if !self.pending_adopt {
+			// The first deferred observation has the same load-on-start
+			// adoption contract as the former synchronous constructor.
+			if self.is_loading()
+				&& self.journal.is_some()
+				&& self.session.phase == journal::Phase::Empty
+				&& self
+					.events
+					.iter()
+					.all(|event| matches!(event, Event::Schema(_)))
+			{
+				if let Some(scope) = adopt_scope(snapshot) {
+					return self.record_all(&[
+						Event::Created { scope },
+						Event::Adopted,
+					]);
+				}
+			}
 			return false;
 		}
 		self.pending_adopt = false;
@@ -1595,8 +1701,15 @@ done
 		fn service(&self) -> RebaseService {
 			let env = self.environment();
 			let shim = self.bridge_shim();
-			RebaseService::build(&env, self.env.clone(), Some(shim))
-				.unwrap()
+			let mut service = RebaseService::build(
+				&env,
+				self.env.clone(),
+				Some(shim),
+			)
+			.unwrap();
+			service.refresh().unwrap();
+			service.wait_idle(WAIT);
+			service
 		}
 
 		fn bridge_shim(&self) -> PathBuf {
@@ -2120,6 +2233,52 @@ done
 	}
 
 	#[test]
+	fn deferred_initial_observation_adopts_external_rebase() {
+		let s = Sandbox::new();
+		let (a, _b, _c) = s.two_step();
+		s.git_env(
+			&["rebase", "-i", "--exec", "false", &a],
+			&[("GIT_SEQUENCE_EDITOR", "true")],
+		);
+
+		let env = s.environment();
+		let shim = s.bridge_shim();
+		let mut service =
+			RebaseService::build(&env, s.env.clone(), Some(shim))
+				.unwrap();
+		assert!(!service.is_ready());
+		assert!(service.is_loading());
+		assert!(!service.session().adopted);
+
+		service.create_draft(Base::Upstream(s.oid(&a)), false);
+		assert!(!service.is_busy());
+		assert!(!service.session().adopted);
+		assert_eq!(
+			service.take_errors(),
+			["rebase: repository state is still loading"]
+		);
+
+		// Building the service leaves the potentially large
+		// worktree observation dormant until the app's first
+		// update, after its shell frame is visible.
+		service.refresh().unwrap();
+		service.wait_idle(WAIT);
+
+		assert!(service.is_ready());
+		assert!(!service.is_loading());
+		assert!(service.session().adopted);
+		assert!(matches!(
+			service.policy().phase,
+			policy::Phase::Adopted { .. }
+		));
+		assert_eq!(
+			service.session().scope.as_ref().unwrap().base,
+			Base::Upstream(s.oid(&a))
+		);
+		assert!(service.take_errors().is_empty());
+	}
+
+	#[test]
 	fn bridge_message_flow_and_busy_gating() {
 		let s = Sandbox::new();
 		let (a, _b, _c) = s.two_step();
@@ -2255,7 +2414,7 @@ done
 	#[test]
 	fn start_began_never_trusts_a_lying_exit_code() {
 		let s = Sandbox::new();
-		let mut service = s.service();
+		let service = s.service();
 		// a real observation from a live repository
 		let clean = service.engine.observe().unwrap();
 		// exit 0 without a captured todo: NOT began
@@ -2405,13 +2564,35 @@ done
 		)
 		.unwrap();
 
-		let mut service = {
+		let (mut service, construction_time) = {
 			let _guard = ENV_LOCK.lock().unwrap();
 			std::env::set_var("GITUI_GIT_PATH", &wrapper);
-			let service = s.service();
+			let env = s.environment();
+			let shim = s.bridge_shim();
+			let started = Instant::now();
+			let service =
+				RebaseService::build(&env, s.env.clone(), Some(shim))
+					.unwrap();
+			let construction_time = started.elapsed();
 			std::env::remove_var("GITUI_GIT_PATH");
-			service
+			(service, construction_time)
 		};
+		assert!(
+			construction_time < Duration::from_millis(500),
+			"empty-journal construction must leave slow status to the worker: \
+			 {construction_time:?}"
+		);
+		assert!(!service.is_ready());
+		assert!(matches!(
+			service.policy().phase,
+			policy::Phase::Reconciling { .. }
+		));
+		assert!(!service.policy().actions.start.is_enabled());
+		service.create_draft(Base::Upstream(s.oid(&a)), false);
+		assert!(!service.is_busy());
+		assert!(!service.take_errors().is_empty());
+		service.refresh().unwrap();
+		service.wait_idle(WAIT);
 
 		service.create_draft(Base::Upstream(s.oid(&a)), false);
 		service.wait_idle(WAIT);

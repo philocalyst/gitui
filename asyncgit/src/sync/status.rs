@@ -9,9 +9,62 @@ use crate::{
 };
 use git2::{Delta, Status, StatusOptions, StatusShow};
 use scopetime::scope_time;
-use std::path::Path;
+use std::{
+	path::Path,
+	time::{Duration, Instant},
+};
 
 use super::{RepoPath, ShowUntrackedFilesConfig};
+
+const PROGRESS_BATCH: usize = 128;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(30);
+
+struct StatusProgress<F> {
+	callback: F,
+	next_progress: usize,
+	last_progress: usize,
+	last_publish: Option<Instant>,
+}
+
+impl<F> StatusProgress<F>
+where
+	F: FnMut(&[StatusItem]),
+{
+	const fn new(callback: F) -> Self {
+		Self {
+			callback,
+			next_progress: PROGRESS_BATCH,
+			last_progress: 0,
+			last_publish: None,
+		}
+	}
+
+	fn publish(&mut self, items: &mut [StatusItem]) {
+		let interval_elapsed = self
+			.last_publish
+			.is_none_or(|last| last.elapsed() >= PROGRESS_INTERVAL);
+		if items.len() >= self.next_progress && interval_elapsed {
+			sort_status(items);
+			(self.callback)(items);
+			self.last_progress = items.len();
+			self.next_progress = self.next_progress.saturating_mul(2);
+			self.last_publish = Some(Instant::now());
+		}
+	}
+
+	fn finish(mut self, items: &mut [StatusItem]) {
+		sort_status(items);
+		if !items.is_empty() && items.len() != self.last_progress {
+			(self.callback)(items);
+		}
+	}
+}
+
+fn sort_status(items: &mut [StatusItem]) {
+	items.sort_by(|a, b| {
+		Path::new(a.path.as_str()).cmp(Path::new(b.path.as_str()))
+	});
+}
 
 ///
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
@@ -173,8 +226,25 @@ pub fn get_status(
 	status_type: StatusType,
 	show_untracked: Option<ShowUntrackedFilesConfig>,
 ) -> Result<Vec<StatusItem>> {
-	scope_time!("get_status");
+	get_status_with_progress(
+		repo_path,
+		status_type,
+		show_untracked,
+		|_| {},
+	)
+}
 
+/// Collect status entries with display progress.
+///
+/// The callback receives sorted prefix snapshots. Use the returned vector for
+/// operations that require a complete repository view.
+pub fn get_status_with_progress(
+	repo_path: &RepoPath,
+	status_type: StatusType,
+	show_untracked: Option<ShowUntrackedFilesConfig>,
+	progress: impl FnMut(&[StatusItem]),
+) -> Result<Vec<StatusItem>> {
+	scope_time!("get_status");
 	let repo: gix::Repository = gix_repo(repo_path)?;
 
 	let show_untracked = if let Some(config) = show_untracked {
@@ -196,6 +266,7 @@ pub fn get_status(
 		.untracked_files(show_untracked.into());
 
 	let mut res = Vec::new();
+	let mut progress = StatusProgress::new(progress);
 
 	match status_type {
 		StatusType::WorkingDir => {
@@ -214,6 +285,7 @@ pub fn get_status(
 					let path = item.rela_path().to_string();
 
 					res.push(StatusItem { path, status });
+					progress.publish(&mut res);
 				}
 			}
 		}
@@ -242,6 +314,7 @@ pub fn get_status(
 					let status = change_ref.into();
 
 					res.push(StatusItem { path, status });
+					progress.publish(&mut res);
 
 					Ok(gix::diff::index::Action::Continue(()))
 				};
@@ -273,14 +346,13 @@ pub fn get_status(
 
 				if let Some(status) = status {
 					res.push(StatusItem { path, status });
+					progress.publish(&mut res);
 				}
 			}
 		}
 	}
 
-	res.sort_by(|a, b| {
-		Path::new(a.path.as_str()).cmp(Path::new(b.path.as_str()))
-	});
+	progress.finish(&mut res);
 
 	Ok(res)
 }

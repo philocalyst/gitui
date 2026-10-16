@@ -25,6 +25,7 @@ use ratatui::{
 
 pub struct CompareDetailsComponent {
 	repo: RepoPathRef,
+	commits: Option<OldNew<CommitId>>,
 	data: Option<OldNew<CommitDetails>>,
 	theme: SharedTheme,
 	focused: bool,
@@ -34,6 +35,7 @@ impl CompareDetailsComponent {
 	///
 	pub fn new(env: &Environment, focused: bool) -> Self {
 		Self {
+			commits: None,
 			data: None,
 			theme: env.theme.clone(),
 			focused,
@@ -42,6 +44,10 @@ impl CompareDetailsComponent {
 	}
 
 	pub fn set_commits(&mut self, ids: Option<OldNew<CommitId>>) {
+		if self.commits == ids {
+			return;
+		}
+		self.commits = ids;
 		self.data = ids.and_then(|ids| {
 			let old = sync::get_commit_details(
 				&self.repo.borrow(),

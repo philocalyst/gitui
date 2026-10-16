@@ -24,7 +24,7 @@ use crate::{
 		command_pump, rail_items, visibility_blocking,
 		CommandBlocking, CommandInfo, CommandText, Component,
 		DrawableComponent, EventState, InputType, Inspector, Rail,
-		TextInputComponent,
+		SelectionStatus, TextInputComponent,
 	},
 	keys::{key_match, SharedKeyConfig},
 	queue::{InternalEvent, NeedsUpdate, Queue},
@@ -65,6 +65,12 @@ enum ComposerPurpose {
 	Note(StepId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebasePane {
+	Rail,
+	Inspector,
+}
+
 /// The interactive-rebase workspace.
 pub struct RebaseTab {
 	backend: SharedBackend,
@@ -78,6 +84,7 @@ pub struct RebaseTab {
 	inspector_toggled: bool,
 	visible: bool,
 	focused: bool,
+	pane: RebasePane,
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
@@ -113,6 +120,7 @@ impl RebaseTab {
 			inspector_toggled: false,
 			visible: false,
 			focused: false,
+			pane: RebasePane::Rail,
 			queue: env.queue.clone(),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
@@ -457,6 +465,24 @@ impl RebaseTab {
 		}
 	}
 
+	fn focus_pane(&mut self, pane: RebasePane) {
+		self.pane = pane;
+		self.rail.focus(self.focused && pane == RebasePane::Rail);
+		self.inspector
+			.focus(self.focused && pane == RebasePane::Inspector);
+		// In the collapsed layout, focusing the inspector must make that pane
+		// visible so keyboard focus always has a visible counterpart.
+		self.inspector_toggled = pane == RebasePane::Inspector;
+	}
+
+	fn focus_next_pane(&mut self, _backwards: bool) {
+		let pane = match self.pane {
+			RebasePane::Rail => RebasePane::Inspector,
+			RebasePane::Inspector => RebasePane::Rail,
+		};
+		self.focus_pane(pane);
+	}
+
 	#[allow(clippy::too_many_lines)]
 	fn key_event(&mut self, k: &KeyEvent) -> Result<EventState> {
 		if self.composer.is_visible() {
@@ -466,15 +492,55 @@ impl RebaseTab {
 			return self.exec_event(k);
 		}
 
-		if self.rail.event(&Event::Key(*k))?.is_consumed() {
-			return Ok(EventState::Consumed);
-		}
-
 		let key_config = self.key_config.clone();
 		let keys = &key_config.keys;
 
+		// Pane movement is modal navigation and never mutates the plan.
+		if self.key_config.is_modal() {
+			if key_match(k, keys.focus_left)
+				|| key_match(k, keys.focus_up)
+			{
+				self.focus_pane(RebasePane::Rail);
+				return Ok(EventState::Consumed);
+			}
+			if key_match(k, keys.focus_right)
+				|| key_match(k, keys.focus_down)
+			{
+				self.focus_pane(RebasePane::Inspector);
+				return Ok(EventState::Consumed);
+			}
+			if key_match(k, keys.focus_next) {
+				self.focus_next_pane(false);
+				return Ok(EventState::Consumed);
+			}
+			if key_match(k, keys.focus_previous) {
+				self.focus_next_pane(true);
+				return Ok(EventState::Consumed);
+			}
+		}
+
+		if self.pane == RebasePane::Rail
+			&& self.rail.event(&Event::Key(*k))?.is_consumed()
+		{
+			return Ok(EventState::Consumed);
+		}
+
 		if key_match(k, keys.rebase_inspector) {
-			self.inspector_toggled = !self.inspector_toggled;
+			if self.key_config.is_modal() {
+				self.focus_pane(if self.inspector_toggled {
+					RebasePane::Rail
+				} else {
+					RebasePane::Inspector
+				});
+			} else {
+				self.inspector_toggled = !self.inspector_toggled;
+				self.inspector.focus(self.inspector_toggled);
+			}
+			Ok(EventState::Consumed)
+		} else if self.pane == RebasePane::Inspector {
+			// The inspector owns navigation while focused. Swallow other keys so
+			// plan actions cannot edit the rail behind the focused pane.
+			let _ = self.inspector.event(&Event::Key(*k))?;
 			Ok(EventState::Consumed)
 		} else if key_match(k, keys.enter) {
 			Ok(self.primary_action().into())
@@ -645,7 +711,11 @@ impl DrawableComponent for RebaseTab {
 		let tiny = body.width < MIN_WIDTH || body.height < MIN_HEIGHT;
 
 		if tiny {
-			self.rail.draw(f, body)?;
+			if self.pane == RebasePane::Inspector {
+				self.inspector.draw(f, body)?;
+			} else {
+				self.rail.draw(f, body)?;
+			}
 		} else if narrow {
 			if self.inspector_toggled {
 				self.inspector.draw(f, body)?;
@@ -862,8 +932,31 @@ impl Component for RebaseTab {
 		self.focused
 	}
 
+	/// Text composers own the complete key stream.  In particular, this
+	/// prevents the modal router from interpreting printable characters,
+	/// arrows, or escape while a rebase message/exec is being entered.
+	fn captures_input(&self) -> bool {
+		self.visible
+			&& (self.composer.is_visible()
+				|| self.exec_input.is_visible())
+	}
+
+	fn selection_status(&self) -> Option<SelectionStatus> {
+		if self.visible
+			&& self.key_config.is_modal()
+			&& self.pane == RebasePane::Rail
+		{
+			self.rail.selection_status()
+		} else {
+			None
+		}
+	}
+
 	fn focus(&mut self, focus: bool) {
 		self.focused = focus;
+		self.rail.focus(focus && self.pane == RebasePane::Rail);
+		self.inspector
+			.focus(focus && self.pane == RebasePane::Inspector);
 		if !focus {
 			self.exec_input.hide();
 		}
@@ -881,6 +974,8 @@ impl Component for RebaseTab {
 
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
+		self.focused = true;
+		self.focus_pane(self.pane);
 		// The app refreshes the service on every update tick;
 		// showing the tab only re-derives the projection.
 		self.reload();
@@ -893,6 +988,7 @@ mod tests {
 	#![allow(clippy::unwrap_used, clippy::panic)]
 
 	use super::*;
+	use crate::keys::{KeyConfig, Keymap};
 	use crate::tabs::rebase_backend::RebaseBackend;
 	use asyncgit::rebase::{
 		engine::{Base, EmptyPolicy},
@@ -1264,7 +1360,23 @@ mod tests {
 		events: Vec<JournalEvent>,
 		snapshot: Snapshot,
 	) -> RebaseTab {
-		let env = Environment::test_env();
+		show_with_keymap(events, snapshot, Keymap::Legacy)
+	}
+
+	fn show_modal(
+		events: Vec<JournalEvent>,
+		snapshot: Snapshot,
+	) -> RebaseTab {
+		show_with_keymap(events, snapshot, Keymap::Helix)
+	}
+
+	fn show_with_keymap(
+		events: Vec<JournalEvent>,
+		snapshot: Snapshot,
+		keymap: Keymap,
+	) -> RebaseTab {
+		let mut env = Environment::test_env();
+		env.key_config = Rc::new(KeyConfig::with_keymap(keymap));
 		let mut tab =
 			RebaseTab::new(&env, mock_backend(events, snapshot));
 		tab.show().unwrap();
@@ -1797,6 +1909,91 @@ mod tests {
 			"rebase_journey_inspector",
 			draw_tab(&tab, 80, 24)
 		);
+	}
+
+	#[test]
+	fn modal_focus_keys_move_between_rebase_panes_without_editing() {
+		let mut tab = show_modal(
+			draft_events(vec![pick_line(1), pick_line(2)]),
+			clean_snapshot(),
+		);
+		tab.focus(true);
+		let selected = tab.selected_step();
+		assert_eq!(tab.pane, RebasePane::Rail);
+
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Char('j'),
+			KeyModifiers::CONTROL,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Inspector);
+		assert_eq!(tab.selected_step(), selected);
+
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Char('k'),
+			KeyModifiers::CONTROL,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Rail);
+		assert_eq!(tab.selected_step(), selected);
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Tab,
+			KeyModifiers::NONE,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Inspector);
+		tab.key_event(&KeyEvent::new(
+			KeyCode::BackTab,
+			KeyModifiers::SHIFT,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Rail);
+	}
+
+	#[test]
+	fn legacy_rebase_profile_keeps_ctrl_j_as_an_ordinary_key() {
+		let mut tab = show(
+			draft_events(vec![pick_line(1), pick_line(2)]),
+			clean_snapshot(),
+		);
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Char('j'),
+			KeyModifiers::CONTROL,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Rail);
+	}
+
+	#[test]
+	fn focused_inspector_scrolls_in_narrow_mode_and_swallows_plan_actions(
+	) {
+		let mut tab = show_modal(
+			draft_events(vec![pick_line(1), pick_line(2)]),
+			clean_snapshot(),
+		);
+		tab.focus(true);
+		let selected = tab.selected_step();
+		tab.inspector.set_content(
+			"Inspector".to_owned(),
+			(0..40)
+				.map(|index| {
+					ratatui::text::Line::from(format!("line {index}"))
+				})
+				.collect(),
+		);
+		tab.key_event(&KeyEvent::new(
+			KeyCode::Char('l'),
+			KeyModifiers::CONTROL,
+		))
+		.unwrap();
+		assert_eq!(tab.pane, RebasePane::Inspector);
+		assert!(tab.inspector_toggled);
+		let _ = draw_tab(&tab, 80, 24);
+		assert!(tab.inspector.scroll_top() < 1);
+		tab.key_event(&KeyEvent::from(KeyCode::Char('j'))).unwrap();
+		assert!(tab.inspector.scroll_top() > 0);
+		tab.key_event(&KeyEvent::from(KeyCode::Char('d'))).unwrap();
+		assert_eq!(tab.selected_step(), selected);
 	}
 
 	// ------------------------------------------------------------------

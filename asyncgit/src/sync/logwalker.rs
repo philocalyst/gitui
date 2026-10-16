@@ -82,9 +82,22 @@ impl<'a> LogWalker<'a> {
 		&mut self,
 		out: &mut Vec<WalkEntry>,
 	) -> Result<usize> {
+		self.read_up_to(out, self.limit)
+	}
+
+	/// Reads at most `max_count` commits, preserving this walker's cursor.
+	/// Unlike [`Self::read`], the bound may be chosen from current demand.
+	pub fn read_up_to(
+		&mut self,
+		out: &mut Vec<WalkEntry>,
+		max_count: usize,
+	) -> Result<usize> {
 		let mut count = 0_usize;
 
-		while let Some(c) = self.commits.pop() {
+		while count < max_count {
+			let Some(c) = self.commits.pop() else {
+				break;
+			};
 			let parents: SmallVec<[CommitId; 4]> =
 				c.0.parent_ids().map(Into::into).collect();
 
@@ -105,9 +118,6 @@ impl<'a> LogWalker<'a> {
 			}
 
 			count += 1;
-			if count == self.limit {
-				break;
-			}
 		}
 
 		Ok(count)
@@ -177,9 +187,24 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 		&mut self,
 		out: &mut Vec<WalkEntry>,
 	) -> Result<usize> {
+		self.read_up_to(out, self.limit)
+	}
+
+	/// Reads at most `max_count` commits without replacing the underlying walk.
+	pub fn read_up_to(
+		&mut self,
+		out: &mut Vec<WalkEntry>,
+		max_count: usize,
+	) -> Result<usize> {
 		let mut count = 0_usize;
 
-		while let Some(Ok(info)) = self.walk.next() {
+		while count < max_count {
+			let Some(info) = self.walk.next() else {
+				break;
+			};
+			let info = info.map_err(|error| {
+				crate::Error::Generic(error.to_string())
+			})?;
 			out.push((
 				info.id.into(),
 				info.parent_ids
@@ -190,10 +215,6 @@ impl<'a> LogWalkerWithoutFilter<'a> {
 			));
 
 			count += 1;
-
-			if count == self.limit {
-				break;
-			}
 		}
 
 		self.visited += count;

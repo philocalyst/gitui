@@ -14,6 +14,7 @@ Many of the tabs can expand to show more details. This is done via
 Enter or right-arrow. To close again, press ESC.
 */
 
+mod branches;
 mod files;
 mod rebase;
 mod rebase_backend;
@@ -22,6 +23,7 @@ mod stashing;
 mod stashlist;
 mod status;
 
+pub use branches::Branches;
 pub use files::FilesTab;
 // TODO(app wiring): these become live once app.rs constructs
 // the rebase tab against its service.

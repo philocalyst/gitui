@@ -1,9 +1,9 @@
-use crate::bug_report;
+use crate::{bug_report, keys::Keymap};
 use anyhow::{anyhow, Context, Result};
 use asyncgit::sync::RepoPath;
 use clap::{
 	builder::ArgPredicate, crate_authors, crate_description,
-	crate_name, Arg, Command as ClapApp,
+	crate_name, Arg, ArgMatches, Command as ClapApp,
 };
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::{
@@ -22,12 +22,14 @@ const GIT_DIR_FLAG_ID: &str = "directory";
 const WATCHER_FLAG_ID: &str = "watcher";
 const KEY_BINDINGS_FLAG_ID: &str = "key_bindings";
 const KEY_SYMBOLS_FLAG_ID: &str = "key_symbols";
+const KEYMAP_FLAG_ID: &str = "keymap";
 const REBASE_BRIDGE_FLAG_ID: &str = "rebase_bridge";
 const DEFAULT_THEME: &str = "theme.ron";
 const DEFAULT_GIT_DIR: &str = ".";
 
 #[derive(Clone)]
 pub struct CliArgs {
+	pub keymap: Keymap,
 	pub theme: PathBuf,
 	pub select_file: Option<PathBuf>,
 	pub repo_path: RepoPath,
@@ -94,6 +96,7 @@ pub fn process_cmdline() -> Result<CliArgs> {
 		.map(PathBuf::from);
 
 	Ok(CliArgs {
+		keymap: selected_keymap(&arg_matches),
 		theme,
 		select_file,
 		repo_path,
@@ -101,6 +104,16 @@ pub fn process_cmdline() -> Result<CliArgs> {
 		key_bindings_path,
 		key_symbols_path,
 	})
+}
+
+fn selected_keymap(matches: &ArgMatches) -> Keymap {
+	match matches
+		.get_one::<String>(KEYMAP_FLAG_ID)
+		.map(String::as_str)
+	{
+		Some("legacy") => Keymap::Legacy,
+		_ => Keymap::Helix,
+	}
 }
 
 fn app() -> ClapApp {
@@ -118,6 +131,13 @@ fn app() -> ClapApp {
 
 {all-args}{after-help}
 		",
+		)
+		.arg(
+			Arg::new(KEYMAP_FLAG_ID)
+				.long("keymap")
+				.help("Interaction profile: selection-first Helix, or classic GitUI")
+				.value_parser(["helix", "legacy"])
+				.default_value("helix"),
 		)
 			.arg(
 			Arg::new(KEY_BINDINGS_FLAG_ID)
@@ -244,6 +264,22 @@ pub fn get_app_config_path() -> Result<PathBuf> {
 
 	path.push("gitui");
 	Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn helix_is_the_cli_default_and_legacy_is_explicit() {
+		let default = app().try_get_matches_from(["gitui"]).unwrap();
+		let legacy = app()
+			.try_get_matches_from(["gitui", "--keymap", "legacy"])
+			.unwrap();
+
+		assert_eq!(selected_keymap(&default), Keymap::Helix);
+		assert_eq!(selected_keymap(&legacy), Keymap::Legacy);
+	}
 }
 
 #[test]

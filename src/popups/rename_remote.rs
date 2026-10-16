@@ -36,6 +36,10 @@ impl DrawableComponent for RenameRemotePopup {
 }
 
 impl Component for RenameRemotePopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.input.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,

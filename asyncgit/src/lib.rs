@@ -44,10 +44,12 @@ It wraps libraries like git2 and gix.
 
 pub mod asyncjob;
 mod blame;
+pub mod branch_view;
 mod branches;
 pub mod cached;
 mod commit_files;
 mod diff;
+pub mod diff_preview;
 mod error;
 mod fetch_job;
 mod filter_commits;
@@ -61,13 +63,18 @@ pub mod remote_progress;
 pub mod remote_tags;
 mod revlog;
 mod status;
+pub mod structural;
 pub mod sync;
 mod tags;
 mod treefiles;
 
 pub use crate::{
 	blame::{AsyncBlame, BlameParams},
-	branches::AsyncBranchesJob,
+	branch_view::{
+		BranchViewCommit, BranchViewFile, BranchViewJob,
+		BranchViewRequest, BranchViewResult,
+	},
+	branches::{AsyncBranchesJob, BranchListSnapshot, HeadIdentity},
 	commit_files::{AsyncCommitFiles, CommitFilesParams},
 	diff::{AsyncDiff, DiffParams, DiffType},
 	error::{Error, Result},
@@ -78,7 +85,7 @@ pub use crate::{
 	push::{AsyncPush, PushRequest},
 	push_tags::{AsyncPushTags, PushTagsRequest},
 	remote_progress::{RemoteProgress, RemoteProgressState},
-	revlog::{AsyncLog, FetchStatus},
+	revlog::{AsyncLog, FetchStatus, LogRangeStatus},
 	status::{AsyncStatus, StatusParams},
 	sync::{
 		diff::{DiffLine, DiffLineType, FileDiff},
@@ -110,6 +117,8 @@ pub enum AsyncGitNotification {
 	///
 	CommitFiles,
 	///
+	CommitDetails,
+	///
 	Tags,
 	///
 	Push,
@@ -125,6 +134,14 @@ pub enum AsyncGitNotification {
 	Fetch,
 	///
 	Branches,
+	/// Branch comparison details are ready.
+	BranchView,
+	/// Bounded branch topology is available while exact relationship data loads.
+	BranchViewTopology,
+	/// External or native diff preview is ready.
+	DiffPreview,
+	/// Repository branch and remote metadata are ready.
+	StatusMetadata,
 	///
 	TreeFiles,
 	///

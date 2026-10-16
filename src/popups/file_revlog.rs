@@ -2,8 +2,8 @@ use crate::{
 	app::Environment,
 	components::{
 		event_pump, visibility_blocking, CommandBlocking,
-		CommandInfo, Component, DiffComponent, DrawableComponent,
-		EventState, ItemBatch, ScrollType,
+		CommandInfo, Component, DiffComponent, DiffPreviewController,
+		DrawableComponent, EventState, ItemBatch, ScrollType,
 	},
 	keys::{key_match, SharedKeyConfig},
 	options::SharedOptions,
@@ -13,14 +13,13 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::{
-	sync::{
-		diff_contains_file, get_commits_info, CommitId, RepoPathRef,
-	},
+	sync::{diff_contains_file, CommitId, RepoPathRef},
 	AsyncDiff, AsyncGitNotification, AsyncLog, DiffParams, DiffType,
+	LogRangeStatus,
 };
 use chrono::{DateTime, Local};
 use crossbeam_channel::Sender;
-use crossterm::event::Event;
+use crossterm::event::{Event, KeyEvent};
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Rect},
 	text::{Line, Span, Text},
@@ -30,7 +29,8 @@ use ratatui::{
 
 use super::{BlameFileOpen, InspectCommitOpen};
 
-const SLICE_SIZE: usize = 1200;
+const LOG_PREFETCH_ROWS: usize = 24;
+const LOG_PAGE_ROWS: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct FileRevOpen {
@@ -55,12 +55,15 @@ pub struct FileRevlogPopup {
 	queue: Queue,
 	sender: Sender<AsyncGitNotification>,
 	diff: DiffComponent,
+	preview: DiffPreviewController,
+	review_mode: bool,
 	visible: bool,
 	repo_path: RepoPathRef,
 	open_request: Option<FileRevOpen>,
 	table_state: std::cell::Cell<TableState>,
 	items: ItemBatch,
-	count_total: usize,
+	history_generation: Option<u64>,
+	history_status: Option<LogRangeStatus>,
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
 	current_width: std::cell::Cell<usize>,
@@ -75,6 +78,12 @@ impl FileRevlogPopup {
 			queue: env.queue.clone(),
 			sender: env.sender_git.clone(),
 			diff: DiffComponent::new(env, true),
+			preview: DiffPreviewController::new(
+				env.repo.clone(),
+				env.sender_git.clone(),
+				env.key_config.clone(),
+			),
+			review_mode: true,
 			git_log: None,
 			git_diff: AsyncDiff::new(
 				env.repo.borrow().clone(),
@@ -85,12 +94,18 @@ impl FileRevlogPopup {
 			open_request: None,
 			table_state: std::cell::Cell::new(TableState::default()),
 			items: ItemBatch::default(),
-			count_total: 0,
+			history_generation: None,
+			history_status: None,
 			key_config: env.key_config.clone(),
 			current_width: std::cell::Cell::new(0),
 			current_height: std::cell::Cell::new(0),
 			options: env.options.clone(),
 		}
+	}
+
+	/// Apply completed native projection and highlighting work.
+	pub fn update_rendering(&mut self) {
+		self.diff.update_rendering();
 	}
 
 	fn components_mut(&mut self) -> Vec<&mut dyn Component> {
@@ -109,12 +124,15 @@ impl FileRevlogPopup {
 		));
 
 		self.items.clear();
+		self.history_generation = None;
+		self.history_status = None;
 		self.set_selection(open_request.selection.unwrap_or(0));
 
 		self.show()?;
 
 		self.diff.focus(false);
 		self.diff.clear(false);
+		self.preview.clear();
 
 		self.update()?;
 
@@ -124,15 +142,59 @@ impl FileRevlogPopup {
 	///
 	pub fn any_work_pending(&self) -> bool {
 		self.git_diff.is_pending()
+			|| self.preview.is_pending()
 			|| self.git_log.as_ref().is_some_and(AsyncLog::is_pending)
 	}
 
 	///
 	pub fn update(&mut self) -> Result<()> {
-		if let Some(ref mut git_log) = self.git_log {
-			git_log.fetch()?;
-
-			self.fetch_commits_if_needed()?;
+		if let Some(git_log) = &self.git_log {
+			let status = git_log.range_status()?;
+			if self.history_generation != Some(status.generation) {
+				self.items.clear();
+				self.history_generation = Some(status.generation);
+				self.table_state.get_mut().select(Some(0));
+				*self.table_state.get_mut().offset_mut() = 0;
+			}
+			let loaded = status.loaded;
+			let selection =
+				self.table_state.get_mut().selected().unwrap_or(0);
+			let offset = *self.table_state.get_mut().offset_mut();
+			let height =
+				self.current_height.get().saturating_sub(2) / 2;
+			let start = offset;
+			let end = selection
+				.saturating_add(height)
+				.saturating_add(LOG_PREFETCH_ROWS)
+				.min(loaded);
+			if end > start {
+				let ids = git_log.get_slice(start, end - start)?;
+				if let Some(infos) =
+					git_log.get_commit_info_range(&ids)
+				{
+					self.items.set_items(start, infos, None);
+				} else if !ids.is_empty() {
+					git_log.request_commit_info_ids(ids)?;
+				}
+			}
+			let required_end = selection
+				.saturating_add(height)
+				.saturating_add(LOG_PREFETCH_ROWS)
+				.max(LOG_PAGE_ROWS);
+			let mut status = if loaded < required_end
+				&& status.has_more
+			{
+				git_log.request_range(start, required_end - start)?
+			} else {
+				status
+			};
+			if status.has_more
+				&& selection.saturating_add(8) >= loaded
+			{
+				status =
+					git_log.request_range(loaded, LOG_PAGE_ROWS)?;
+			}
+			self.history_status = Some(status);
 			self.update_diff()?;
 		}
 
@@ -146,7 +208,11 @@ impl FileRevlogPopup {
 	) -> Result<()> {
 		if self.visible {
 			match event {
+				AsyncGitNotification::DiffPreview => {
+					self.preview.update();
+				}
 				AsyncGitNotification::CommitFiles
+				| AsyncGitNotification::CommitDetails
 				| AsyncGitNotification::Log => self.update()?,
 				AsyncGitNotification::Diff => self.update_diff()?,
 				_ => (),
@@ -173,64 +239,69 @@ impl FileRevlogPopup {
 							self.diff.update(
 								open_request.file_path.clone(),
 								false,
-								last,
+								last.clone(),
 							);
+							self.request_preview(diff_params, &last);
 
 							return Ok(());
 						}
 					}
 
-					self.git_diff.request(diff_params)?;
+					if let Some(last) =
+						self.git_diff.request(diff_params.clone())?
+					{
+						self.diff.update(
+							open_request.file_path.clone(),
+							false,
+							last.clone(),
+						);
+						self.request_preview(diff_params, &last);
+						return Ok(());
+					}
 					self.diff.clear(true);
+					self.preview.clear_with_message(
+						"Loading commit preview…",
+					);
 
 					return Ok(());
 				}
 			}
 
 			self.diff.clear(false);
+			self.preview.clear();
 		}
 
 		Ok(())
 	}
 
-	fn fetch_commits(
+	fn request_preview(
 		&mut self,
-		new_offset: usize,
-		new_max_offset: usize,
-	) -> Result<()> {
-		if let Some(git_log) = &mut self.git_log {
-			let amount = new_max_offset
-				.saturating_sub(new_offset)
-				.max(SLICE_SIZE);
-
-			let commits = get_commits_info(
-				&self.repo_path.borrow(),
-				&git_log.get_slice(new_offset, amount)?,
-				self.current_width.get(),
-			);
-
-			if let Ok(commits) = commits {
-				self.items.set_items(new_offset, commits, None);
-			}
-
-			self.count_total = git_log.count()?;
+		params: DiffParams,
+		native_diff: &asyncgit::FileDiff,
+	) {
+		if !self.review_mode {
+			return;
 		}
-
-		Ok(())
+		let preference =
+			self.options.borrow().diff_preview_preference().into();
+		self.preview.request(
+			params,
+			100,
+			preference,
+			asyncgit::hash(native_diff),
+		);
 	}
 
 	fn selected_commit(&self) -> Option<CommitId> {
 		let table_state = self.table_state.take();
 
 		let commit_id = table_state.selected().and_then(|selected| {
-			self.items
-				.iter()
-				.nth(
-					selected
-						.saturating_sub(self.items.index_offset()),
-				)
-				.as_ref()
-				.map(|entry| entry.id)
+			self.git_log
+				.as_ref()?
+				.get_slice(selected, 1)
+				.ok()?
+				.first()
+				.copied()
 		});
 
 		self.table_state.set(table_state);
@@ -249,15 +320,36 @@ impl FileRevlogPopup {
 			self.table_state.set(table);
 			res
 		};
-		let revisions = self.get_max_selection();
+		let revisions =
+			self.history_status.map_or(0, |status| status.loaded);
 
 		self.open_request.as_ref().map_or_else(
 			|| "<no history available>".into(),
 			|open_request| {
-				strings::file_log_title(
+				let title = strings::file_log_title(
 					&open_request.file_path,
-					selected,
+					selected.saturating_add(1),
 					revisions,
+				);
+				format!(
+					"{title}{}{}",
+					if self
+						.history_status
+						.is_none_or(|status| status.has_more
+							&& !status.complete)
+					{
+						"+"
+					} else {
+						""
+					},
+					if self
+						.history_status
+						.is_some_and(|status| status.pending)
+					{
+						" · loading"
+					} else {
+						""
+					},
 				)
 			},
 		)
@@ -294,10 +386,11 @@ impl FileRevlogPopup {
 			.collect()
 	}
 
-	fn get_max_selection(&self) -> usize {
-		self.git_log.as_ref().map_or(0, |log| {
-			log.count().unwrap_or(0).saturating_sub(1)
-		})
+	const fn get_max_selection(&self) -> usize {
+		match self.history_status {
+			Some(status) => status.loaded.saturating_sub(1),
+			None => 0,
+		}
 	}
 
 	fn move_selection(
@@ -330,7 +423,7 @@ impl FileRevlogPopup {
 		}
 
 		self.set_selection(new_selection);
-		self.fetch_commits_if_needed()?;
+		self.update()?;
 
 		Ok(())
 	}
@@ -347,22 +440,6 @@ impl FileRevlogPopup {
 
 		*self.table_state.get_mut().offset_mut() = new_offset;
 		self.table_state.get_mut().select(Some(selection));
-	}
-
-	fn fetch_commits_if_needed(&mut self) -> Result<()> {
-		let selection =
-			self.table_state.get_mut().selected().unwrap_or(0);
-		let offset = *self.table_state.get_mut().offset_mut();
-		let height_in_items =
-			(self.current_height.get().saturating_sub(2)) / 2;
-		let new_max_offset =
-			selection.saturating_add(height_in_items);
-
-		if self.items.needs_data(offset, new_max_offset) {
-			self.fetch_commits(offset, new_max_offset)?;
-		}
-
-		Ok(())
 	}
 
 	fn get_selection(&self) -> Option<usize> {
@@ -430,7 +507,7 @@ impl FileRevlogPopup {
 			f,
 			area,
 			&self.theme,
-			self.count_total,
+			self.history_status.map_or(0, |status| status.loaded),
 			table_state.selected().unwrap_or(0),
 			Orientation::Vertical,
 		);
@@ -455,6 +532,75 @@ impl FileRevlogPopup {
 		} else {
 			self.queue.push(InternalEvent::PopupStackPop);
 		}
+	}
+
+	fn toggle_review_mode(&mut self) -> Result<()> {
+		self.review_mode = !self.review_mode;
+		if self.review_mode {
+			self.update_diff()?;
+		} else {
+			self.preview.clear();
+		}
+		Ok(())
+	}
+
+	fn handle_key_event(&mut self, key: &KeyEvent) -> Result<()> {
+		if key_match(key, self.key_config.keys.branches_load_more) {
+			if let Some(log) = &self.git_log {
+				let status = log.range_status()?;
+				if status.has_more {
+					log.request_range(status.loaded, LOG_PAGE_ROWS)?;
+					self.update()?;
+				}
+			}
+		} else if key_match(key, self.key_config.keys.exit_popup) {
+			if self.diff.focused() {
+				self.diff.focus(false);
+			} else {
+				self.hide_stacked(false);
+			}
+		} else if key_match(key, self.key_config.keys.move_right)
+			&& self.can_focus_diff()
+		{
+			self.diff.focus(true);
+		} else if key_match(key, self.key_config.keys.enter) {
+			if let Some(commit_id) = self.selected_commit() {
+				self.hide_stacked(true);
+				self.queue.push(InternalEvent::OpenPopup(
+					StackablePopupOpen::InspectCommit(
+						InspectCommitOpen::new(commit_id),
+					),
+				));
+			}
+		} else if key_match(key, self.key_config.keys.blame) {
+			if let Some(open_request) = self.open_request.clone() {
+				self.hide_stacked(true);
+				self.queue.push(InternalEvent::OpenPopup(
+					StackablePopupOpen::BlameFile(BlameFileOpen {
+						file_path: open_request.file_path,
+						commit_id: self.selected_commit(),
+						selection: None,
+					}),
+				));
+			}
+		} else if key_match(key, self.key_config.keys.move_up) {
+			self.move_selection(ScrollType::Up)?;
+		} else if key_match(key, self.key_config.keys.move_down) {
+			self.move_selection(ScrollType::Down)?;
+		} else if key_match(key, self.key_config.keys.shift_up)
+			|| key_match(key, self.key_config.keys.home)
+		{
+			self.move_selection(ScrollType::Home)?;
+		} else if key_match(key, self.key_config.keys.shift_down)
+			|| key_match(key, self.key_config.keys.end)
+		{
+			self.move_selection(ScrollType::End)?;
+		} else if key_match(key, self.key_config.keys.page_up) {
+			self.move_selection(ScrollType::PageUp)?;
+		} else if key_match(key, self.key_config.keys.page_down) {
+			self.move_selection(ScrollType::PageDown)?;
+		}
+		Ok(())
 	}
 }
 
@@ -481,7 +627,16 @@ impl DrawableComponent for FileRevlogPopup {
 			f.render_widget(Clear, area);
 
 			self.draw_revlog(f, chunks[0]);
-			self.diff.draw(f, chunks[1])?;
+			if self.review_mode {
+				self.preview.view().draw(
+					f,
+					chunks[1],
+					&self.theme,
+					self.diff.focused(),
+				);
+			} else {
+				self.diff.draw(f, chunks[1])?;
+			}
 		}
 
 		Ok(())
@@ -491,85 +646,33 @@ impl DrawableComponent for FileRevlogPopup {
 impl Component for FileRevlogPopup {
 	fn event(&mut self, event: &Event) -> Result<EventState> {
 		if self.is_visible() {
-			if event_pump(
-				event,
-				self.components_mut().as_mut_slice(),
-			)?
-			.is_consumed()
+			if let Event::Key(key) = event {
+				if key_match(
+					key,
+					self.key_config.keys.diff_view_toggle,
+				) {
+					self.toggle_review_mode()?;
+					return Ok(EventState::Consumed);
+				}
+			}
+			let consumed = if self.review_mode && self.diff.focused()
 			{
+				self.preview.view_mut().event(event)?.is_consumed()
+			} else if self.review_mode {
+				false
+			} else {
+				event_pump(
+					event,
+					self.components_mut().as_mut_slice(),
+				)?
+				.is_consumed()
+			};
+			if consumed {
 				return Ok(EventState::Consumed);
 			}
 
 			if let Event::Key(key) = event {
-				if key_match(key, self.key_config.keys.exit_popup) {
-					if self.diff.focused() {
-						self.diff.focus(false);
-					} else {
-						self.hide_stacked(false);
-					}
-				} else if key_match(
-					key,
-					self.key_config.keys.move_right,
-				) && self.can_focus_diff()
-				{
-					self.diff.focus(true);
-				} else if key_match(key, self.key_config.keys.enter) {
-					if let Some(commit_id) = self.selected_commit() {
-						self.hide_stacked(true);
-						self.queue.push(InternalEvent::OpenPopup(
-							StackablePopupOpen::InspectCommit(
-								InspectCommitOpen::new(commit_id),
-							),
-						));
-					}
-				} else if key_match(key, self.key_config.keys.blame) {
-					if let Some(open_request) =
-						self.open_request.clone()
-					{
-						self.hide_stacked(true);
-						self.queue.push(InternalEvent::OpenPopup(
-							StackablePopupOpen::BlameFile(
-								BlameFileOpen {
-									file_path: open_request.file_path,
-									commit_id: self.selected_commit(),
-									selection: None,
-								},
-							),
-						));
-					}
-				} else if key_match(key, self.key_config.keys.move_up)
-				{
-					self.move_selection(ScrollType::Up)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.move_down,
-				) {
-					self.move_selection(ScrollType::Down)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.shift_up,
-				) || key_match(
-					key,
-					self.key_config.keys.home,
-				) {
-					self.move_selection(ScrollType::Home)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.shift_down,
-				) || key_match(
-					key,
-					self.key_config.keys.end,
-				) {
-					self.move_selection(ScrollType::End)?;
-				} else if key_match(key, self.key_config.keys.page_up)
-				{
-					self.move_selection(ScrollType::PageUp)?;
-				} else if key_match(
-					key,
-					self.key_config.keys.page_down,
-				) {
-					self.move_selection(ScrollType::PageDown)?;
-				}
+				self.handle_key_event(key)?;
 			}
 
 			return Ok(EventState::Consumed);
@@ -584,6 +687,11 @@ impl Component for FileRevlogPopup {
 		force_all: bool,
 	) -> CommandBlocking {
 		if self.is_visible() || force_all {
+			out.push(CommandInfo::new(
+				strings::commands::diff_view_toggle(&self.key_config),
+				true,
+				self.diff.focused() || force_all,
+			));
 			out.push(
 				CommandInfo::new(
 					strings::commands::close_popup(&self.key_config),
@@ -632,6 +740,7 @@ impl Component for FileRevlogPopup {
 
 	fn hide(&mut self) {
 		self.visible = false;
+		self.preview.clear();
 	}
 
 	fn show(&mut self) -> Result<()> {

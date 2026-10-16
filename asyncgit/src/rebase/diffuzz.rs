@@ -1160,7 +1160,12 @@ fn kill_during_start_is_observable_and_abortable() {
 
 	// A sequence editor that never returns.
 	let editor = s.path().join("sleep-editor.sh");
-	fs::write(&editor, "#!/bin/sh\nsleep 5\n").unwrap();
+	let editor_started = s.path().join(".git/gitui-editor-started");
+	fs::write(
+		&editor,
+		"#!/bin/sh\nprintf ready > \"$GITUI_SEQUENCE_EDITOR_STARTED\"\nsleep 5\n",
+	)
+	.unwrap();
 	fs::set_permissions(&editor, fs::Permissions::from_mode(0o755))
 		.unwrap();
 	let mut child = Command::new("git")
@@ -1173,22 +1178,23 @@ fn kill_during_start_is_observable_and_abortable() {
 		.env_remove("GIT_SEQUENCE_EDITOR")
 		.env_remove("VISUAL")
 		.env("GIT_SEQUENCE_EDITOR", editor.canonicalize().unwrap())
+		.env("GITUI_SEQUENCE_EDITOR_STARTED", &editor_started)
 		.spawn()
 		.unwrap();
 
-	// Wait for the rebase state to appear, then kill git.
+	// Wait until Git has initialized its state and entered the
+	// sequence editor. Directory creation alone precedes those writes.
 	// Generous budget: under a loaded parallel test run the
 	// spawn itself can take seconds.
-	let merge_dir = s.path().join(".git").join("rebase-merge");
 	let mut appeared = false;
 	for _ in 0..800 {
-		if merge_dir.is_dir() {
+		if editor_started.is_file() {
 			appeared = true;
 			break;
 		}
 		std::thread::sleep(Duration::from_millis(25));
 	}
-	assert!(appeared, "rebase-merge never appeared");
+	assert!(appeared, "the sequence editor never started");
 	child.kill().unwrap();
 	child.wait().unwrap();
 

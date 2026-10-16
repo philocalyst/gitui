@@ -779,7 +779,7 @@ mod shapes {
 	use super::{Conflict, ConflictShape};
 
 	pub(super) fn of(c: &Conflict) -> Vec<ConflictShape> {
-		match (c.stages[0], c.stages[1], c.stages[2]) {
+		match c.stages.into() {
 			(None, Some(_), Some(_)) => {
 				vec![ConflictShape::BothAdded]
 			}

@@ -49,7 +49,7 @@ impl From<git2::DiffLineType> for DiffLineType {
 }
 
 ///
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct DiffLine {
 	///
 	pub content: Box<str>,
@@ -104,7 +104,7 @@ impl From<DiffHunk<'_>> for HunkHeader {
 }
 
 /// single diff hunk
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct Hunk {
 	/// hash of the hunk header
 	pub header_hash: u64,
@@ -113,7 +113,7 @@ pub struct Hunk {
 }
 
 /// collection of hunks, sum of all diff lines
-#[derive(Default, Clone, Hash, Debug)]
+#[derive(Default, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct FileDiff {
 	/// list of hunks
 	pub hunks: Vec<Hunk>,
@@ -165,7 +165,9 @@ pub(crate) fn get_diff_raw<'a>(
 		opt.ignore_whitespace(options.ignore_whitespace);
 		opt.interhunk_lines(options.interhunk_lines);
 	}
-	opt.pathspec(p);
+	// UI-selected paths are exact filenames, not glob patterns. This also
+	// keeps pathspec magic characters in filenames from widening the diff.
+	opt.disable_pathspec_match(true).pathspec(p);
 	opt.reverse(reverse);
 
 	let diff = if stage {
@@ -208,7 +210,7 @@ pub fn get_diff(
 	let work_dir = work_dir(&repo)?;
 	let diff = get_diff_raw(&repo, p, stage, false, options)?;
 
-	raw_diff_to_file_diff(&diff, work_dir)
+	raw_diff_to_file_diff(&repo, &diff, work_dir)
 }
 
 /// returns diff of a specific file inside a commit
@@ -231,7 +233,7 @@ pub fn get_diff_commit(
 		Some(&get_stashes(repo_path)?.into_iter().collect()),
 	)?;
 
-	raw_diff_to_file_diff(&diff, work_dir)
+	raw_diff_to_file_diff(&repo, &diff, work_dir)
 }
 
 /// get file changes of a diff between two commits
@@ -248,13 +250,14 @@ pub fn get_diff_commits(
 	let diff =
 		get_compare_commits_diff(&repo, ids, Some(p), options)?;
 
-	raw_diff_to_file_diff(&diff, work_dir)
+	raw_diff_to_file_diff(&repo, &diff, work_dir)
 }
 
 ///
 //TODO: refactor into helper type with the inline closures as dedicated functions
 #[allow(clippy::too_many_lines)]
-fn raw_diff_to_file_diff(
+pub(crate) fn raw_diff_to_file_diff(
+	repo: &Repository,
 	diff: &Diff,
 	work_dir: &Path,
 ) -> Result<FileDiff> {
@@ -305,8 +308,9 @@ fn raw_diff_to_file_diff(
 				let diff_line = DiffLine {
 					position: DiffLinePosition::from(&line),
 					content: String::from_utf8_lossy(line.content())
-						//Note: trim await trailing newline characters
-						.trim_matches(is_newline)
+						// Retain CR so checked staging can distinguish CRLF
+						// from LF; rendering trims both line endings.
+						.trim_end_matches('\n')
 						.into(),
 					line_type: line.origin_value().into(),
 				};
@@ -328,9 +332,11 @@ fn raw_diff_to_file_diff(
 
 					let newfile_path = work_dir.join(relative_path);
 
-					if let Some(newfile_content) =
-						new_file_content(&newfile_path)
-					{
+					if let Some(newfile_content) = new_file_content(
+						repo,
+						work_dir,
+						relative_path,
+					) {
 						let mut patch = Patch::from_buffers(
 							&[],
 							None,
@@ -391,21 +397,47 @@ fn raw_diff_to_file_diff(
 	Ok(res.into_inner())
 }
 
-const fn is_newline(c: char) -> bool {
-	c == '\n' || c == '\r'
+pub(crate) fn validate_diff_source(
+	repo: &Repository,
+	diff: &Diff,
+	expected: &FileDiff,
+) -> Result<()> {
+	let current = raw_diff_to_file_diff(repo, diff, work_dir(repo)?)?;
+	if current == *expected {
+		Ok(())
+	} else {
+		Err(Error::Generic(String::from(
+			"diff changed since selection; refresh and retry",
+		)))
+	}
 }
 
-fn new_file_content(path: &Path) -> Option<Vec<u8>> {
-	if let Ok(meta) = fs::symlink_metadata(path) {
+#[allow(clippy::filetype_is_file)] // Diff only reads regular files, never symlink targets.
+fn new_file_content(
+	repo: &Repository,
+	work_dir: &Path,
+	relative_path: &Path,
+) -> Option<Vec<u8>> {
+	let path = work_dir.join(relative_path);
+	if let Ok(meta) = fs::symlink_metadata(&path) {
 		if meta.file_type().is_symlink() {
 			if let Ok(path) = fs::read_link(path) {
 				return Some(
 					path.to_str()?.to_string().as_bytes().into(),
 				);
 			}
-		} else if !meta.file_type().is_dir() {
+		} else if meta.file_type().is_file() {
 			if let Ok(content) = fs::read(path) {
-				return Some(content);
+				if content.contains(&0) {
+					return Some(content);
+				}
+				let path = relative_path.to_str()?;
+				return Some(
+					super::staging::clean_worktree_contents(
+						repo, work_dir, path, &content,
+					)
+					.unwrap_or(content),
+				);
 			}
 		}
 	}

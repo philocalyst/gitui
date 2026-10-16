@@ -142,11 +142,12 @@ impl ConfirmPopup {
                     strings::confirm_title_stashpop(&self.key_config),
                     strings::confirm_msg_stashpop(&self.key_config),
                 ),
-                Action::ResetHunk(_, _) => (
+                Action::ResetHunk(_, _, _) => (
                     strings::confirm_title_reset(),
                     strings::confirm_msg_resethunk(&self.key_config),
                 ),
-                Action::ResetLines(_, lines) => (
+				Action::ResetLines(_, lines, _)
+				| Action::ResetLinesWithPairs(_, lines, _, _) => (
                     strings::confirm_title_reset(),
                     strings::confirm_msg_reset_lines(lines.len()),
                 ),

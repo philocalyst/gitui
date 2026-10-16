@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, path::PathBuf};
@@ -17,7 +18,21 @@ impl GituiKeyEvent {
 }
 
 pub fn key_match(ev: &KeyEvent, binding: GituiKeyEvent) -> bool {
-	ev.code == binding.code && ev.modifiers == binding.modifiers
+	fn effective_modifiers(
+		code: KeyCode,
+		mut modifiers: KeyModifiers,
+	) -> KeyModifiers {
+		// Terminals disagree about reporting Shift once the character already
+		// contains it (e.g. 'D', ':', '%'). Keep Ctrl/Alt/Super significant.
+		if matches!(code, KeyCode::Char(c) if c.is_uppercase() || c.is_ascii_punctuation())
+		{
+			modifiers.remove(KeyModifiers::SHIFT);
+		}
+		modifiers
+	}
+	ev.code == binding.code
+		&& effective_modifiers(ev.code, ev.modifiers)
+			== effective_modifiers(binding.code, binding.modifiers)
 }
 
 impl PartialEq for GituiKeyEvent {
@@ -37,11 +52,28 @@ impl From<&GituiKeyEvent> for KeyEvent {
 #[derive(Debug, Clone, Patch)]
 #[patch(attribute(derive(Deserialize, Debug)))]
 pub struct KeysList {
+	pub select_mode: GituiKeyEvent,
+	pub select_clear: GituiKeyEvent,
+	pub select_all: GituiKeyEvent,
+	pub select_item: GituiKeyEvent,
+	pub focus_left: GituiKeyEvent,
+	pub focus_right: GituiKeyEvent,
+	pub focus_up: GituiKeyEvent,
+	pub focus_down: GituiKeyEvent,
+	pub focus_next: GituiKeyEvent,
+	pub focus_previous: GituiKeyEvent,
+	pub goto_prefix: GituiKeyEvent,
+	pub action_prefix: GituiKeyEvent,
+	pub window_prefix: GituiKeyEvent,
+	pub command_palette: GituiKeyEvent,
+	pub diff_view_toggle: GituiKeyEvent,
+	pub diff_zoom_toggle: GituiKeyEvent,
 	pub tab_status: GituiKeyEvent,
 	pub tab_log: GituiKeyEvent,
 	pub tab_files: GituiKeyEvent,
 	pub tab_stashing: GituiKeyEvent,
 	pub tab_stashes: GituiKeyEvent,
+	pub tab_branches: GituiKeyEvent,
 	pub tab_toggle: GituiKeyEvent,
 	pub tab_toggle_reverse: GituiKeyEvent,
 	pub toggle_workarea: GituiKeyEvent,
@@ -50,6 +82,7 @@ pub struct KeysList {
 	pub exit_popup: GituiKeyEvent,
 	pub open_commit: GituiKeyEvent,
 	pub open_commit_editor: GituiKeyEvent,
+	pub open_commit_inline: GituiKeyEvent,
 	pub open_help: GituiKeyEvent,
 	pub open_options: GituiKeyEvent,
 	pub move_left: GituiKeyEvent,
@@ -71,6 +104,7 @@ pub struct KeysList {
 	pub file_history: GituiKeyEvent,
 	pub edit_file: GituiKeyEvent,
 	pub status_stage_all: GituiKeyEvent,
+	pub status_unstage_item: GituiKeyEvent,
 	pub status_reset_item: GituiKeyEvent,
 	pub status_ignore_file: GituiKeyEvent,
 	pub diff_stage_lines: GituiKeyEvent,
@@ -97,6 +131,10 @@ pub struct KeysList {
 	pub create_branch: GituiKeyEvent,
 	pub rename_branch: GituiKeyEvent,
 	pub select_branch: GituiKeyEvent,
+	pub branches_create: GituiKeyEvent,
+	pub branches_checkout: GituiKeyEvent,
+	pub branches_set_base: GituiKeyEvent,
+	pub branches_load_more: GituiKeyEvent,
 	pub delete_branch: GituiKeyEvent,
 	pub merge_branch: GituiKeyEvent,
 	pub rebase_branch: GituiKeyEvent,
@@ -157,11 +195,28 @@ impl Default for KeysList {
 	#[allow(clippy::too_many_lines)]
 	fn default() -> Self {
 		Self {
+			select_mode: GituiKeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()),
+			select_clear: GituiKeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+			select_all: GituiKeyEvent::new(KeyCode::Char('%'), KeyModifiers::empty()),
+			select_item: GituiKeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+			focus_left: GituiKeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+			focus_right: GituiKeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+			focus_up: GituiKeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+			focus_down: GituiKeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+			focus_next: GituiKeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+			focus_previous: GituiKeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+			goto_prefix: GituiKeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+			action_prefix: GituiKeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+			window_prefix: GituiKeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+			command_palette: GituiKeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()),
+			diff_view_toggle: GituiKeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+			diff_zoom_toggle: GituiKeyEvent::new(KeyCode::Char('z'), KeyModifiers::empty()),
 			tab_status: GituiKeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()),
 			tab_log: GituiKeyEvent::new(KeyCode::Char('2'),  KeyModifiers::empty()),
 			tab_files: GituiKeyEvent::new(KeyCode::Char('3'),  KeyModifiers::empty()),
 			tab_stashing: GituiKeyEvent::new(KeyCode::Char('4'),  KeyModifiers::empty()),
 			tab_stashes: GituiKeyEvent::new(KeyCode::Char('5'),  KeyModifiers::empty()),
+			tab_branches: GituiKeyEvent::new(KeyCode::Char('7'),  KeyModifiers::empty()),
 			tab_toggle: GituiKeyEvent::new(KeyCode::Tab,  KeyModifiers::empty()),
 			tab_toggle_reverse: GituiKeyEvent::new(KeyCode::BackTab,  KeyModifiers::SHIFT),
 			toggle_workarea: GituiKeyEvent::new(KeyCode::Char('w'),  KeyModifiers::empty()),
@@ -170,6 +225,7 @@ impl Default for KeysList {
 			exit_popup: GituiKeyEvent::new(KeyCode::Esc,  KeyModifiers::empty()),
 			open_commit: GituiKeyEvent::new(KeyCode::Char('c'),  KeyModifiers::empty()),
 			open_commit_editor: GituiKeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+			open_commit_inline: GituiKeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
 			open_help: GituiKeyEvent::new(KeyCode::Char('h'),  KeyModifiers::empty()),
 			open_options: GituiKeyEvent::new(KeyCode::Char('o'),  KeyModifiers::empty()),
 			move_left: GituiKeyEvent::new(KeyCode::Left,  KeyModifiers::empty()),
@@ -191,6 +247,7 @@ impl Default for KeysList {
 			file_history: GituiKeyEvent::new(KeyCode::Char('H'),  KeyModifiers::SHIFT),
 			edit_file: GituiKeyEvent::new(KeyCode::Char('e'),  KeyModifiers::empty()),
 			status_stage_all: GituiKeyEvent::new(KeyCode::Char('a'),  KeyModifiers::empty()),
+			status_unstage_item: GituiKeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
 			status_reset_item: GituiKeyEvent::new(KeyCode::Char('D'),  KeyModifiers::SHIFT),
 			diff_reset_lines: GituiKeyEvent::new(KeyCode::Char('d'),  KeyModifiers::empty()),
 			status_ignore_file: GituiKeyEvent::new(KeyCode::Char('i'),  KeyModifiers::empty()),
@@ -217,6 +274,10 @@ impl Default for KeysList {
 			create_branch: GituiKeyEvent::new(KeyCode::Char('c'),  KeyModifiers::empty()),
 			rename_branch: GituiKeyEvent::new(KeyCode::Char('r'),  KeyModifiers::empty()),
 			select_branch: GituiKeyEvent::new(KeyCode::Char('b'),  KeyModifiers::empty()),
+			branches_create: GituiKeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+			branches_checkout: GituiKeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+			branches_set_base: GituiKeyEvent::new(KeyCode::Char('b'),  KeyModifiers::empty()),
+			branches_load_more: GituiKeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
 			delete_branch: GituiKeyEvent::new(KeyCode::Char('D'),  KeyModifiers::SHIFT),
 			merge_branch: GituiKeyEvent::new(KeyCode::Char('m'),  KeyModifiers::empty()),
 			rebase_branch: GituiKeyEvent::new(KeyCode::Char('R'),  KeyModifiers::SHIFT),
@@ -273,17 +334,123 @@ impl Default for KeysList {
 }
 
 impl KeysList {
-	pub fn init(file: PathBuf) -> Self {
-		let mut keys_list = Self::default();
-		if let Ok(f) = File::open(file) {
-			match ron::de::from_reader(f) {
-				Ok(patch) => keys_list.apply(patch),
-				Err(e) => {
-					log::error!("KeysList parse error: {e}");
-				}
-			}
+	/// Selection-first profile. Action keys stay configurable through RON patches.
+	pub fn helix() -> Self {
+		let plain = |c| {
+			GituiKeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+		};
+		let ctrl = |c| {
+			GituiKeyEvent::new(
+				KeyCode::Char(c),
+				KeyModifiers::CONTROL,
+			)
+		};
+		let shifted = |c| {
+			GituiKeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+		};
+		Self {
+			window_prefix: ctrl('w'),
+			move_left: plain('h'),
+			move_down: plain('j'),
+			move_up: plain('k'),
+			move_right: plain('l'),
+			open_help: GituiKeyEvent::new(
+				KeyCode::F(1),
+				KeyModifiers::NONE,
+			),
+			popup_up: ctrl('p'),
+			popup_down: ctrl('n'),
+			page_up: ctrl('b'),
+			page_down: ctrl('f'),
+			shift_up: shifted('K'),
+			shift_down: shifted('J'),
+			tab_toggle: GituiKeyEvent::new(
+				KeyCode::Char('l'),
+				KeyModifiers::ALT,
+			),
+			tab_toggle_reverse: GituiKeyEvent::new(
+				KeyCode::Char('h'),
+				KeyModifiers::ALT,
+			),
+			status_stage_all: shifted('A'),
+			stage_unstage_item: plain('s'),
+			status_reset_item: shifted('D'),
+			diff_reset_lines: shifted('D'),
+			diff_stage_lines: GituiKeyEvent::new(
+				KeyCode::Null,
+				KeyModifiers::NONE,
+			),
+			open_commit_inline: shifted('C'),
+			status_unstage_item: plain('u'),
+			branches_checkout: plain('c'),
+			branches_load_more: plain('+'),
+			reset_branch: shifted('R'),
+			rebase_drop: shifted('D'),
+			undo_commit: ctrl('z'),
+			log_mark_commit: plain('x'),
+			log_toggle_graph: ctrl('g'),
+			abort_merge: GituiKeyEvent::new(
+				KeyCode::Char('a'),
+				KeyModifiers::ALT,
+			),
+			log_find: plain('/'),
+			file_find: plain('/'),
+			branch_find: plain('/'),
+			rebase_skip: ctrl('s'),
+			rebase_keep: GituiKeyEvent::new(
+				KeyCode::Char('k'),
+				KeyModifiers::ALT,
+			),
+			rebase_inspector: plain('i'),
+			rebase_exec: ctrl('x'),
+			..Self::default()
 		}
-		keys_list
+	}
+
+	#[cfg(test)]
+	pub fn init(file: PathBuf) -> Self {
+		Self::load(Self::default(), file)
+	}
+
+	#[cfg(test)]
+	pub fn load(keys_list: Self, file: PathBuf) -> Self {
+		Self::try_load(keys_list.clone(), file).unwrap_or_else(
+			|error| {
+				log::error!("{error:#}");
+				keys_list
+			},
+		)
+	}
+
+	/// Apply an optional RON patch, preserving profile defaults when no file
+	/// exists and returning malformed or inaccessible explicit config to caller.
+	pub fn try_load(
+		mut keys_list: Self,
+		file: PathBuf,
+	) -> Result<Self> {
+		let file_display = file.display().to_string();
+		let f = match File::open(file) {
+			Ok(file) => file,
+			Err(error)
+				if error.kind() == std::io::ErrorKind::NotFound =>
+			{
+				return Ok(keys_list);
+			}
+			Err(error) => {
+				return Err(error).with_context(|| {
+					format!(
+						"failed to open key bindings file {file_display}"
+					)
+				});
+			}
+		};
+		let patch = ron::de::from_reader(f).with_context(|| {
+			format!(
+				"failed to parse key bindings file {file_display}"
+			)
+		})?;
+		keys_list.apply(patch);
+		Ok(keys_list)
 	}
 }
 
@@ -293,6 +460,89 @@ mod tests {
 	use pretty_assertions::assert_eq;
 	use std::io::Write;
 	use tempfile::NamedTempFile;
+
+	#[test]
+	fn helix_stage_unstage_and_inline_commit_defaults_are_contextual()
+	{
+		let legacy = KeysList::default();
+		let helix = KeysList::helix();
+		assert_eq!(
+			legacy.stage_unstage_item,
+			GituiKeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+		);
+		assert_eq!(
+			helix.stage_unstage_item,
+			GituiKeyEvent::new(
+				KeyCode::Char('s'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			helix.status_unstage_item,
+			GituiKeyEvent::new(
+				KeyCode::Char('u'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			helix.open_commit_inline,
+			GituiKeyEvent::new(
+				KeyCode::Char('C'),
+				KeyModifiers::SHIFT
+			)
+		);
+		assert_eq!(
+			helix.branches_checkout,
+			GituiKeyEvent::new(
+				KeyCode::Char('c'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			helix.branches_create,
+			GituiKeyEvent::new(
+				KeyCode::Char('n'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			helix.branches_load_more,
+			GituiKeyEvent::new(
+				KeyCode::Char('+'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			legacy.branches_load_more,
+			GituiKeyEvent::new(
+				KeyCode::Char('+'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			legacy.create_branch,
+			GituiKeyEvent::new(
+				KeyCode::Char('c'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			KeysList::default().branches_checkout,
+			GituiKeyEvent::new(
+				KeyCode::Char('c'),
+				KeyModifiers::NONE
+			)
+		);
+		for binding in [
+			helix.status_reset_item,
+			helix.diff_reset_lines,
+			helix.reset_branch,
+			helix.rebase_drop,
+		] {
+			assert!(matches!(binding.code, KeyCode::Char('D' | 'R')));
+			assert!(binding.modifiers.contains(KeyModifiers::SHIFT));
+		}
+	}
 
 	#[test]
 	fn test_apply_vim_style_example() {
@@ -336,5 +586,104 @@ mod tests {
 				KeyModifiers::NONE
 			)
 		);
+	}
+
+	#[test]
+	fn profile_patch_preserves_defaults_and_invalid_ron_is_reported()
+	{
+		let mut file = NamedTempFile::new().unwrap();
+		writeln!(
+			file,
+			r#"(move_down: Some((code: Char('n'), modifiers: "")))"#
+		)
+		.unwrap();
+		let keys = KeysList::try_load(
+			KeysList::helix(),
+			file.path().to_path_buf(),
+		)
+		.unwrap();
+		assert_eq!(
+			keys.move_down,
+			GituiKeyEvent::new(
+				KeyCode::Char('n'),
+				KeyModifiers::NONE
+			)
+		);
+		assert_eq!(
+			keys.move_left,
+			GituiKeyEvent::new(
+				KeyCode::Char('h'),
+				KeyModifiers::NONE
+			)
+		);
+		let helix_defaults = KeysList::helix();
+		assert_eq!(
+			keys.branches_create,
+			helix_defaults.branches_create
+		);
+		assert_eq!(
+			keys.branches_checkout,
+			helix_defaults.branches_checkout
+		);
+		assert_eq!(
+			keys.branches_load_more,
+			helix_defaults.branches_load_more
+		);
+		assert_eq!(keys.select_branch, helix_defaults.select_branch);
+
+		let legacy = KeysList::try_load(
+			KeysList::default(),
+			file.path().to_path_buf(),
+		)
+		.unwrap();
+		assert_eq!(
+			legacy.create_branch,
+			KeysList::default().create_branch
+		);
+		assert_eq!(
+			legacy.select_branch,
+			KeysList::default().select_branch
+		);
+
+		let mut invalid = NamedTempFile::new().unwrap();
+		writeln!(invalid, "not RON").unwrap();
+		assert!(KeysList::try_load(
+			KeysList::helix(),
+			invalid.path().to_path_buf(),
+		)
+		.is_err());
+	}
+
+	#[test]
+	fn key_match_accepts_shift_in_character_or_modifier_for_terminal_variants(
+	) {
+		let shifted_letter = GituiKeyEvent::new(
+			KeyCode::Char('A'),
+			KeyModifiers::SHIFT,
+		);
+		assert!(key_match(
+			&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE),
+			shifted_letter,
+		));
+		assert!(key_match(
+			&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+			shifted_letter,
+		));
+
+		let punctuation = GituiKeyEvent::new(
+			KeyCode::Char('%'),
+			KeyModifiers::NONE,
+		);
+		assert!(key_match(
+			&KeyEvent::new(KeyCode::Char('%'), KeyModifiers::SHIFT),
+			punctuation,
+		));
+		assert!(!key_match(
+			&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT),
+			GituiKeyEvent::new(
+				KeyCode::Char('a'),
+				KeyModifiers::NONE
+			),
+		));
 	}
 }

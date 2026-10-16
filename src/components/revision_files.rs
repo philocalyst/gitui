@@ -21,15 +21,15 @@ use asyncgit::{
 	},
 	AsyncGitNotification, AsyncTreeFilesJob,
 };
-use crossterm::event::Event;
-use filetreelist::{FileTree, FileTreeItem};
+use crossterm::event::{Event, MouseButton, MouseEventKind};
+use filetreelist::{FileTree, FileTreeItem, MoveSelection};
 use ratatui::{
-	layout::{Constraint, Direction, Layout, Rect},
+	layout::{Constraint, Direction, Layout, Margin, Rect},
 	text::Span,
 	widgets::{Block, Borders},
 	Frame,
 };
-use std::{borrow::Cow, fmt::Write};
+use std::{borrow::Cow, cell::Cell, fmt::Write};
 use std::{
 	collections::BTreeSet,
 	path::{Path, PathBuf},
@@ -37,6 +37,7 @@ use std::{
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
 	Tree,
 	File,
@@ -57,9 +58,32 @@ pub struct RevisionFilesComponent {
 	focus: Focus,
 	key_config: SharedKeyConfig,
 	select_file: Option<PathBuf>,
+	tree_area: Cell<Rect>,
+	file_area: Cell<Rect>,
+	mouse_capture: Option<Focus>,
 }
 
 impl RevisionFilesComponent {
+	fn visible_tree_label(path: &str) -> String {
+		let mut visible = String::with_capacity(path.len());
+		for character in path.chars() {
+			match character {
+				'\n' => visible.push_str("\\n"),
+				'\r' => visible.push_str("\\r"),
+				'\t' => visible.push_str("\\t"),
+				character if character.is_control() => {
+					let _ = write!(
+						visible,
+						"\\u{{{:x}}}",
+						character as u32
+					);
+				}
+				character => visible.push(character),
+			}
+		}
+		visible
+	}
+
 	///
 	pub fn new(
 		env: &Environment,
@@ -81,6 +105,9 @@ impl RevisionFilesComponent {
 			repo: env.repo.clone(),
 			select_file,
 			visible: false,
+			tree_area: Cell::new(Rect::default()),
+			file_area: Cell::new(Rect::default()),
+			mouse_capture: None,
 		}
 	}
 
@@ -106,6 +133,34 @@ impl RevisionFilesComponent {
 	///
 	pub const fn revision(&self) -> Option<&CommitInfo> {
 		self.revision.as_ref()
+	}
+
+	/// Whether the file tree currently owns input focus.
+	#[must_use]
+	pub const fn tree_focused(&self) -> bool {
+		matches!(self.focus, Focus::Tree)
+	}
+
+	/// Focus the file tree directly, independent of configured key bindings.
+	pub fn focus_tree(&mut self) {
+		self.focus = Focus::Tree;
+		self.current_file.focus(false);
+	}
+
+	/// Focus the file contents directly, independent of configured key bindings.
+	pub fn focus_file(&mut self) {
+		self.focus = Focus::File;
+		self.current_file.focus(true);
+	}
+
+	/// Move focus between the tree and the file contents and return the new
+	/// focus owner.
+	pub fn focus_next(&mut self) {
+		if self.tree_focused() {
+			self.focus_file();
+		} else {
+			self.focus_tree();
+		}
 	}
 
 	///
@@ -170,7 +225,7 @@ impl RevisionFilesComponent {
 		width: usize,
 		selected: bool,
 	) -> Span<'a> {
-		let path = item.info().path_str();
+		let path = Self::visible_tree_label(item.info().path_str());
 		let indent = item.info().indent();
 
 		let indent_str = if indent == 0 {
@@ -392,6 +447,93 @@ impl RevisionFilesComponent {
 			commit,
 		));
 	}
+
+	fn handle_mouse_event(
+		&mut self,
+		event: &crossterm::event::Event,
+	) -> Result<EventState> {
+		let Event::Mouse(mouse) = event else {
+			return Ok(EventState::NotConsumed);
+		};
+		let focus = match mouse.kind {
+			MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+				self.mouse_capture
+			}
+			MouseEventKind::Down(MouseButton::Left)
+			| MouseEventKind::ScrollUp
+			| MouseEventKind::ScrollDown => {
+				let position = (mouse.column, mouse.row).into();
+				if self.tree_area.get().contains(position) {
+					Some(Focus::Tree)
+				} else if self.file_area.get().contains(position) {
+					Some(Focus::File)
+				} else {
+					None
+				}
+			}
+			_ => None,
+		};
+		if let Some(focus) = focus {
+			match focus {
+				Focus::Tree => self.focus_tree(),
+				Focus::File => self.focus_file(),
+			}
+			if matches!(
+				mouse.kind,
+				MouseEventKind::Down(MouseButton::Left)
+			) {
+				self.mouse_capture = Some(focus);
+			}
+			if focus == Focus::Tree {
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left) => {
+						let visible_row =
+							usize::from(mouse.row.saturating_sub(
+								self.tree_area.get().y,
+							));
+						let index =
+							self.scroll.get_top() + visible_row;
+						let path = self
+							.tree
+							.iterate(index, 1)
+							.next()
+							.map(|(item, _)| {
+								item.info().full_path().to_path_buf()
+							});
+						if let Some(path) = path {
+							if self.tree.select_file(&path) {
+								self.selection_changed();
+							}
+						}
+					}
+					MouseEventKind::ScrollUp => {
+						if self.tree.move_selection(MoveSelection::Up)
+						{
+							self.selection_changed();
+						}
+					}
+					MouseEventKind::ScrollDown
+						if self
+							.tree
+							.move_selection(MoveSelection::Down) =>
+					{
+						self.selection_changed();
+					}
+					_ => {}
+				}
+			} else {
+				let _ = self.current_file.event(event)?;
+			}
+		}
+		if matches!(mouse.kind, MouseEventKind::Up(_)) {
+			self.mouse_capture = None;
+		}
+		Ok(if focus.is_some() {
+			EventState::Consumed
+		} else {
+			EventState::NotConsumed
+		})
+	}
 }
 
 impl DrawableComponent for RevisionFilesComponent {
@@ -408,6 +550,11 @@ impl DrawableComponent for RevisionFilesComponent {
 				)
 				.split(area);
 
+			self.tree_area.set(chunks[0].inner(Margin {
+				vertical: 1,
+				horizontal: 1,
+			}));
+			self.file_area.set(chunks[1]);
 			self.draw_tree(f, chunks[0])?;
 
 			self.current_file.draw(f, chunks[1])?;
@@ -474,6 +621,9 @@ impl Component for RevisionFilesComponent {
 	) -> Result<EventState> {
 		if !self.is_visible() {
 			return Ok(EventState::NotConsumed);
+		}
+		if matches!(event, Event::Mouse(_)) {
+			return self.handle_mouse_event(event);
 		}
 
 		if let Event::Key(key) = event {
@@ -593,5 +743,117 @@ fn tree_nav(
 		true
 	} else {
 		false
+	}
+}
+
+#[cfg(test)]
+mod pointer_tests {
+	use super::*;
+	use crossterm::event::{KeyModifiers, MouseEvent};
+	use std::path::Path;
+
+	#[test]
+	fn clicking_a_rendered_file_row_selects_that_file() {
+		let env = Environment::test_env();
+		let mut component = RevisionFilesComponent::new(&env, None);
+		component.visible = true;
+		component.files = Some(Vec::new());
+		component.tree = FileTree::new(
+			&[Path::new("alpha.txt"), Path::new("beta.txt")],
+			&BTreeSet::new(),
+		)
+		.unwrap();
+
+		let backend = ratatui::backend::TestBackend::new(80, 24);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| {
+				component.draw(frame, frame.area()).unwrap();
+			})
+			.unwrap();
+
+		let area = component.tree_area.get();
+		component
+			.event(&Event::Mouse(MouseEvent {
+				kind: MouseEventKind::Down(MouseButton::Left),
+				column: area.x + 1,
+				row: area.y + 1,
+				modifiers: KeyModifiers::NONE,
+			}))
+			.unwrap();
+		assert_eq!(
+			component
+				.tree
+				.selected_file()
+				.map(|item| item.full_path_str()),
+			Some("beta.txt"),
+		);
+	}
+
+	#[test]
+	fn control_characters_stay_on_one_rendered_tree_row() {
+		let env = Environment::test_env();
+		let mut component = RevisionFilesComponent::new(&env, None);
+		component.visible = true;
+		component.files = Some(Vec::new());
+		component.tree = FileTree::new(
+			&[Path::new("alpha\nbroken.txt")],
+			&BTreeSet::new(),
+		)
+		.unwrap();
+		let tree_rows = component
+			.tree
+			.iterate(0, 20)
+			.map(|(item, _)| item.info().path_str().to_owned())
+			.collect::<Vec<_>>();
+
+		let backend = ratatui::backend::TestBackend::new(80, 24);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| {
+				component.draw(frame, frame.area()).unwrap();
+			})
+			.unwrap();
+
+		let area = component.tree_area.get();
+		let rendered_rows = (0..area.height)
+			.map(|offset| {
+				(area.x..area.right())
+					.map(|x| {
+						terminal.backend().buffer()
+							[(x, area.y + offset)]
+							.symbol()
+							.to_owned()
+					})
+					.collect::<String>()
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			rendered_rows
+				.iter()
+				.any(|row| row.contains("alpha\\nbroken.txt")),
+			"rendered={rendered_rows:?} tree={tree_rows:?}"
+		);
+		assert!(rendered_rows.iter().all(|row| !row.contains('\n')));
+		let file_row = rendered_rows
+			.iter()
+			.position(|row| row.contains("alpha\\nbroken.txt"))
+			.expect("control-character file is rendered");
+
+		component
+			.event(&Event::Mouse(MouseEvent {
+				kind: MouseEventKind::Down(MouseButton::Left),
+				column: area.x + 1,
+				row: area.y + u16::try_from(file_row).unwrap(),
+				modifiers: KeyModifiers::NONE,
+			}))
+			.unwrap();
+		assert_eq!(
+			component
+				.tree
+				.selected_file()
+				.map(|item| item.full_path_str()),
+			Some("alpha\nbroken.txt"),
+		);
 	}
 }

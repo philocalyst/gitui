@@ -9,7 +9,9 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::hash;
-use crossterm::event::Event;
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseEventKind,
+};
 use itertools::Itertools;
 use ratatui::{
 	layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -18,7 +20,7 @@ use ratatui::{
 	widgets::{Block, BorderType, Borders, Clear, Paragraph},
 	Frame,
 };
-use std::{borrow::Cow, cmp};
+use std::{borrow::Cow, cell::Cell, cmp};
 use ui::style::SharedTheme;
 
 ///
@@ -28,6 +30,7 @@ pub struct HelpPopup {
 	selection: u16,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
+	content_area: Cell<Rect>,
 }
 
 impl DrawableComponent for HelpPopup {
@@ -66,6 +69,7 @@ impl DrawableComponent for HelpPopup {
 					.alignment(Alignment::Left),
 				chunks[0],
 			);
+			self.content_area.set(chunks[0]);
 
 			ui::draw_scrollbar(
 				f,
@@ -134,13 +138,38 @@ impl Component for HelpPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.visible {
+			if let Event::Mouse(mouse) = ev {
+				let area = self.content_area.get();
+				if area.contains((mouse.column, mouse.row).into()) {
+					match mouse.kind {
+						MouseEventKind::ScrollDown => {
+							self.move_selection(true);
+						}
+						MouseEventKind::ScrollUp => {
+							self.move_selection(false);
+						}
+						_ => {}
+					}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(e) = ev {
+				let modal_up = self.key_config.is_modal()
+					&& e.code == KeyCode::Up
+					&& e.modifiers == KeyModifiers::NONE;
+				let modal_down = self.key_config.is_modal()
+					&& e.code == KeyCode::Down
+					&& e.modifiers == KeyModifiers::NONE;
+
 				if key_match(e, self.key_config.keys.exit_popup) {
 					self.hide();
-				} else if key_match(e, self.key_config.keys.move_down)
+				} else if modal_down
+					|| key_match(e, self.key_config.keys.move_down)
 				{
 					self.move_selection(true);
-				} else if key_match(e, self.key_config.keys.move_up) {
+				} else if modal_up
+					|| key_match(e, self.key_config.keys.move_up)
+				{
 					self.move_selection(false);
 				}
 			}
@@ -181,6 +210,7 @@ impl HelpPopup {
 			selection: 0,
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			content_area: Cell::new(Rect::default()),
 		}
 	}
 	///
@@ -251,5 +281,46 @@ impl HelpPopup {
 		}
 
 		txt
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		components::CommandText,
+		keys::{KeyConfig, Keymap},
+	};
+	use crossterm::event::{KeyEvent, KeyEventKind};
+
+	#[test]
+	fn modal_arrow_down_moves_help_selection() {
+		let mut env = Environment::test_env();
+		env.key_config =
+			std::rc::Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let mut popup = HelpPopup::new(&env);
+		popup.set_cmds(vec![
+			CommandInfo::new(
+				CommandText::new("first".to_owned(), "", "test"),
+				true,
+				true,
+			),
+			CommandInfo::new(
+				CommandText::new("second".to_owned(), "", "test"),
+				true,
+				true,
+			),
+		]);
+		popup.show().unwrap();
+
+		popup
+			.event(&Event::Key(KeyEvent::new_with_kind(
+				KeyCode::Down,
+				KeyModifiers::NONE,
+				KeyEventKind::Press,
+			)))
+			.unwrap();
+
+		assert_eq!(popup.selection, 1);
 	}
 }

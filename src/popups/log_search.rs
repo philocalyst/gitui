@@ -541,6 +541,15 @@ impl DrawableComponent for LogSearchPopupPopup {
 }
 
 impl Component for LogSearchPopupPopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible()
+			&& self.find_text.captures_input()
+			&& match self.mode {
+				PopupMode::Search => !self.option_selected(),
+				PopupMode::JumpCommitSha => true,
+			}
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,

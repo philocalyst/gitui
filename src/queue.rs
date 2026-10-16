@@ -9,9 +9,9 @@ use crate::{
 use asyncgit::{
 	sync::{
 		diff::DiffLinePosition, BranchInfo, CommitId,
-		LogFilterSearchOptions,
+		DiffLineReplacement, LogFilterSearchOptions,
 	},
-	PushType,
+	FileDiff, PushType,
 };
 use bitflags::bitflags;
 use std::{
@@ -43,8 +43,14 @@ pub struct ResetItem {
 ///
 pub enum Action {
 	Reset(ResetItem),
-	ResetHunk(String, u64),
-	ResetLines(String, Vec<DiffLinePosition>),
+	ResetHunk(String, u64, FileDiff),
+	ResetLines(String, Vec<DiffLinePosition>, FileDiff),
+	ResetLinesWithPairs(
+		String,
+		Vec<DiffLinePosition>,
+		Vec<DiffLineReplacement>,
+		FileDiff,
+	),
 	StashDrop(Vec<CommitId>),
 	StashPop(CommitId),
 	DeleteLocalBranch(String),
@@ -53,7 +59,10 @@ pub enum Action {
 	DeleteRemoteTag(String, String),
 	DeleteRemote(String),
 	ForcePush(String, bool),
-	PullMerge { incoming: usize, rebase: bool },
+	PullMerge {
+		incoming: usize,
+		rebase: bool,
+	},
 	AbortMerge,
 	AbortRebase,
 	AbortRevert,
@@ -81,6 +90,7 @@ pub enum AppTabs {
 	Stashing,
 	Stashlist,
 	Rebase,
+	Branches,
 }
 
 ///
@@ -99,6 +109,10 @@ pub enum InternalEvent {
 	StatusLastFileMoved,
 	/// open commit msg input
 	OpenCommit,
+	/// open the modal commit workflow in the configured editor
+	OpenCommitEditor,
+	/// open the inline commit message dialog
+	OpenCommitInline,
 	///
 	PopupStashing(StashingOptions),
 	///

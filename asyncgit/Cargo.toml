@@ -22,6 +22,8 @@ git2-hooks = { path = "../git2-hooks", version = "0.7" }
 gix = { version = "0.84.0", default-features = false, features = ["mailmap", "max-performance", "revision", "sha1", "sha256", "status"] }
 foldhash = "0.2"
 log = "0.4"
+libc = "0.2"
+unicode-segmentation = "1.12"
 # git2 = { path = "../../extern/git2-rs", features = ["vendored-openssl"]}
 # git2 = { git="https://github.com/extrawurst/git2-rs.git", rev="fc13dcc", features = ["vendored-openssl"]}
 # pinning to vendored openssl, using the git2 feature this gets lost with new resolver
@@ -34,6 +36,14 @@ serde = { version = "1.0", features = ["derive"] }
 smallvec = "1"
 tempfile = "3"
 thiserror = "2.0"
+tree-sitter = "=0.25.10"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-zig = "=1.1.2"
+tree-sitter-language = "=0.1.5"
 unicode-truncate = "2.0"
 url = "2.5"
 

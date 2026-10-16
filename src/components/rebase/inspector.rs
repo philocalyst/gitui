@@ -14,9 +14,9 @@ use crate::{
 	app::Environment,
 	components::{
 		visibility_blocking, CommandBlocking, CommandInfo, Component,
-		DrawableComponent, EventState,
+		DrawableComponent, EventState, ScrollType,
 	},
-	keys::SharedKeyConfig,
+	keys::{key_match, SharedKeyConfig},
 	strings,
 	ui::style::{SharedTheme, Theme},
 };
@@ -38,6 +38,7 @@ use ratatui::{
 	widgets::{Block, Borders, Paragraph},
 	Frame,
 };
+use std::cell::Cell;
 use std::cell::RefCell;
 
 /// One styled line under construction.
@@ -501,6 +502,10 @@ pub struct Inspector {
 	lines: RefCell<Vec<Line<'static>>>,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
+	focused: Cell<bool>,
+	scroll_top: Cell<usize>,
+	max_scroll_top: Cell<usize>,
+	visible_height: Cell<usize>,
 }
 
 impl Inspector {
@@ -511,6 +516,10 @@ impl Inspector {
 			lines: RefCell::new(Vec::new()),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			focused: Cell::new(false),
+			scroll_top: Cell::new(0),
+			max_scroll_top: Cell::new(0),
+			visible_height: Cell::new(0),
 		}
 	}
 
@@ -522,6 +531,36 @@ impl Inspector {
 	) {
 		*self.title.borrow_mut() = title;
 		*self.lines.borrow_mut() = lines;
+		self.clamp_scroll();
+	}
+
+	/// The current scroll offset, useful to keep focus and rendering behavior
+	/// observable to the owning workspace.
+	#[must_use]
+	pub const fn scroll_top(&self) -> usize {
+		self.scroll_top.get()
+	}
+
+	fn clamp_scroll(&self) {
+		self.scroll_top.set(
+			self.scroll_top.get().min(self.max_scroll_top.get()),
+		);
+	}
+
+	fn scroll(&self, movement: ScrollType) -> bool {
+		let old = self.scroll_top.get();
+		let step = self.visible_height.get().max(1);
+		let next = match movement {
+			ScrollType::Up => old.saturating_sub(1),
+			ScrollType::Down => old.saturating_add(1),
+			ScrollType::PageUp => old.saturating_sub(step),
+			ScrollType::PageDown => old.saturating_add(step),
+			ScrollType::Home => 0,
+			ScrollType::End => self.max_scroll_top.get(),
+		};
+		let next = next.min(self.max_scroll_top.get());
+		self.scroll_top.set(next);
+		next != old
 	}
 }
 
@@ -529,17 +568,28 @@ impl DrawableComponent for Inspector {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
 		let title = self.title.borrow();
 		let lines = self.lines.borrow();
+		let height = area.height.saturating_sub(2) as usize;
+		self.visible_height.set(height);
+		self.max_scroll_top.set(lines.len().saturating_sub(height));
+		self.clamp_scroll();
 
 		f.render_widget(
 			Paragraph::new(lines.clone())
+				.scroll((
+					u16::try_from(self.scroll_top.get())
+						.unwrap_or(u16::MAX),
+					0,
+				))
 				.block(
 					Block::default()
 						.borders(Borders::ALL)
 						.title(Span::styled(
 							title.as_str(),
-							self.theme.title(true),
+							self.theme.title(self.focused.get()),
 						))
-						.border_style(self.theme.block(true)),
+						.border_style(
+							self.theme.block(self.focused.get()),
+						),
 				)
 				.alignment(Alignment::Left),
 			area,
@@ -550,7 +600,32 @@ impl DrawableComponent for Inspector {
 }
 
 impl Component for Inspector {
-	fn event(&mut self, _ev: &Event) -> Result<EventState> {
+	fn event(&mut self, ev: &Event) -> Result<EventState> {
+		if !self.focused.get() {
+			return Ok(EventState::NotConsumed);
+		}
+		if let Event::Key(key) = ev {
+			let keys = &self.key_config.keys;
+			let movement = if key_match(key, keys.move_down) {
+				Some(ScrollType::Down)
+			} else if key_match(key, keys.move_up) {
+				Some(ScrollType::Up)
+			} else if key_match(key, keys.page_down) {
+				Some(ScrollType::PageDown)
+			} else if key_match(key, keys.page_up) {
+				Some(ScrollType::PageUp)
+			} else if key_match(key, keys.home) {
+				Some(ScrollType::Home)
+			} else if key_match(key, keys.end) {
+				Some(ScrollType::End)
+			} else {
+				None
+			};
+			if let Some(movement) = movement {
+				self.scroll(movement);
+				return Ok(EventState::Consumed);
+			}
+		}
 		Ok(EventState::NotConsumed)
 	}
 
@@ -571,5 +646,13 @@ impl Component for Inspector {
 
 	fn is_visible(&self) -> bool {
 		true
+	}
+
+	fn focused(&self) -> bool {
+		self.focused.get()
+	}
+
+	fn focus(&mut self, focus: bool) {
+		self.focused.set(focus);
 	}
 }

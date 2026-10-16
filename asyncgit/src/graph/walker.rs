@@ -20,12 +20,20 @@ bitflags! {
 	/// The neighboring cells a lane joins to. Overlapping lines
 	/// are merged through this representation rather than
 	/// a naive overwrite for readability.
+	///
+	/// [`Self::LEFT`] and [`Self::RIGHT`] are a horizontal run that
+	/// *joins* this cell; [`Self::CROSS`] is one that runs past it
+	/// without joining. Keeping the two apart is what lets a bridge be
+	/// drawn behind an unrelated lane, while a bridge that really ends
+	/// on a lane still gets its junction even when a third line
+	/// crosses the same cell.
 	#[derive(Clone, Copy, Default)]
 	struct Directions: u8 {
-		const UP = 0b0001;
-		const DOWN = 0b0010;
-		const LEFT = 0b0100;
-		const RIGHT = 0b1000;
+		const UP = 0b0_0001;
+		const DOWN = 0b0_0010;
+		const LEFT = 0b0_0100;
+		const RIGHT = 0b0_1000;
+		const CROSS = 0b1_0000;
 	}
 }
 
@@ -75,6 +83,12 @@ fn connection_to_directions(
 		ConnectionType::TeeDown => {
 			Directions::DOWN | Directions::LEFT | Directions::RIGHT
 		}
+		ConnectionType::Cross => {
+			Directions::UP
+				| Directions::DOWN
+				| Directions::LEFT
+				| Directions::RIGHT
+		}
 		ConnectionType::CommitNormal
 		| ConnectionType::CommitBranch
 		| ConnectionType::CommitMerge
@@ -83,36 +97,57 @@ fn connection_to_directions(
 	})
 }
 
+const fn vertical_connection(dotted: bool) -> ConnectionType {
+	if dotted {
+		ConnectionType::VerticalDotted
+	} else {
+		ConnectionType::Vertical
+	}
+}
+
 /// Synthesize a connection glyph from direction components.
-/// Vertical lines take precedence in crossed cells.
-/// Yet the horizontal bridge continues in
-/// the spacer columns either side, so we retain wholeness.
 const fn directions_to_connection(
 	dirs: Directions,
 	dotted: bool,
 ) -> ConnectionType {
 	let up = dirs.contains(Directions::UP);
 	let down = dirs.contains(Directions::DOWN);
-	let left = dirs.contains(Directions::LEFT);
-	let right = dirs.contains(Directions::RIGHT);
+	let joins_left = dirs.contains(Directions::LEFT);
+	let joins_right = dirs.contains(Directions::RIGHT);
+	let crossed = dirs.contains(Directions::CROSS);
+
+	// A lane running straight through the cell. A bridge that merely
+	// crosses it is drawn behind it, which keeps the lane readable and
+	// is the whole reason a crossing is tracked apart from a join. A
+	// bridge that ends on the lane needs a junction instead, and when
+	// the cell is both joined and crossed there is nothing left to
+	// hide the join behind, so it takes the full cross. Drawing that
+	// case as a plain vertical, which is all a single horizontal bit
+	// could do, loses the merge edge out of the picture entirely.
+	if up && down {
+		return match (joins_left, joins_right, crossed) {
+			(false, false, _) => vertical_connection(dotted),
+			(true, false, false) => ConnectionType::TeeLeft,
+			(false, true, false) => ConnectionType::TeeRight,
+			_ => ConnectionType::Cross,
+		};
+	}
+
+	// Below here the cell has at most one vertical end, so a crossing
+	// and a join on the same side are drawn alike.
+	let left = joins_left || crossed;
+	let right = joins_right || crossed;
+
 	match (up, down, left, right) {
-		(true, true, true, false) => ConnectionType::TeeLeft,
-		(true, true, false, true) => ConnectionType::TeeRight,
-		(true, false, true, true) => ConnectionType::TeeUp,
-		(false, true, true, true) => ConnectionType::TeeDown,
-		(true, false, true, false) => ConnectionType::BranchUp,
-		(true, false, false, true) => ConnectionType::BranchUpRight,
-		(false, true, true, false) => {
-			ConnectionType::MergeBridgeStart
-		}
-		(false, true, false, true) => ConnectionType::MergeBridgeEnd,
+		(true, _, true, true) => ConnectionType::TeeUp,
+		(_, true, true, true) => ConnectionType::TeeDown,
+		(true, _, true, false) => ConnectionType::BranchUp,
+		(true, _, false, true) => ConnectionType::BranchUpRight,
+		(_, true, true, false) => ConnectionType::MergeBridgeStart,
+		(_, true, false, true) => ConnectionType::MergeBridgeEnd,
 		(false, false, _, _) => ConnectionType::MergeBridgeMid,
-		(true, true, _, _) | (_, false | true, false, false) => {
-			if dotted {
-				ConnectionType::VerticalDotted
-			} else {
-				ConnectionType::Vertical
-			}
+		(true | false, _, false, false) => {
+			vertical_connection(dotted)
 		}
 	}
 }
@@ -152,25 +187,58 @@ fn overlay_cell(
 	}
 }
 
+/// What the walk learned about one commit, indexed by its
+/// [`CommitAlias`]. Aliases are dense `0..n`, so the facts live in a
+/// flat vector instead of a map.
+#[derive(Clone, Copy, Debug, Default)]
+struct CommitFacts {
+	/// Whether the commit has already been folded into the buffer.
+	///
+	/// [`GraphWalker::mint_drawable_parent`] refuses to mint an
+	/// [`UnwalkedAlias`] for one of these: a lane waiting on a commit
+	/// the walk has already passed would stay open to the end of the
+	/// log, drawing a line that never reaches anything.
+	processed: bool,
+
+	/// Whether Git reports more than one parent for this commit, which
+	/// is what makes it draw a merge marker.
+	///
+	/// A merge can legitimately end up with a single drawn edge — an
+	/// octopus merge past its second parent, a duplicated parent
+	/// entry, or a second parent the walk reached first — and keeping
+	/// this apart from the lanes lets the marker stay honest about
+	/// what the commit is in all three cases.
+	is_merge: bool,
+
+	/// The second parent that was given a lane of its own, which is
+	/// the far end of the row's merge bridge.
+	second_parent: Option<CommitAlias>,
+}
+
 #[derive(Default)]
 pub struct GraphWalker {
 	pub buffer: Buffer,
 	pub oids: GraphOids,
 
-	/// For each merge commit's alias, the alias of its second parent.
-	/// Indexed directly by alias: aliases are dense `0..n`, so no
-	/// hashing is needed.
-	pub merge_parents: Vec<Option<CommitAlias>>,
-
-	/// Whether an alias has already been folded into the buffer;
-	/// consulted by [`Self::mint_drawable_parent`], which refuses to
-	/// mint an [`UnwalkedAlias`] for any of them. Indexed by alias.
-	pub processed: Vec<bool>,
+	/// What the walk knows about each commit, indexed by alias.
+	facts: Vec<CommitFacts>,
 }
 
 impl GraphWalker {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	fn facts(&self, alias: CommitAlias) -> CommitFacts {
+		self.facts.get(*alias).copied().unwrap_or_default()
+	}
+
+	fn facts_mut(&mut self, alias: CommitAlias) -> &mut CommitFacts {
+		let index = *alias;
+		if self.facts.len() <= index {
+			self.facts.resize(index + 1, CommitFacts::default());
+		}
+		&mut self.facts[index]
 	}
 
 	/// Mint the drawable alias for a parent commit, or `None` if the
@@ -180,19 +248,49 @@ impl GraphWalker {
 		id: &CommitId,
 	) -> Option<UnwalkedAlias> {
 		let alias = self.oids.get_or_insert(id);
-		(!self.is_processed(alias)).then_some(UnwalkedAlias(alias))
+		(!self.facts(alias).processed).then_some(UnwalkedAlias(alias))
 	}
 
-	fn is_processed(&self, alias: CommitAlias) -> bool {
-		self.processed.get(*alias).copied().unwrap_or(false)
-	}
+	/// The parents this commit draws an edge to: the first two
+	/// distinct parents the walk has not already passed.
+	///
+	/// Every parent left out is one that no lane will wait for, and
+	/// that is the point. Git lets a commit name the same parent twice
+	/// and lets an octopus merge name more than two, and a walk
+	/// ordered by commit time can reach a parent before its child. A
+	/// lane opened for any of those could never be closed by a later
+	/// row, so it would hang off the bottom of the log as a line that
+	/// goes nowhere.
+	fn drawable_parents(
+		&mut self,
+		parents: &[CommitId],
+	) -> [Option<UnwalkedAlias>; 2] {
+		let mut drawn: [Option<UnwalkedAlias>; 2] = [None, None];
+		let mut found = 0;
 
-	fn mark_processed(&mut self, alias: CommitAlias) {
-		let index = *alias;
-		if self.processed.len() <= index {
-			self.processed.resize(index + 1, false);
+		for parent_id in parents {
+			if found == drawn.len() {
+				break;
+			}
+
+			let Some(parent) = self.mint_drawable_parent(parent_id)
+			else {
+				continue;
+			};
+
+			let repeated = drawn[..found]
+				.iter()
+				.flatten()
+				.any(|seen| **seen == *parent);
+			if repeated {
+				continue;
+			}
+
+			drawn[found] = Some(parent);
+			found += 1;
 		}
-		self.processed[index] = true;
+
+		drawn
 	}
 
 	pub fn process(
@@ -202,14 +300,14 @@ impl GraphWalker {
 	) {
 		let commit_alias = self.oids.get_or_insert(&commit_id);
 
-		let mut drawable_parents =
-			parents.iter().filter_map(|parent_id| {
-				self.mint_drawable_parent(parent_id)
-			});
+		// Mark the commit walked before resolving its parents, so that
+		// a parent entry naming the commit itself is turned down like
+		// any other already-walked parent instead of opening a lane
+		// that waits for the commit which just closed it.
+		self.facts_mut(commit_alias).processed = true;
 
-		// We explicitly cap support at 2 parents, ignoring octo/mega merges.
-		let first_parent = drawable_parents.next();
-		let second_parent = drawable_parents.next();
+		let [first_parent, second_parent] =
+			self.drawable_parents(parents);
 
 		let chunk = match (first_parent, second_parent) {
 			(Some(parent), Some(second)) => LaneSlot::FlowingMerge {
@@ -221,30 +319,24 @@ impl GraphWalker {
 				alias: commit_alias,
 				parent,
 			},
-			(None, None) => LaneSlot::Settled {
+			// `drawable_parents` fills its slots left to right, so
+			// there is no second parent without a first.
+			(None, _) => LaneSlot::Settled {
 				alias: commit_alias,
 			},
-			(None, Some(_)) => unreachable!(
-				"second_parent is only ever Some once first_parent \
-				 has already been consumed from the identical \
-				 iterator, so a merge always has both parents"
-			),
 		};
 
-		if let LaneSlot::FlowingMerge { second, .. } = &chunk {
-			let second = **second;
-			let index = *commit_alias;
-			if self.merge_parents.len() <= index {
-				self.merge_parents.resize(index + 1, None);
-			}
-			self.merge_parents[index] = Some(second);
+		let second = second_parent.map(|second| *second);
+		let facts = self.facts_mut(commit_alias);
+		facts.is_merge = parents.len() > 1;
+		facts.second_parent = second;
 
+		if let Some(second) = second {
 			if !self.has_lane_to_parent(second) {
 				self.buffer.track_merge_commit(commit_alias);
 			}
 		}
 
-		self.mark_processed(commit_alias);
 		self.buffer.update(&chunk);
 	}
 
@@ -321,13 +413,10 @@ impl GraphWalker {
 		let Some((source_lane, target_lane)) = merge_bridge else {
 			return;
 		};
-		// A commit that lists the same parent twice (git allows
-		// duplicate parent entries, however rare in practice) makes
-		// its own lane await its second parent's alias too, so the
-		// search in `calculate_merge_bridge` can land back on
-		// `commit_lane` itself. There is no separate lane to bridge
-		// to in that case, so skip drawing rather than laying a
-		// zero-length span.
+		// `drawable_parents` keeps the two parents distinct, so the
+		// search in `calculate_merge_bridge` cannot land back on the
+		// merge's own lane. The guard stays because the alternative
+		// is overwriting the commit marker with a zero-length span.
 		if source_lane == target_lane {
 			return;
 		}
@@ -410,22 +499,28 @@ impl GraphWalker {
 			.collect()
 	}
 
-	/// Whether some lane already flows or is reserved for
-	/// `target_parent` without owing a second parent of its own,
-	/// making it redundant to track a new merge bridge to that
-	/// parent.
+	/// Whether a lane is already waiting for `target_parent`, making a
+	/// second lane for it both redundant and wrong.
+	///
+	/// This has to agree exactly with the two other places that go
+	/// looking for a lane by the parent it awaits: the one that places
+	/// a commit, and the one that picks the far end of a merge bridge.
+	/// Both of them take the *first* such lane. So if this said no
+	/// while a lane was in fact waiting, the reservation opened on the
+	/// strength of that answer would be left over — the bridge would
+	/// be drawn to the lane that was already there, and the reserved
+	/// column would draw a line with nothing above it.
 	fn has_lane_to_parent(&self, target_parent: CommitAlias) -> bool {
-		self.buffer.current.iter().flatten().any(|slot| {
-			matches!(
-				slot,
-				LaneSlot::Flowing { parent, .. }
-				| LaneSlot::Reserved { parent }
-					if **parent == target_parent
-			)
-		})
+		self.buffer
+			.current
+			.iter()
+			.flatten()
+			.any(|slot| slot.awaits() == Some(target_parent))
 	}
 
-	/// Determines if a lane should draw an upward-connecting corner.
+	/// Whether the lane in `target_lane` is the same lane the row above
+	/// had there, which is what lets a bridge end draw a junction into
+	/// it instead of a corner.
 	fn lane_continues_upwards(
 		target_lane: usize,
 		current_snapshot: &[Option<LaneSlot>],
@@ -435,9 +530,16 @@ impl GraphWalker {
 			return false;
 		};
 
-		let current = current_snapshot.get(target_lane);
-		current.is_some()
-			&& previous_snapshot.get(target_lane) == current
+		let occupant = |snapshot: &[Option<LaneSlot>]| {
+			snapshot
+				.get(target_lane)
+				.copied()
+				.flatten()
+				.map(|slot| slot.identity())
+		};
+
+		let current = occupant(current_snapshot);
+		current.is_some() && occupant(previous_snapshot) == current
 	}
 
 	/// Uses `Ordering` to elegantly map spatial relationships to visual bitmasks.
@@ -498,13 +600,14 @@ impl GraphWalker {
 	) -> GraphRow {
 		let commit_alias = self.oids.get(commit_id);
 		let head_alias = head_id.and_then(|id| self.oids.get(id));
-		let second_parent_alias = commit_alias.and_then(|alias| {
-			self.merge_parents.get(*alias).copied().flatten()
-		});
+		let facts = commit_alias
+			.map_or_else(CommitFacts::default, |alias| {
+				self.facts(alias)
+			});
 
 		let commit_lane =
 			Self::find_commit_lane(current_snapshot, commit_alias);
-		let is_merge = second_parent_alias.is_some();
+		let is_merge = facts.is_merge;
 		let is_branch_tip = branch_tips.contains(commit_id);
 		let is_stash = stashes.contains(commit_id);
 
@@ -514,7 +617,7 @@ impl GraphWalker {
 		);
 
 		let merge_bridge =
-			second_parent_alias.and_then(|parent_alias| {
+			facts.second_parent.and_then(|parent_alias| {
 				commit_lane.and_then(|cl| {
 					Self::calculate_merge_bridge(
 						current_snapshot,
@@ -571,11 +674,8 @@ impl GraphWalker {
 			)
 		});
 
-		let active_lane_count =
-			current_snapshot.iter().flatten().count();
-
 		GraphRow {
-			lane_count: active_lane_count.into(),
+			lane_count: LaneIndex::from(lanes.len()),
 			commit_lane: LaneIndex::from(commit_lane.unwrap_or(0)),
 			is_merge,
 			is_branch_tip,
@@ -625,7 +725,15 @@ impl GraphWalker {
 			})
 	}
 
-	/// Identifies lanes that existed in the previous row but terminated before the current row.
+	/// Columns whose lane drew a line into the row above and has no
+	/// occupant now: each one closed into this row's commit and needs
+	/// a bridge drawn across to its lane.
+	///
+	/// A column the row above held a root commit in is not one of
+	/// them. [`LaneSlot::Settled`] draws a marker and no line
+	/// downward, so there would be nothing above for the bridge to
+	/// join, and drawing one would invent an edge between two
+	/// unrelated histories.
 	fn find_branching_lanes(
 		current_snapshot: &[Option<LaneSlot>],
 		previous_snapshot: Option<&[Option<LaneSlot>]>,
@@ -638,7 +746,8 @@ impl GraphWalker {
 			.iter()
 			.enumerate()
 			.filter_map(|(index, previous_chunk)| {
-				(previous_chunk.is_some()
+				(previous_chunk
+					.is_some_and(|chunk| chunk.awaits().is_some())
 					&& current_snapshot
 						.get(index)
 						.is_none_or(Option::is_none))
@@ -689,6 +798,12 @@ impl GraphWalker {
 	/// Lay the horizontal run of a bridge over the lanes strictly
 	/// between its two ends, merging with whatever each cell already
 	/// shows.
+	///
+	/// These cells are passed *through*, never joined — a bridge's two
+	/// ends are drawn by the callers — so the run is recorded as a
+	/// crossing. That is what keeps an unrelated lane drawn whole
+	/// underneath it, and what stops it from swallowing a junction
+	/// another bridge left in the same cell.
 	fn draw_bridge_span(
 		lanes: &mut [Option<(ConnectionType, LaneIndex)>],
 		from: usize,
@@ -696,11 +811,7 @@ impl GraphWalker {
 		color: LaneIndex,
 	) {
 		for lane in lanes.iter_mut().take(to).skip(from + 1) {
-			overlay_cell(
-				lane,
-				Directions::LEFT | Directions::RIGHT,
-				color,
-			);
+			overlay_cell(lane, Directions::CROSS, color);
 		}
 	}
 }
@@ -708,118 +819,81 @@ impl GraphWalker {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	fn id(n: usize) -> CommitId {
-		CommitId::from_str_unchecked(&format!("{n:040x}"))
-			.expect("valid oid")
-	}
-
-	fn sym(conn: ConnectionType) -> char {
-		match conn {
-			ConnectionType::Vertical => '┃',
-			ConnectionType::VerticalDotted => '╏',
-			ConnectionType::CommitNormal => 'o',
-			ConnectionType::CommitBranch => '*',
-			ConnectionType::CommitMerge => 'M',
-			ConnectionType::CommitStash => '*',
-			ConnectionType::CommitUncommitted => '+',
-			ConnectionType::MergeBridgeStart => '┓',
-			ConnectionType::MergeBridgeMid => '━',
-			ConnectionType::MergeBridgeEnd => '┏',
-			ConnectionType::BranchUp => '┛',
-			ConnectionType::BranchUpRight => '┗',
-			ConnectionType::TeeLeft => '┫',
-			ConnectionType::TeeRight => '┣',
-			ConnectionType::TeeUp => '┻',
-			ConnectionType::TeeDown => '┳',
-		}
-	}
-
-	/// Render a row the way the UI does: one glyph per lane plus a
-	/// spacer that carries a bridge's horizontal run.
-	fn row_to_string(row: &GraphRow) -> String {
-		let mut out = String::new();
-		for (lane_index, conn) in row.lanes.iter().enumerate() {
-			out.push(conn.map_or(' ', |(c, _)| sym(c)));
-
-			let in_bridge = row
-				.merge_bridge
-				.into_iter()
-				.chain(row.branches.iter().copied())
-				.any(|(from, to)| {
-					lane_index >= usize::from(from)
-						&& lane_index < usize::from(to)
-				});
-			out.push(if in_bridge { '━' } else { ' ' });
-		}
-		out.trim_end().to_string()
-	}
-
-	/// Walk `history` (newest first, `(commit, parents)`) and render
-	/// every row.
-	fn render(history: &[(usize, &[usize])]) -> Vec<String> {
-		let mut walker = GraphWalker::new();
-		let ids: Vec<CommitId> =
-			history.iter().map(|(c, _)| id(*c)).collect();
-
-		for (commit, parents) in history {
-			let parents: Vec<CommitId> =
-				parents.iter().map(|p| id(*p)).collect();
-			walker.process(id(*commit), &parents);
-		}
-
-		walker
-			.compute_rows(
-				&ids,
-				0,
-				&HashSet::new(),
-				&HashSet::new(),
-				None,
-			)
-			.iter()
-			.map(row_to_string)
-			.collect()
-	}
+	use crate::graph::harness::{
+		assert_lane_index_exact, oid, walk_generated, Scene, Shape,
+	};
 
 	#[test]
 	fn linear_history() {
-		let rows = render(&[(1, &[2]), (2, &[3]), (3, &[])]);
-		assert_eq!(rows, vec!["o", "o", "o"]);
+		Scene::walk(&[(1, &[2]), (2, &[3]), (3, &[])])
+			.assert_drawing(&["o", "o", "o"]);
 	}
 
 	#[test]
 	fn history_with_multiple_roots() {
 		// Two independent commit chains, each terminating in its own
-		// root (a commit with no parents), STAY IN THEIR LANE!
-		let rows =
-			render(&[(1, &[2]), (2, &[]), (3, &[4]), (4, &[])]);
-		assert_eq!(rows, vec!["o", "o", "  o", "  o"]);
+		// root (a commit with no parents), STAY IN THEIR LANE! A root
+		// draws a marker and no line below it, so handing its column
+		// to the next history would stack two commit markers in one
+		// column — which is exactly how a lane draws two consecutive
+		// commits, and would read as joining the two histories.
+		let scene =
+			Scene::walk(&[(1, &[2]), (2, &[]), (3, &[4]), (4, &[])]);
+		scene.assert_drawing(&["o", "o", "  o", "  o"]);
+		scene.assert_fully_settled();
 	}
 
 	#[test]
 	fn simple_merge() {
 		// 1 merges 3 into the line 1 → 2 → 4, 3 → 4
-		let rows =
-			render(&[(1, &[2, 3]), (2, &[4]), (3, &[4]), (4, &[])]);
-		assert_eq!(rows, vec!["M━┓", "o ┃", "┃ o", "o━┛"]);
+		Scene::walk(&[(1, &[2, 3]), (2, &[4]), (3, &[4]), (4, &[])])
+			.assert_drawing(&["M━┓", "o ┃", "┃ o", "o━┛"]);
 	}
 
 	#[test]
 	fn merge_into_tracked_lane_continues_through_corner() {
 		// 3's merge line joins lane 1 which keeps flowing to 5,
 		// so the corner must be a junction (┫), not a dead end (┓)
-		let rows = render(&[
+		Scene::walk(&[
 			(1, &[3]),
 			(2, &[5]),
 			(3, &[4, 5]),
 			(4, &[6]),
 			(5, &[6]),
 			(6, &[]),
+		])
+		.assert_drawing(&["o", "┃ o", "M━┫", "o ┃", "┃ o", "o━┛"]);
+	}
+
+	#[test]
+	fn merge_into_a_lane_that_stops_owing_a_parent_keeps_flowing() {
+		// Commit 2 is a merge that found a lane already heading for
+		// its second parent, so its own lane keeps that debt open.
+		// Commit 4 settles it — commit 4 *is* that second parent — and
+		// in the same row merges the commit that lane is waiting for,
+		// so its bridge ends there. That lane runs through the row,
+		// which makes the bridge end a junction; it is only the slot's
+		// shape that changed, not the lane.
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[6, 4]),
+			(3, &[7]),
+			(4, &[5, 6]),
+			(5, &[8]),
+			(6, &[8]),
+			(7, &[8]),
+			(8, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┣━M",
+			"┃ ┃ o",
+			"M━┫ ┃",
+			"o ┃ ┃",
+			"┃ o ┃",
+			"┃ ┃ o",
+			"o━┻━┛",
 		]);
-		assert_eq!(
-			rows,
-			vec!["o", "┃ o", "M━┫", "o ┃", "┃ o", "o━┛"]
-		);
 	}
 
 	#[test]
@@ -827,7 +901,283 @@ mod tests {
 		// 3 (lane 2) merges into 1's line (lane 0) while 2's line
 		// (lane 1) passes through: the crossed lane keeps its
 		// vertical instead of being cut by the bridge
-		let rows = render(&[
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[5]),
+			(3, &[6, 4]),
+			(4, &[7]),
+			(5, &[7]),
+			(6, &[7]),
+			(7, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┃ o",
+			"┣━┃━M",
+			"o ┃ ┃",
+			"┃ o ┃",
+			"┃ ┃ o",
+			"o━┻━┛",
+		]);
+	}
+
+	#[test]
+	fn overlapping_branch_bridges_keep_inner_corner() {
+		// lanes 1 and 2 both close into the commit on lane 0; the
+		// outer bridge passes through the inner corner (┻) instead
+		// of erasing it
+		Scene::walk(&[(1, &[4]), (2, &[4]), (3, &[4]), (4, &[])])
+			.assert_drawing(&["o", "┃ o", "┃ ┃ o", "o━┻━┛"]);
+	}
+
+	#[test]
+	fn nested_merges_keep_every_lane_in_its_column() {
+		// Commit 3 closes a branch while opening a merge of its own.
+		// The lane reserved for commit 1's second parent is already
+		// open in column 1, and has to stay there: moving it along to
+		// make room next to commit 3 would leave its line with
+		// nothing above it in the column it moved to, and would take
+		// commit 2's closing bridge with it. The merge's own lane goes
+		// at the right-hand end instead, and the bridge reaches it
+		// across the lanes in between.
+		Scene::walk(&[
+			(1, &[3, 4]),
+			(2, &[3]),
+			(3, &[5, 6]),
+			(4, &[5]),
+			(5, &[7]),
+			(6, &[7]),
+			(7, &[]),
+		])
+		.assert_drawing(&[
+			"M━┓",
+			"┃ ┃ o",
+			"M━┃━┻━┓",
+			"┃ o   ┃",
+			"o━┛   ┃",
+			"┃     o",
+			"o━━━━━┛",
+		]);
+	}
+
+	#[test]
+	fn second_parent_lane_takes_a_column_left_blank_above() {
+		// Commit 4 closes the lane in column 1, so by the time commit
+		// 5 merges, the row above it draws nothing there. Starting the
+		// second parent's lane in that column keeps the bridge one
+		// step long instead of reaching past every lane still open.
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[4]),
+			(3, &[9]),
+			(4, &[5]),
+			(5, &[6, 7]),
+			(6, &[9]),
+			(7, &[9]),
+			(9, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┃ o",
+			"┃ ┃ o",
+			"o━┛ ┃",
+			"M━┓ ┃",
+			"o ┃ ┃",
+			"┃ o ┃",
+			"o━┻━┛",
+		]);
+	}
+
+	#[test]
+	fn second_parent_lane_skips_a_column_this_commit_freed() {
+		// Commit 4 both closes the lane in column 1 and opens a merge.
+		// Column 1 is vacant by the end of the step, but the row above
+		// still draws commit 2's lane there and this row draws its
+		// closing corner, so the merge's second parent cannot have it
+		// — taking it would put a new lane's corner where that edge
+		// ends and lose the edge.
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[4]),
+			(3, &[7]),
+			(4, &[5, 6]),
+			(5, &[8]),
+			(6, &[8]),
+			(7, &[8]),
+			(8, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┃ o",
+			"┃ ┃ o",
+			"M━┻━┃━┓",
+			"o   ┃ ┃",
+			"┃   ┃ o",
+			"┃   o ┃",
+			"o━━━┻━┛",
+		]);
+	}
+
+	#[test]
+	fn merge_bridges_to_the_lane_its_second_parent_already_has() {
+		// Commit 2 is a merge that found a lane already heading for
+		// its second parent, so it owes that parent nothing and keeps
+		// a lane of its own open for it. Commit 3 then merges the
+		// same commit 6 that commit 2's lane is waiting for: it has to
+		// bridge into that lane, not reserve a second column for a
+		// parent only one lane can receive. A second column would be
+		// left drawing a line that starts out of nothing, because the
+		// bridge is always drawn to the first lane waiting.
+		Scene::walk(&[
+			(1, &[5]),
+			(2, &[6, 5]),
+			(3, &[7, 6]),
+			(5, &[8]),
+			(6, &[8]),
+			(7, &[8]),
+			(8, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┣━M",
+			"┃ ┣━M",
+			"o ┃ ┃",
+			"┃ o ┃",
+			"┃ ┃ o",
+			"o━┻━┛",
+		]);
+	}
+
+	#[test]
+	fn a_bridge_crossing_another_bridges_junction_keeps_it() {
+		// Commit 4 does two things at once: it merges commit 6, whose
+		// lane is already open in column 1, and it closes the branch
+		// in column 2. The branch's bridge has to reach across column
+		// 1, which is where the merge's bridge ends. That cell joins
+		// up, down, left and right, and there is no way to draw it as
+		// a lane with something passing behind — drawing it as a plain
+		// vertical would take the merge edge out of the picture.
+		Scene::walk(&[
+			(1, &[4]),
+			(2, &[6]),
+			(3, &[4]),
+			(4, &[5, 6]),
+			(5, &[8]),
+			(6, &[8]),
+			(8, &[]),
+		])
+		.assert_drawing(&[
+			"o",
+			"┃ o",
+			"┃ ┃ o",
+			"M━╋━┛",
+			"o ┃",
+			"┃ o",
+			"o━┛",
+		]);
+	}
+
+	#[test]
+	fn skewed_parent_before_child_leaves_no_phantom_lane() {
+		// Commit 2 is walked before commit 1, which lists it as a
+		// parent. The edge up to it cannot be drawn, and must not open
+		// a lane that waits for a commit the walk has gone past. The
+		// marker still says merge, because commit 1 is one.
+		Scene::walk(&[(2, &[3]), (1, &[2, 3]), (3, &[])])
+			.assert_drawing(&["o", "┃ M", "o━┛"]);
+	}
+
+	#[test]
+	fn complete_walk_settles_all_lanes() {
+		// Both parents of 1 appear before it in the walk (clock
+		// skew). After a complete walk no lane may still wait on a
+		// parent, creating the evil phantom lines
+		let scene = Scene::walk(&[
+			(2, &[4]),
+			(3, &[4]),
+			(1, &[2, 3]),
+			(4, &[]),
+		]);
+		scene.assert_drawing(&["o", "┃ o", "┃ ┃ M", "o━┛"]);
+		scene.assert_fully_settled();
+	}
+
+	#[test]
+	fn duplicate_parent_entries_draw_one_edge() {
+		// A commit object may name the same parent twice. There is one
+		// edge to draw, and the second entry must not reserve a lane
+		// for a commit that the first entry's lane already receives.
+		Scene::walk(&[(1, &[2, 2]), (2, &[3]), (3, &[])])
+			.assert_drawing(&["M", "o", "o"]);
+	}
+
+	#[test]
+	fn octopus_merge_draws_its_first_two_parents() {
+		// Support stops at two parents. The third parent's commit
+		// still appears, on a lane of its own with no edge into it,
+		// which is the honest picture of an edge this graph cannot
+		// show — not a lane left waiting for something.
+		let scene = Scene::walk(&[
+			(1, &[2, 3, 4]),
+			(2, &[5]),
+			(3, &[5]),
+			(4, &[5]),
+			(5, &[]),
+		]);
+		scene.assert_drawing(&[
+			"M━┓",
+			"o ┃",
+			"┃ o",
+			"┃ ┃ o",
+			"o━┻━┛",
+		]);
+		scene.assert_fully_settled();
+	}
+
+	#[test]
+	fn a_commit_naming_itself_as_a_parent_opens_no_lane() {
+		let scene = Scene::walk(&[(1, &[1, 2]), (2, &[])]);
+		scene.assert_drawing(&["M", "o"]);
+		scene.assert_fully_settled();
+	}
+
+	#[test]
+	fn unwalked_parents_keep_their_lanes_open() {
+		// The log view shows a window onto a longer history, so a lane
+		// heading for a commit below the window stays open and draws
+		// off the bottom of the picture.
+		let scene = Scene::walk(&[(1, &[8]), (2, &[9])]);
+		scene.assert_drawing(&["o", "┃ o"]);
+		assert_eq!(scene.open_lane_count(), 2);
+	}
+
+	#[test]
+	fn head_lane_is_dotted_in_any_column() {
+		// HEAD is not guaranteed to sit on the leftmost lane, so the
+		// dotted segment has to follow the lane heading for it.
+		Scene::walk_marked(
+			&[(1, &[3]), (2, &[4]), (3, &[5]), (4, &[5]), (5, &[])],
+			&[],
+			&[],
+			Some(4),
+		)
+		.assert_drawing(&["o", "┃ o", "o ╏", "┃ o", "o━┛"]);
+	}
+
+	#[test]
+	fn branch_tip_and_stash_markers_leave_the_lines_alone() {
+		Scene::walk_marked(
+			&[(1, &[2]), (2, &[3]), (3, &[])],
+			&[1],
+			&[3],
+			None,
+		)
+		.assert_drawing(&["*", "o", "*"]);
+	}
+
+	#[test]
+	fn crossed_lane_keeps_own_color() {
+		let scene = Scene::walk(&[
 			(1, &[4]),
 			(2, &[5]),
 			(3, &[6, 4]),
@@ -836,120 +1186,10 @@ mod tests {
 			(6, &[7]),
 			(7, &[]),
 		]);
-		assert_eq!(
-			rows,
-			vec![
-				"o",
-				"┃ o",
-				"┣━┃━M",
-				"o ┃ ┃",
-				"┃ o ┃",
-				"┃ ┃ o",
-				"o━┻━┛",
-			]
-		);
-	}
-
-	#[test]
-	fn overlapping_branch_bridges_keep_inner_corner() {
-		// lanes 1 and 2 both close into the commit on lane 0; the
-		// outer bridge passes through the inner corner (┻) instead
-		// of erasing it
-		let rows =
-			render(&[(1, &[4]), (2, &[4]), (3, &[4]), (4, &[])]);
-		assert_eq!(rows, vec!["o", "┃ o", "┃ ┃ o", "o━┻━┛"]);
-	}
-
-	#[test]
-	fn merge_and_branch_bridges_overlap() {
-		// commit 3 closes a branch from lane 2 while opening a merge
-		// to lane 3, crossing lane 1: every line stays continuous
-		let rows = render(&[
-			(1, &[3, 4]),
-			(2, &[3]),
-			(3, &[5, 6]),
-			(4, &[5]),
-			(5, &[7]),
-			(6, &[7]),
-			(7, &[]),
-		]);
-		assert_eq!(
-			rows,
-			vec![
-				"M━┓",
-				"┃ ┃ o",
-				"M━┃━┻━┓",
-				"┃ o   ┃",
-				"o━┛   ┃",
-				"┃     o",
-				"o━━━━━┛",
-			]
-		);
-	}
-
-	#[test]
-	fn skewed_parent_before_child_leaves_no_phantom_lane() {
-		//1 to 2 must be dropped instead of
-		// opening a lane that waits for 2 until the end of the walk.
-		let rows = render(&[(2, &[3]), (1, &[2, 3]), (3, &[])]);
-		assert_eq!(rows, vec!["o", "┃ o", "o━┛"]);
-	}
-
-	#[test]
-	fn complete_walk_settles_all_lanes() {
-		// Both parents of 1 appear before it in the walk (clock
-		// skew). After a complete walk no lane may still wait on a
-		// parent, creating the evil phantom lines
-		let history: &[(usize, &[usize])] =
-			&[(2, &[4]), (3, &[4]), (1, &[2, 3]), (4, &[])];
-
-		assert_eq!(render(history), vec!["o", "┃ o", "┃ ┃ o", "o━┛"]);
-
-		let mut walker = GraphWalker::new();
-		for (commit, parents) in history {
-			let parents: Vec<CommitId> =
-				parents.iter().map(|p| id(*p)).collect();
-			walker.process(id(*commit), &parents);
-		}
-
-		for slot in walker.buffer.current.iter().flatten() {
-			assert!(
-				matches!(slot, LaneSlot::Settled { .. }),
-				"lane still waiting on a parent after a complete walk: {slot:?}"
-			);
-		}
-	}
-
-	#[test]
-	fn crossed_lane_keeps_own_color() {
-		let rows = &[
-			(1usize, &[4usize][..]),
-			(2, &[5]),
-			(3, &[6, 4]),
-			(4, &[7]),
-			(5, &[7]),
-			(6, &[7]),
-			(7, &[]),
-		];
-		let mut walker = GraphWalker::new();
-		let ids: Vec<CommitId> =
-			rows.iter().map(|(c, _)| id(*c)).collect();
-		for (commit, parents) in rows {
-			let parents: Vec<CommitId> =
-				parents.iter().map(|p| id(*p)).collect();
-			walker.process(id(*commit), &parents);
-		}
-		let computed = walker.compute_rows(
-			&ids,
-			0,
-			&HashSet::new(),
-			&HashSet::new(),
-			None,
-		);
 
 		// row of commit 3: lane 1 is crossed by the merge bridge but
 		// keeps both its vertical glyph and its own lane color
-		let crossed = computed[2].lanes[1]
+		let crossed = scene.rows[2].lanes[1]
 			.expect("crossed lane should not be empty");
 		assert_eq!(crossed.0, ConnectionType::Vertical);
 		assert_eq!(crossed.1, lane_color(1));
@@ -958,40 +1198,157 @@ mod tests {
 	#[test]
 	fn branch_bridge_crosses_unrelated_lane_keeps_own_color() {
 		// 5 is the fork point for both 1 and 3
-		let history: &[(usize, &[usize])] = &[
+		let scene = Scene::walk(&[
 			(1, &[5]),
 			(2, &[6]),
 			(3, &[5]),
 			(5, &[8]),
 			(6, &[8]),
 			(8, &[]),
-		];
+		]);
+		scene.assert_drawing(&[
+			"o",
+			"┃ o",
+			"┃ ┃ o",
+			"o━┃━┛",
+			"┃ o",
+			"o━┛",
+		]);
+
+		// row of commit 5: lane 1 is crossed by the branch bridge but
+		// keeps both its vertical glyph and its own lane color (visual identity mans)
+		let crossed = scene.rows[3].lanes[1]
+			.expect("crossed lane should not be empty");
+		assert_eq!(crossed.0, ConnectionType::Vertical);
+		assert_eq!(crossed.1, lane_color(1));
+	}
+
+	#[test]
+	fn windows_decompress_across_checkpoint_boundaries() {
+		// Long enough to take several lane-state checkpoints, which is
+		// the path the log view uses for every scroll. The window
+		// comparison itself is part of every scene's invariants.
+		let scene = walk_generated(7, 250, Shape::MergeHeavy);
+		assert!(
+			scene.walker.buffer.checkpoints.len() >= 2,
+			"expected the walk to take checkpoints"
+		);
+	}
+
+	#[test]
+	fn a_wide_history_reports_every_column() {
+		// One lane per commit, none of them ever closing. A column
+		// index has to survive being reported: clamping it would
+		// relabel every lane past the clamp as the same column and
+		// put their edges in the wrong place.
+		const LANES: usize = 300;
+
+		let history = (1..=LANES)
+			.map(|commit| (commit, vec![10_000 + commit]))
+			.collect::<Vec<_>>();
+		let borrowed = history
+			.iter()
+			.map(|(commit, parents)| (*commit, parents.as_slice()))
+			.collect::<Vec<_>>();
+
+		let scene = Scene::walk(&borrowed);
+		let last = &scene.rows[LANES - 1];
+
+		assert_eq!(usize::from(last.lane_count), LANES);
+		assert_eq!(usize::from(last.commit_lane), LANES - 1);
+		assert_eq!(scene.open_lane_count(), LANES);
+		assert_lane_index_exact(LANES - 1);
+	}
+
+	#[test]
+	fn rows_requested_beyond_the_walk_draw_nothing() {
 		let mut walker = GraphWalker::new();
-		let ids: Vec<CommitId> =
-			history.iter().map(|(c, _)| id(*c)).collect();
-		for (commit, parents) in history {
-			let parents: Vec<CommitId> =
-				parents.iter().map(|p| id(*p)).collect();
-			walker.process(id(*commit), &parents);
-		}
-		let computed = walker.compute_rows(
-			&ids,
-			0,
+		walker.process(oid(1), &[oid(2)]);
+
+		let rows = walker.compute_rows(
+			&[oid(2), oid(3)],
+			1,
 			&HashSet::new(),
 			&HashSet::new(),
 			None,
 		);
 
-		assert_eq!(
-			computed.iter().map(row_to_string).collect::<Vec<_>>(),
-			vec!["o", "┃ o", "┃ ┃ o", "o━┃━┛", "┃ o", "o━┛"]
-		);
+		assert_eq!(rows.len(), 2);
+		assert!(rows.iter().all(|row| row.lanes.is_empty()));
+	}
 
-		// row of commit 5: lane 1 is crossed by the branch bridge but
-		// keeps both its vertical glyph and its own lane color (visual identity mans)
-		let crossed = computed[3].lanes[1]
-			.expect("crossed lane should not be empty");
-		assert_eq!(crossed.0, ConnectionType::Vertical);
-		assert_eq!(crossed.1, lane_color(1));
+	#[test]
+	fn generated_histories_hold_every_invariant() {
+		// Scene::walk holds each of these to every invariant, so this
+		// is the broad sweep behind the drawings above: the shapes
+		// cover long-lived branches, short topics, disjoint roots,
+		// mainlines that skip over the branches they merge, and the
+		// parent lists Git permits but a naive walk mishandles.
+		//
+		// Long enough that each history crosses a lane-state
+		// checkpoint, and that the shapes reach the states a short
+		// history never gets into.
+		const COMMITS: usize = 120;
+		const SEEDS: u64 = 10;
+
+		for shape in Shape::ALL {
+			for seed in 0..SEEDS {
+				eprintln!("graph topology: {shape:?} seed {seed}");
+				walk_generated(seed, COMMITS, shape);
+			}
+		}
+	}
+}
+
+/// Holds a real repository's history to the same invariants as the
+/// tests above.
+///
+/// Every bug these invariants have caught so far was reachable from a
+/// generated topology once the generator knew to produce the right
+/// shape — but two of them were found here first, on a repository
+/// busy enough to stumble into states the generator was not reaching.
+/// Ignored by default, because it needs a checkout to point at:
+///
+/// ```text
+/// git -C <repo> rev-list --parents --topo-order --max-count=20000 HEAD > /tmp/parents
+/// GITUI_GRAPH_PARENTS=/tmp/parents cargo test -p asyncgit \
+///     graph::walker::real_repository -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod real_repository {
+	use crate::graph::harness::Scene;
+	use crate::sync::CommitId;
+	use std::collections::HashSet;
+
+	#[test]
+	#[ignore = "needs GITUI_GRAPH_PARENTS; see the module docs"]
+	fn holds_every_invariant() {
+		let Ok(path) = std::env::var("GITUI_GRAPH_PARENTS") else {
+			return;
+		};
+		let text = std::fs::read_to_string(&path)
+			.expect("GITUI_GRAPH_PARENTS names a readable file");
+
+		let history = text
+			.lines()
+			.map(|line| {
+				let mut ids = line.split_whitespace().map(|id| {
+					CommitId::from_str_unchecked(id)
+						.expect("rev-list emits valid object ids")
+				});
+				let commit =
+					ids.next().expect("a line names its commit");
+				(commit, ids.collect())
+			})
+			.collect::<Vec<_>>();
+
+		let total = history.len();
+		Scene::walk_ids(
+			history,
+			HashSet::new(),
+			HashSet::new(),
+			None,
+		);
+		eprintln!("{total} commits drawn; every invariant holds");
 	}
 }

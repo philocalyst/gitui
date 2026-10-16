@@ -21,7 +21,7 @@ use crate::{
 	app::Environment,
 	components::{
 		visibility_blocking, CommandBlocking, CommandInfo, Component,
-		DrawableComponent, EventState, ScrollType,
+		DrawableComponent, EventState, ScrollType, SelectionStatus,
 	},
 	keys::{key_match, SharedKeyConfig},
 	strings,
@@ -141,6 +141,7 @@ pub struct Rail {
 	current_size: Cell<Option<(u16, u16)>>,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
+	focused: Cell<bool>,
 }
 
 impl Rail {
@@ -154,6 +155,7 @@ impl Rail {
 			current_size: Cell::new(None),
 			theme: env.theme.clone(),
 			key_config: env.key_config.clone(),
+			focused: Cell::new(true),
 		}
 	}
 
@@ -175,6 +177,21 @@ impl Rail {
 		self.items
 			.get(self.selection.get())
 			.and_then(|item| item.step)
+	}
+
+	/// The rail currently has a single selected step.  Keeping this
+	/// projection on the component lets the modal router render a
+	/// consistent selection indicator without knowing rebase details.
+	#[must_use]
+	pub fn selection_status(&self) -> Option<SelectionStatus> {
+		if !self.focused() {
+			return None;
+		}
+		self.selected_step().map(|_| SelectionStatus {
+			extending: false,
+			count: 1,
+			unit: "step",
+		})
 	}
 
 	/// Keep the selection on `step` when it is present.
@@ -369,9 +386,11 @@ impl DrawableComponent for Rail {
 							.borders(Borders::ALL)
 							.title(Span::styled(
 								self.title.as_ref(),
-								self.theme.title(true),
+								self.theme.title(self.focused()),
 							))
-							.border_style(self.theme.block(true)),
+							.border_style(
+								self.theme.block(self.focused()),
+							),
 					)
 					.alignment(Alignment::Center),
 				area,
@@ -395,9 +414,9 @@ impl DrawableComponent for Rail {
 					.borders(Borders::ALL)
 					.title(Span::styled(
 						title.as_str(),
-						self.theme.title(true),
+						self.theme.title(self.focused()),
 					))
-					.border_style(self.theme.block(true)),
+					.border_style(self.theme.block(self.focused())),
 			)
 			.alignment(Alignment::Left),
 			area,
@@ -457,6 +476,14 @@ impl Component for Rail {
 
 	fn is_visible(&self) -> bool {
 		true
+	}
+
+	fn focused(&self) -> bool {
+		self.focused.get()
+	}
+
+	fn focus(&mut self, focus: bool) {
+		self.focused.set(focus);
 	}
 }
 
@@ -573,6 +600,31 @@ mod tests {
 		assert!(rail.move_selection(ScrollType::Home));
 		// moving above the top clamps
 		assert!(!rail.move_selection(ScrollType::Up));
+	}
+
+	#[test]
+	fn selection_status_describes_the_active_step() {
+		let env = Environment::test_env();
+		let mut rail = Rail::new(&env, "Plan");
+		assert_eq!(rail.selection_status(), None);
+		rail.set_items(vec![RailItem {
+			step: Some(StepId::FIRST),
+			state: RowState::Pending,
+			word: "PICK",
+			short_oid: None,
+			label: String::from("subject"),
+			fold: false,
+		}]);
+		assert_eq!(
+			rail.selection_status(),
+			Some(SelectionStatus {
+				extending: false,
+				count: 1,
+				unit: "step",
+			})
+		);
+		rail.focus(false);
+		assert_eq!(rail.selection_status(), None);
 	}
 
 	#[test]

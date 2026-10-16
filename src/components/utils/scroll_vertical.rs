@@ -88,24 +88,8 @@ impl VerticalScroll {
 		selection_max: usize,
 		visual_height: usize,
 	) -> usize {
-		self.visual_height.set(visual_height);
-
-		let new_top = calc_scroll_top(
-			self.get_top(),
-			visual_height,
-			selection,
-			selection_max,
-		);
-		self.top.set(new_top);
-
-		if visual_height == 0 {
-			self.max_top.set(0);
-		} else {
-			let new_max = selection_max.saturating_sub(visual_height);
-			self.max_top.set(new_max);
-		}
-
-		new_top
+		self.update_bounds(selection_max, visual_height);
+		self.ensure_visible(selection, selection_max)
 	}
 
 	pub fn update_no_selection(
@@ -113,7 +97,48 @@ impl VerticalScroll {
 		line_count: usize,
 		visual_height: usize,
 	) -> usize {
-		self.update(self.get_top(), line_count, visual_height)
+		self.update_bounds(line_count, visual_height);
+		self.get_top()
+	}
+
+	/// Update the viewport limits without coupling scrolling to a selection.
+	pub fn update_bounds(
+		&self,
+		line_count: usize,
+		visual_height: usize,
+	) -> usize {
+		self.visual_height.set(visual_height);
+		let max_top = if visual_height == 0 {
+			0
+		} else {
+			line_count.saturating_sub(visual_height)
+		};
+		self.max_top.set(max_top);
+		let top = self.get_top().min(max_top);
+		self.top.set(top);
+		top
+	}
+
+	/// Move the viewport only when the requested cursor is outside it.
+	pub fn ensure_visible(
+		&self,
+		selection: usize,
+		line_count: usize,
+	) -> usize {
+		let new_top = calc_scroll_top(
+			self.get_top(),
+			self.visual_height.get(),
+			selection,
+			line_count,
+		);
+		let new_top = new_top.min(self.max_top.get());
+		self.top.set(new_top);
+		new_top
+	}
+
+	/// Set a preferred viewport row; the next bounds update clamps it.
+	pub fn set_top(&self, top: usize) {
+		self.top.set(top);
 	}
 
 	pub fn draw(&self, f: &mut Frame, r: Rect, theme: &SharedTheme) {

@@ -215,6 +215,99 @@ impl Theme {
 		self.apply_select(style, selected)
 	}
 
+	/// Strong inline emphasis for graphemes changed within a paired patch row.
+	/// Keep the accent derived from the existing diff colors so custom themes
+	/// continue to control the semantic add/delete colors.
+	pub fn diff_inline_changed(&self, typ: DiffLineType) -> Style {
+		let accent = match typ {
+			DiffLineType::Delete => self.diff_line_delete,
+			_ => self.diff_line_add,
+		};
+		let background = match accent {
+			Color::Rgb(r, g, b) => Color::Rgb(r / 3, g / 3, b / 3),
+			Color::Indexed(index) => match index % 16 {
+				1 | 9 => Color::Rgb(78, 32, 32),
+				2 | 10 => Color::Rgb(20, 72, 36),
+				3 | 11 => Color::Rgb(76, 64, 28),
+				4 | 12 => Color::Rgb(30, 48, 80),
+				5 | 13 => Color::Rgb(66, 32, 72),
+				6 | 14 => Color::Rgb(22, 62, 70),
+				_ => Color::Rgb(46, 46, 46),
+			},
+			Color::Red | Color::LightRed => Color::Rgb(78, 32, 32),
+			Color::Green | Color::LightGreen => {
+				Color::Rgb(20, 72, 36)
+			}
+			Color::Yellow | Color::LightYellow => {
+				Color::Rgb(76, 64, 28)
+			}
+			Color::Blue | Color::LightBlue => Color::Rgb(30, 48, 80),
+			Color::Magenta | Color::LightMagenta => {
+				Color::Rgb(66, 32, 72)
+			}
+			Color::Cyan | Color::LightCyan => Color::Rgb(22, 62, 70),
+			_ => Color::Rgb(46, 46, 46),
+		};
+		Style::default()
+			.fg(accent)
+			.bg(background)
+			.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+	}
+
+	/// Keeps an optional syntax foreground while adding the muted inline
+	/// change background and selected-row treatment.
+	pub fn diff_inline_emphasis(
+		&self,
+		typ: DiffLineType,
+		syntax_foreground: Option<Color>,
+		selected: bool,
+		cursor: bool,
+	) -> Style {
+		let accent = match typ {
+			DiffLineType::Delete => self.diff_line_delete,
+			_ => self.diff_line_add,
+		};
+		let mut style = self
+			.diff_inline_changed(typ)
+			.fg(syntax_foreground.unwrap_or(accent));
+		if cursor {
+			style = style.add_modifier(Modifier::BOLD);
+		}
+		self.apply_select(style, selected)
+	}
+
+	/// Subdued style for the old/new line-number columns in a diff.
+	pub fn diff_line_gutter(&self, selected: bool) -> Style {
+		self.apply_select(
+			Style::default().fg(self.disabled_fg),
+			selected,
+		)
+	}
+
+	/// Gives the focused diff row a quiet gutter cue independent of its
+	/// add/delete color or any inline character-level emphasis.
+	pub fn diff_line_gutter_cursor(
+		&self,
+		selected: bool,
+		cursor: bool,
+	) -> Style {
+		let style = self.diff_line_gutter(selected);
+		if cursor {
+			style.add_modifier(Modifier::BOLD)
+		} else {
+			style
+		}
+	}
+
+	/// Adds a stable cursor cue without changing configured diff colors.
+	pub fn diff_line_cursor(
+		&self,
+		typ: DiffLineType,
+		selected: bool,
+	) -> Style {
+		self.diff_line(typ, selected).add_modifier(Modifier::BOLD)
+	}
+
 	pub fn text_danger(&self) -> Style {
 		Style::default().fg(self.danger_fg)
 	}
@@ -330,9 +423,13 @@ impl Theme {
 			theme = old_theme;
 
 			if theme.save_patch(theme_path).is_ok() {
-				log::info!("Converted old theme to new format. ({theme_path:?})");
+				log::info!(
+					"Converted old theme to new format. ({theme_path:?})"
+				);
 			} else {
-				log::warn!("Failed to save theme in new format. ({theme_path:?})");
+				log::warn!(
+					"Failed to save theme in new format. ({theme_path:?})"
+				);
 			}
 		}
 

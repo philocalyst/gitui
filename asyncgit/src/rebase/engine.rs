@@ -55,6 +55,7 @@ use crate::rebase::todo::Todo;
 use crate::rebase::Generation;
 use crate::sync::{CommitId, RepoPath};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -69,6 +70,23 @@ const COMMIT_MESSAGE_FILE: &str = "commit-msg.txt";
 /// Cadence of the parent heartbeat while git waits in the
 /// helper.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+/// Files Git may have written before its first replay when a process is
+/// killed during interactive rebase setup. Any other file means the state
+/// is outside the narrow, abort-safe bootstrap repair boundary.
+const PRISTINE_BOOTSTRAP_FILES: [&str; 12] = [
+	"interactive",
+	"orig-head",
+	"onto",
+	"git-rebase-todo",
+	"git-rebase-todo.backup",
+	"quiet",
+	"verbose",
+	"strategy",
+	"strategy_opts",
+	"rebase-cousins",
+	"no-rebase-cousins",
+	"gpg_sign_opt",
+];
 
 /// How the replay range is determined.
 #[derive(
@@ -448,6 +466,28 @@ fn prepare_child(cmd: &mut Command, workdir: &Path) {
 }
 
 impl NativeEngine {
+	/// Create an observation-only engine with the same validated
+	/// repository and session configuration. It has an independent
+	/// command lock and observation generation, without repeating the
+	/// synchronous Git executable probes performed by [`Self::new`].
+	#[must_use]
+	pub fn clone_for_observer(&self) -> Self {
+		Self {
+			repo: self.repo.clone(),
+			session: self.session.clone(),
+			git: self.git.clone(),
+			version: self.version,
+			workdir: self.workdir.clone(),
+			git_dir: self.git_dir.clone(),
+			zero_oid: self.zero_oid.clone(),
+			serial: Mutex::new(()),
+			generation: AtomicU64::new(0),
+			extra_env: self.extra_env.clone(),
+			bridge_exe_override: None,
+			bridge: self.bridge.clone(),
+		}
+	}
+
 	/// Create an engine bound to a repository and a session
 	/// directory, discovering the git executable. The
 	/// executable is probed once (`--version`, object format,
@@ -471,6 +511,14 @@ impl NativeEngine {
 	) -> crate::error::Result<Self> {
 		let git = std::env::var_os("GITUI_GIT_PATH")
 			.map_or_else(|| PathBuf::from("git"), PathBuf::from);
+		Self::new_with_git(repo, session, git)
+	}
+
+	fn new_with_git(
+		repo: RepoPath,
+		session: Option<std::path::PathBuf>,
+		git: PathBuf,
+	) -> crate::error::Result<Self> {
 		let workdir = repo.workdir().map_or_else(
 			|| repo.gitpath().to_path_buf(),
 			Path::to_path_buf,
@@ -807,6 +855,100 @@ impl NativeEngine {
 		Ok(())
 	}
 
+	/// Repair one narrowly identifiable crash during Git's rebase
+	/// bootstrap so Git's own `--abort` can do the cleanup. Never
+	/// synthesize metadata once a replay may have begun: require the
+	/// original tip to still be HEAD, a clean index/worktree, and no
+	/// sequencer progress markers.
+	fn repair_pristine_bootstrap(&self) -> Result<bool> {
+		let state_dir = self.git_dir.join("rebase-merge");
+		let head_name_path = state_dir.join("head-name");
+		if !state_dir.is_dir()
+			|| !state_dir.join("interactive").is_file()
+			|| head_name_path.exists()
+		{
+			return Ok(false);
+		}
+		for entry in fs::read_dir(&state_dir)? {
+			let entry = entry?;
+			let Some(name) =
+				entry.file_name().to_str().map(str::to_owned)
+			else {
+				log::debug!("refusing bootstrap repair with a non-UTF8 state file");
+				return Ok(false);
+			};
+			if !PRISTINE_BOOTSTRAP_FILES.contains(&name.as_str()) {
+				log::debug!("refusing bootstrap repair with state file {name}");
+				return Ok(false);
+			}
+		}
+
+		let original_head =
+			match fs::read_to_string(state_dir.join("orig-head")) {
+				Ok(head) => head.trim().to_owned(),
+				Err(_) => return Ok(false),
+			};
+		if original_head.is_empty() {
+			return Ok(false);
+		}
+
+		let head = self.git(&["rev-parse", "--verify", "HEAD"])?;
+		if !head.status.success()
+			|| String::from_utf8_lossy(&head.stdout).trim()
+				!= original_head
+		{
+			log::debug!("refusing bootstrap repair because HEAD does not match orig-head");
+			return Ok(false);
+		}
+
+		let status = self.git(&[
+			"status",
+			"--porcelain=v2",
+			"-z",
+			"--untracked-files=all",
+		])?;
+		if !status.status.success() || !status.stdout.is_empty() {
+			log::debug!("refusing bootstrap repair because index/worktree is not clean");
+			return Ok(false);
+		}
+
+		let symbolic_head =
+			self.git(&["symbolic-ref", "--quiet", "HEAD"])?;
+		let head_name = if symbolic_head.status.success() {
+			String::from_utf8_lossy(&symbolic_head.stdout)
+				.trim()
+				.to_owned()
+		} else if symbolic_head.status.code() == Some(1) {
+			String::from("detached HEAD")
+		} else {
+			return Ok(false);
+		};
+		if head_name.is_empty() {
+			return Ok(false);
+		}
+
+		let mut file = match fs::OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&head_name_path)
+		{
+			Ok(file) => file,
+			Err(error)
+				if error.kind()
+					== std::io::ErrorKind::AlreadyExists =>
+			{
+				return Ok(false);
+			}
+			Err(error) => return Err(error.into()),
+		};
+		writeln!(file, "{head_name}")?;
+		file.sync_all()?;
+		log::warn!(
+			"rebase bootstrap was interrupted before replay; restoring missing head-name so git can abort safely"
+		);
+		Ok(true)
+	}
+
 	/// Run an effectful command. Callers hold the mutex.
 	fn run_effect(&self, cmd: Cmd) -> Result<RawOutcome> {
 		match cmd {
@@ -824,6 +966,7 @@ impl NativeEngine {
 				Ok(RawOutcome::from_output(&out, None, None))
 			}
 			Cmd::Abort => {
+				self.repair_pristine_bootstrap()?;
 				let out =
 					self.git_protected(&["rebase", "--abort"])?;
 				Ok(RawOutcome::from_output(&out, None, None))
@@ -1297,6 +1440,7 @@ mod tests {
 	use crate::sync::{CommitId, RepoPath};
 	use std::path::Path;
 	use std::process::Command;
+	use std::sync::atomic::Ordering;
 	use std::sync::Arc;
 	use std::time::Duration;
 
@@ -1363,6 +1507,65 @@ mod tests {
 				.contains(&std::process::id().to_string()),
 			"the bridge directory embeds this process's pid: {:?}",
 			engine.bridge_dir()
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn observer_clone_reuses_git_probes_with_independent_state() {
+		use std::{fs, os::unix::fs::PermissionsExt};
+
+		let s = Sandbox::new();
+		let (_a, _b, _c) = two_step_branch(&s);
+		let temp = tempfile::tempdir().unwrap();
+		let counter = temp.path().join("git-invocations");
+		let real_git =
+			std::env::split_paths(&std::env::var_os("PATH").unwrap())
+				.map(|dir| dir.join("git"))
+				.find(|path| path.is_file())
+				.expect("git is available for the test");
+		let wrapper = temp.path().join("git-wrapper");
+		fs::write(
+			&wrapper,
+			format!(
+				"#!/bin/sh\nprintf x >> '{}'\nexec '{}' \"$@\"\n",
+				counter.display(),
+				real_git.display(),
+			),
+		)
+		.unwrap();
+		fs::set_permissions(
+			&wrapper,
+			fs::Permissions::from_mode(0o755),
+		)
+		.unwrap();
+
+		let engine = super::NativeEngine::new_with_git(
+			RepoPath::Path(s.path()),
+			None,
+			wrapper,
+		)
+		.unwrap();
+		let probes = fs::read_to_string(&counter).unwrap().len();
+		assert!(
+			probes >= 3,
+			"constructor should probe git: {probes}"
+		);
+
+		engine.generation.store(42, Ordering::Relaxed);
+		let observer = engine.clone_for_observer();
+
+		assert_eq!(
+			fs::read_to_string(&counter).unwrap().len(),
+			probes
+		);
+		assert_eq!(observer.session_dir(), engine.session_dir());
+		assert_eq!(observer.bridge_dir(), engine.bridge_dir());
+		assert_eq!(observer.generation.load(Ordering::Relaxed), 0);
+		assert_eq!(engine.generation.load(Ordering::Relaxed), 42);
+		assert_ne!(
+			&engine.serial as *const _, &observer.serial as *const _,
+			"observer must not block on the exec engine lock"
 		);
 	}
 
@@ -1570,6 +1773,10 @@ mod tests {
 	/// concurrent instances from clobbering each other.
 	#[test]
 	fn observer_sees_the_exec_engines_bridge_request() {
+		// NativeEngine captures GITUI_GIT_PATH at construction.
+		// Serialize with tests that deliberately mutate it so
+		// parallel test execution cannot silently select a bad git.
+		let _env_guard = ENV_LOCK.lock().unwrap();
 		let s = Sandbox::new();
 		let (a, b, _c) = two_step_branch(&s);
 		let engine_a = Arc::new(s.engine_at("shared-session"));
@@ -1580,32 +1787,72 @@ mod tests {
 			"one process, one bridge"
 		);
 
+		let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
 		let runner = {
 			let engine = Arc::clone(&engine_a);
 			let todo = todo_of(&[format!("reword {b}")]);
 			let base = Base::Upstream(s.oid(&a));
 			std::thread::spawn(move || {
-				engine.exec(Cmd::Start {
+				let result = engine.exec(Cmd::Start {
 					todo,
 					options: start_opts(base),
-				})
+				});
+				let diagnostic =
+					match &result {
+						Ok(out) => format!(
+							"git exited with code {}: {}",
+							out.code,
+							String::from_utf8_lossy(&out.stderr)
+						),
+						Err(error) => {
+							format!("engine command failed to run: {error}")
+						}
+					};
+				let _ = done_tx.send(diagnostic);
+				result
 			})
 		};
 
 		// The observer engine must discover the pending
 		// request while the exec engine's command is running.
+		// Polling the request file is cheap under parallel test
+		// load; the contents are not atomically written, so
+		// verify through the observer before proceeding.
+		let request = engine_bridge_request_path(&engine_b);
+		let deadline =
+			std::time::Instant::now() + Duration::from_secs(30);
 		let mut observed = false;
-		for _ in 0..600 {
-			if engine_b.observe().unwrap().bridge.is_some() {
-				observed = true;
+		let mut early_completion = None;
+		while std::time::Instant::now() < deadline {
+			if request.exists() {
+				if engine_b.observe().unwrap().bridge.is_some() {
+					observed = true;
+					break;
+				}
+			}
+			if let Ok(diagnostic) = done_rx.try_recv() {
+				early_completion = Some(diagnostic);
 				break;
 			}
-			std::thread::sleep(Duration::from_millis(50));
+			std::thread::sleep(Duration::from_millis(10));
 		}
-		assert!(
-			observed,
-			"the observer engine never saw the pending request"
-		);
+		if !observed {
+			// If observation failed or exec timed out, release a
+			// blocked helper before the sandbox is removed.
+			let cancel = request.with_file_name("cancel");
+			let _ = std::fs::write(cancel, b"");
+			let completion = early_completion.or_else(|| {
+				done_rx.recv_timeout(Duration::from_secs(10)).ok()
+			});
+			if completion.is_some() {
+				let _ = runner.join();
+			} else {
+				drop(runner);
+			}
+			panic!(
+				"the observer engine never saw the pending request; exec status: {completion:?}"
+			);
+		}
 
 		// And the observer engine answers it (correspondence
 		// commands are lock-free): the reword completes.
@@ -1664,6 +1911,227 @@ mod tests {
 		assert_eq!(quit.snapshot.operation, Operation::Clean);
 		assert_eq!(s.head(), x, "quit keeps the moved state");
 		assert_eq!(s.ref_value("main").as_deref(), Some(c.as_str()));
+	}
+
+	#[test]
+	fn abort_repairs_a_pristine_incomplete_rebase_bootstrap() {
+		let s = Sandbox::new();
+		let (base, _b, _c) = two_step_branch(&s);
+		// The Unix test engine writes a bridge shim into the worktree.
+		// Track that fixture so the bootstrap is genuinely clean.
+		let _ = s.bridge_shim();
+		s.git_ok(&["add", "bridge-shim.sh"]);
+		s.git_ok(&["commit", "-m", "track editor bridge fixture"]);
+		let original_head = s.head();
+		let state_dir = s.path().join(".git/rebase-merge");
+		std::fs::create_dir_all(&state_dir).unwrap();
+		std::fs::write(state_dir.join("interactive"), b"").unwrap();
+		std::fs::write(
+			state_dir.join("orig-head"),
+			format!("{original_head}\n"),
+		)
+		.unwrap();
+		std::fs::write(state_dir.join("onto"), format!("{base}\n"))
+			.unwrap();
+
+		let engine =
+			s.engine_at("gitui-session-incomplete-bootstrap");
+		let aborted = engine.exec(Cmd::Abort).unwrap();
+
+		assert_eq!(
+			aborted.code,
+			0,
+			"{}",
+			String::from_utf8_lossy(&aborted.stderr)
+		);
+		assert_eq!(aborted.snapshot.operation, Operation::Clean);
+		assert_eq!(s.head(), original_head);
+		assert_eq!(
+			s.git_ok(&["symbolic-ref", "--quiet", "HEAD"])
+				.stdout
+				.as_slice(),
+			b"refs/heads/main\n"
+		);
+		assert!(s
+			.git_ok(&["status", "--porcelain"])
+			.stdout
+			.is_empty());
+		assert!(!state_dir.exists());
+	}
+
+	#[test]
+	fn abort_does_not_repair_bootstrap_with_progress_marker() {
+		let s = Sandbox::new();
+		let (_a, _b, _c) = two_step_branch(&s);
+		let _ = s.bridge_shim();
+		s.git_ok(&["add", "bridge-shim.sh"]);
+		s.git_ok(&["commit", "-m", "track editor bridge fixture"]);
+		let original_head = s.head();
+		let state_dir = s.path().join(".git/rebase-merge");
+		std::fs::create_dir_all(&state_dir).unwrap();
+		std::fs::write(state_dir.join("interactive"), b"").unwrap();
+		std::fs::write(
+			state_dir.join("orig-head"),
+			format!("{original_head}\n"),
+		)
+		.unwrap();
+		std::fs::write(state_dir.join("done"), b"pick progress\n")
+			.unwrap();
+
+		let aborted = s
+			.engine_at("gitui-session-progressed-bootstrap")
+			.exec(Cmd::Abort)
+			.unwrap();
+
+		assert_ne!(aborted.code, 0);
+		assert!(state_dir.join("interactive").exists());
+		assert!(!state_dir.join("head-name").exists());
+		assert_eq!(s.head(), original_head);
+	}
+
+	#[test]
+	fn abort_does_not_repair_dirty_or_invalid_bootstrap() {
+		for invalid_original in [false, true] {
+			let s = Sandbox::new();
+			let (_a, _b, _c) = two_step_branch(&s);
+			let _ = s.bridge_shim();
+			s.git_ok(&["add", "bridge-shim.sh"]);
+			s.git_ok(&[
+				"commit",
+				"-m",
+				"track editor bridge fixture",
+			]);
+			let original_head = s.head();
+			let state_dir = s.path().join(".git/rebase-merge");
+			std::fs::create_dir_all(&state_dir).unwrap();
+			std::fs::write(state_dir.join("interactive"), b"")
+				.unwrap();
+			let recorded = if invalid_original {
+				String::from("not-a-commit\n")
+			} else {
+				std::fs::write(
+					s.path().join("dirty.txt"),
+					"preserve me\n",
+				)
+				.unwrap();
+				format!("{original_head}\n")
+			};
+			std::fs::write(state_dir.join("orig-head"), recorded)
+				.unwrap();
+
+			let aborted = s
+				.engine_at("gitui-session-unproven-bootstrap")
+				.exec(Cmd::Abort)
+				.unwrap();
+
+			assert_ne!(aborted.code, 0);
+			assert!(state_dir.join("interactive").exists());
+			assert!(!state_dir.join("head-name").exists());
+			assert_eq!(s.head(), original_head);
+			if !invalid_original {
+				assert_eq!(
+					std::fs::read_to_string(
+						s.path().join("dirty.txt")
+					)
+					.unwrap(),
+					"preserve me\n"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn abort_does_not_repair_bootstrap_after_head_moved() {
+		let s = Sandbox::new();
+		let (base, _b, _c) = two_step_branch(&s);
+		let _ = s.bridge_shim();
+		s.git_ok(&["add", "bridge-shim.sh"]);
+		s.git_ok(&["commit", "-m", "track editor bridge fixture"]);
+		let recorded_original = s.head();
+		s.write("later.txt", "committed after original tip\n");
+		let current_head = s.commit("advance tip");
+		let state_dir = s.path().join(".git/rebase-merge");
+		std::fs::create_dir_all(&state_dir).unwrap();
+		std::fs::write(state_dir.join("interactive"), b"").unwrap();
+		std::fs::write(
+			state_dir.join("orig-head"),
+			format!("{recorded_original}\n"),
+		)
+		.unwrap();
+		std::fs::write(state_dir.join("onto"), format!("{base}\n"))
+			.unwrap();
+		let clean_status =
+			s.git_ok(&["status", "--porcelain=v2", "-z"]).stdout;
+
+		let aborted = s
+			.engine_at("gitui-session-moved-bootstrap")
+			.exec(Cmd::Abort)
+			.unwrap();
+
+		assert_ne!(aborted.code, 0);
+		assert_eq!(s.head(), current_head);
+		assert_eq!(
+			s.read("later.txt"),
+			"committed after original tip\n"
+		);
+		assert_eq!(
+			s.git_ok(&["status", "--porcelain=v2", "-z"]).stdout,
+			clean_status
+		);
+		assert!(!state_dir.join("head-name").exists());
+	}
+
+	#[test]
+	fn abort_does_not_repair_bootstrap_with_autostash_state() {
+		let s = Sandbox::new();
+		let (base, _b, _c) = two_step_branch(&s);
+		let _ = s.bridge_shim();
+		s.git_ok(&["add", "bridge-shim.sh"]);
+		s.git_ok(&["commit", "-m", "track editor bridge fixture"]);
+		let original_head = s.head();
+		let state_dir = s.path().join(".git/rebase-merge");
+		std::fs::create_dir_all(&state_dir).unwrap();
+		std::fs::write(state_dir.join("interactive"), b"").unwrap();
+		std::fs::write(
+			state_dir.join("orig-head"),
+			format!("{original_head}\n"),
+		)
+		.unwrap();
+		std::fs::write(state_dir.join("onto"), format!("{base}\n"))
+			.unwrap();
+		let autostash = b"preserve autostash state bytes\n";
+		std::fs::write(state_dir.join("autostash"), autostash)
+			.unwrap();
+
+		let aborted = s
+			.engine_at("gitui-session-autostash-bootstrap")
+			.exec(Cmd::Abort)
+			.unwrap();
+
+		assert_ne!(aborted.code, 0);
+		assert_eq!(s.head(), original_head);
+		assert_eq!(
+			std::fs::read(state_dir.join("autostash")).unwrap(),
+			autostash
+		);
+		assert!(!state_dir.join("head-name").exists());
+	}
+
+	#[test]
+	fn abort_does_not_repair_unborn_bootstrap() {
+		let s = Sandbox::new();
+		let state_dir = s.path().join(".git/rebase-merge");
+		std::fs::create_dir_all(&state_dir).unwrap();
+		std::fs::write(state_dir.join("interactive"), b"").unwrap();
+
+		let aborted = s
+			.engine_at("gitui-session-unborn-bootstrap")
+			.exec(Cmd::Abort)
+			.unwrap();
+
+		assert_ne!(aborted.code, 0);
+		assert!(!state_dir.join("head-name").exists());
+		assert!(state_dir.exists());
 	}
 
 	#[test]

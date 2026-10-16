@@ -8,6 +8,7 @@ use crate::{
 	},
 	input::{Input, InputEvent, InputState},
 	keys::{key_match, KeyConfig, SharedKeyConfig},
+	modal::{ModalAction, ModalInput, ModalOutcome},
 	options::{Options, SharedOptions},
 	popup_stack::PopupStack,
 	popups::{
@@ -31,7 +32,8 @@ use crate::{
 	strings::{self, ellipsis_trim_start, order},
 	tabs::SharedBackend,
 	tabs::{
-		FilesTab, RebaseTab, Revlog, StashList, Stashing, Status,
+		Branches, FilesTab, RebaseTab, Revlog, StashList, Stashing,
+		Status,
 	},
 	try_or_popup,
 	ui::style::{SharedTheme, Theme},
@@ -47,7 +49,9 @@ use asyncgit::{
 	AsyncGitNotification, PushType,
 };
 use crossbeam_channel::Sender;
-use crossterm::event::{Event, KeyEvent};
+use crossterm::event::{
+	Event, KeyEvent, KeyEventKind, MouseButton, MouseEventKind,
+};
 use ratatui::{
 	layout::{
 		Alignment, Constraint, Direction, Layout, Margin, Rect,
@@ -68,6 +72,268 @@ pub enum QuitState {
 	None,
 	Close,
 	OpenSubmodule(RepoPath),
+}
+
+#[cfg(test)]
+mod modal_app_tests {
+	use super::*;
+	use crossterm::event::{
+		KeyCode, KeyEventKind, KeyModifiers, MouseEvent,
+	};
+	use std::sync::{Mutex, OnceLock};
+
+	static APP_RECEIVERS: OnceLock<
+		Mutex<(
+			Vec<crossbeam_channel::Receiver<AsyncGitNotification>>,
+			Vec<crossbeam_channel::Receiver<AsyncAppNotification>>,
+		)>,
+	> = OnceLock::new();
+
+	fn modal_app() -> (tempfile::TempDir, App) {
+		let (dir, _repository) = git2_testing::repo_init();
+		let cliargs = CliArgs {
+			keymap: crate::keys::Keymap::Helix,
+			theme: PathBuf::new(),
+			select_file: None,
+			repo_path: RepoPath::Path(dir.path().to_path_buf()),
+			notify_watcher: false,
+			key_bindings_path: None,
+			key_symbols_path: None,
+		};
+		let (sender_git, receiver_git) =
+			crossbeam_channel::unbounded();
+		let (sender_app, receiver_app) =
+			crossbeam_channel::unbounded();
+		let app = App::new(
+			cliargs,
+			sender_git,
+			sender_app,
+			Input::new(),
+			Theme::default(),
+			KeyConfig::with_keymap(crate::keys::Keymap::Helix),
+		)
+		.unwrap();
+		// A running UI drains these channels. Keep the receivers alive for
+		// the test process so background git workers do not panic on send.
+		let mut receivers = APP_RECEIVERS
+			.get_or_init(|| Mutex::new((Vec::new(), Vec::new())))
+			.lock()
+			.unwrap();
+		receivers.0.push(receiver_git);
+		receivers.1.push(receiver_app);
+		(dir, app)
+	}
+
+	fn key(code: KeyCode) -> InputEvent {
+		InputEvent::Input(Event::Key(KeyEvent::new(
+			code,
+			KeyModifiers::NONE,
+		)))
+	}
+
+	fn key_kind(
+		code: KeyCode,
+		modifiers: KeyModifiers,
+		kind: KeyEventKind,
+	) -> InputEvent {
+		InputEvent::Input(Event::Key(KeyEvent::new_with_kind(
+			code, modifiers, kind,
+		)))
+	}
+
+	#[test]
+	fn prefix_and_palette_consume_q_without_quitting() {
+		let (_dir, mut app) = modal_app();
+		app.event(key(KeyCode::Char('g'))).unwrap();
+		app.event(key(KeyCode::Char('q'))).unwrap();
+		assert!(matches!(app.do_quit, QuitState::None));
+
+		app.event(key(app.key_config.keys.command_palette.code))
+			.unwrap();
+		app.event(key(KeyCode::Char('q'))).unwrap();
+		assert!(matches!(app.do_quit, QuitState::None));
+		assert!(app.modal_input.active());
+	}
+
+	#[test]
+	fn command_palette_accepts_text_repeats_but_not_repeated_commands(
+	) {
+		let (_dir, mut app) = modal_app();
+		app.event(key(app.key_config.keys.command_palette.code))
+			.unwrap();
+		app.event(key(KeyCode::Char('a'))).unwrap();
+		app.event(key_kind(
+			KeyCode::Char('a'),
+			KeyModifiers::NONE,
+			KeyEventKind::Repeat,
+		))
+		.unwrap();
+		assert_eq!(app.modal_input.pending_hint(), ":aa");
+
+		app.event(key_kind(
+			KeyCode::Char('d'),
+			KeyModifiers::CONTROL,
+			KeyEventKind::Repeat,
+		))
+		.unwrap();
+		assert_eq!(app.modal_input.pending_hint(), ":aa");
+		assert!(matches!(app.do_quit, QuitState::None));
+	}
+
+	#[test]
+	fn branch_search_repeat_types_q_instead_of_quitting() {
+		let (_dir, mut app) = modal_app();
+		app.set_tab(6).unwrap();
+		app.event(key(KeyCode::Char('/'))).unwrap();
+		app.event(key(KeyCode::Char('q'))).unwrap();
+		app.event(key_kind(
+			KeyCode::Char('q'),
+			KeyModifiers::NONE,
+			KeyEventKind::Repeat,
+		))
+		.unwrap();
+		assert!(matches!(app.do_quit, QuitState::None));
+
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(100, 30),
+		)
+		.unwrap();
+		terminal.draw(|frame| app.draw(frame).unwrap()).unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("Branches /qq"), "{rendered}");
+	}
+
+	#[test]
+	fn inline_commit_accepts_character_repeat_and_rejects_repeat_ctrl_d(
+	) {
+		let (dir, mut app) = modal_app();
+		std::fs::write(dir.path().join("repeat.txt"), "staged\n")
+			.unwrap();
+		let output = std::process::Command::new("git")
+			.args(["add", "repeat.txt"])
+			.current_dir(dir.path())
+			.output()
+			.unwrap();
+		assert!(output.status.success());
+		app.commit_popup.open(None).unwrap();
+		app.event(key(KeyCode::Char('a'))).unwrap();
+		app.event(key_kind(
+			KeyCode::Char('a'),
+			KeyModifiers::NONE,
+			KeyEventKind::Repeat,
+		))
+		.unwrap();
+
+		let head = || {
+			std::process::Command::new("git")
+				.args(["rev-parse", "HEAD"])
+				.current_dir(dir.path())
+				.output()
+				.unwrap()
+		};
+		let before = head();
+		app.event(key_kind(
+			KeyCode::Char('d'),
+			KeyModifiers::CONTROL,
+			KeyEventKind::Repeat,
+		))
+		.unwrap();
+		let after = head();
+		assert_eq!(before.stdout, after.stdout);
+		assert!(app.commit_popup.is_visible());
+
+		let mut terminal = ratatui::Terminal::new(
+			ratatui::backend::TestBackend::new(100, 30),
+		)
+		.unwrap();
+		terminal.draw(|frame| app.draw(frame).unwrap()).unwrap();
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("aa"), "{rendered}");
+	}
+
+	#[test]
+	fn goto_prefix_dispatches_tab_number() {
+		let (_dir, mut app) = modal_app();
+		app.set_tab(1).unwrap();
+		app.event(key(KeyCode::Char('g'))).unwrap();
+		app.event(key(KeyCode::Char('1'))).unwrap();
+		assert_eq!(app.tab, 0);
+	}
+
+	#[test]
+	fn modal_status_line_renders_in_a_small_terminal() {
+		let (_dir, app) = modal_app();
+		let backend = ratatui::backend::TestBackend::new(44, 8);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal.draw(|frame| app.draw(frame).unwrap()).unwrap();
+
+		let line: String = (0..44)
+			.map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+			.collect();
+		assert!(line.contains("NORMAL"), "{line:?}");
+	}
+
+	#[test]
+	fn clicking_a_tab_label_switches_tabs_but_palette_owns_pointer() {
+		let (_dir, mut app) = modal_app();
+		let backend = ratatui::backend::TestBackend::new(100, 30);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal.draw(|frame| app.draw(frame).unwrap()).unwrap();
+		let status_width =
+			strings::tab_status(&app.key_config).width();
+		let tab_gap =
+			strings::tab_divider(&app.key_config).width() + 2;
+		let log_column =
+			u16::try_from(2 + status_width + tab_gap).unwrap();
+		app.event(InputEvent::Input(Event::Mouse(MouseEvent {
+			kind: MouseEventKind::Down(MouseButton::Left),
+			column: log_column,
+			row: 0,
+			modifiers: KeyModifiers::NONE,
+		})))
+		.unwrap();
+		assert_eq!(app.tab, 1);
+
+		app.event(key(app.key_config.keys.command_palette.code))
+			.unwrap();
+		app.event(InputEvent::Input(Event::Mouse(MouseEvent {
+			kind: MouseEventKind::Down(MouseButton::Left),
+			column: 2,
+			row: 0,
+			modifiers: KeyModifiers::NONE,
+		})))
+		.unwrap();
+		assert_eq!(app.tab, 1);
+
+		app.event(key(KeyCode::Esc)).unwrap();
+		app.options_popup.show().unwrap();
+		app.event(InputEvent::Input(Event::Mouse(MouseEvent {
+			kind: MouseEventKind::Down(MouseButton::Left),
+			column: 2,
+			row: 0,
+			modifiers: KeyModifiers::NONE,
+		})))
+		.unwrap();
+		assert_eq!(app.tab, 1);
+		assert!(app.options_popup.is_visible());
+	}
+
+	#[test]
+	fn captured_branch_filter_owns_mouse_input_above_tab_bar() {
+		let (_dir, mut app) = modal_app();
+		app.set_tab(6).unwrap();
+		app.event(key(KeyCode::Char('/'))).unwrap();
+		assert!(app.branches_tab.captures_input());
+
+		app.event(InputEvent::Input(Event::Mouse(MouseEvent {
+			kind: MouseEventKind::Down(MouseButton::Left),
+			column: 2,
+			row: 0,
+			modifiers: KeyModifiers::NONE,
+		})))
+		.unwrap();
+		assert_eq!(app.tab, 6);
+	}
 }
 
 /// the main app type
@@ -105,22 +371,29 @@ pub struct App {
 	reset_popup: ResetPopup,
 	checkout_option_popup: CheckoutOptionPopup,
 	cmdbar: RefCell<CommandBar>,
+	tab_hit_areas: RefCell<Vec<(usize, Rect)>>,
 	tab: usize,
 	revlog: Revlog,
 	status_tab: Status,
 	stashing_tab: Stashing,
 	stashlist_tab: StashList,
 	files_tab: FilesTab,
+	branches_tab: Branches,
 	rebase_service: Rc<RefCell<RebaseService>>,
 	rebase_tab: RebaseTab,
 	queue: Queue,
 	theme: SharedTheme,
 	key_config: SharedKeyConfig,
 	input: Input,
+	modal_input: ModalInput,
+	mouse_capture_tab: Option<usize>,
 	popup_stack: PopupStack,
 	options: SharedOptions,
 	repo_path_text: String,
 	goto_line_popup: GotoLinePopup,
+	/// Initial tab requested by the user. Its activation is
+	/// deliberately deferred until the shell has been painted.
+	initial_tab: Option<usize>,
 
 	// "Flags"
 	requires_redraw: Cell<bool>,
@@ -141,15 +414,34 @@ pub struct Environment {
 #[cfg(test)]
 impl Environment {
 	pub fn test_env() -> Self {
-		use crossbeam_channel::unbounded;
+		use crossbeam_channel::{unbounded, Receiver};
+		use std::sync::{Mutex, OnceLock};
+
+		static TEST_RECEIVERS: OnceLock<
+			Mutex<(
+				Vec<Receiver<AsyncGitNotification>>,
+				Vec<Receiver<AsyncAppNotification>>,
+			)>,
+		> = OnceLock::new();
+
+		let (sender_git, receiver_git) = unbounded();
+		let (sender_app, receiver_app) = unbounded();
+		let mut receivers = TEST_RECEIVERS
+			.get_or_init(|| Mutex::new((Vec::new(), Vec::new())))
+			.lock()
+			.unwrap();
+		receivers.0.push(receiver_git);
+		receivers.1.push(receiver_app);
+		drop(receivers);
+
 		Self {
 			queue: Queue::new(),
 			theme: Rc::default(),
 			key_config: Rc::default(),
 			repo: RefCell::new(RepoPath::Path(PathBuf::default())),
 			options: Rc::new(RefCell::new(Options::test_env())),
-			sender_git: unbounded().0,
-			sender_app: unbounded().0,
+			sender_git,
+			sender_app,
 		}
 	}
 }
@@ -194,7 +486,7 @@ impl App {
 			}
 			2
 		} else {
-			env.options.borrow().current_tab().min(5)
+			env.options.borrow().current_tab().min(6)
 		};
 
 		let rebase_service =
@@ -204,8 +496,10 @@ impl App {
 			Rc::clone(&rebase_service) as SharedBackend,
 		);
 
-		let mut app = Self {
+		let app = Self {
 			input,
+			modal_input: ModalInput::new(),
+			mouse_capture_tab: None,
 			confirm_popup: ConfirmPopup::new(&env),
 			commit_popup: CommitPopup::new(&env),
 			blame_file_popup: BlameFilePopup::new(
@@ -241,6 +535,7 @@ impl App {
 				env.theme.clone(),
 				env.key_config.clone(),
 			)),
+			tab_hit_areas: RefCell::new(Vec::new()),
 			help_popup: HelpPopup::new(&env),
 			msg_popup: MsgPopup::new(&env),
 			revlog: Revlog::new(&env),
@@ -248,11 +543,13 @@ impl App {
 			stashing_tab: Stashing::new(&env),
 			stashlist_tab: StashList::new(&env),
 			files_tab: FilesTab::new(&env, select_file),
+			branches_tab: Branches::new(&env),
 			rebase_service: Rc::clone(&rebase_service),
 			rebase_tab,
 			checkout_option_popup: CheckoutOptionPopup::new(&env),
 			goto_line_popup: GotoLinePopup::new(&env),
-			tab: 0,
+			tab,
+			initial_tab: Some(tab),
 			queue: env.queue,
 			theme: env.theme,
 			options: env.options,
@@ -264,27 +561,49 @@ impl App {
 			popup_stack: PopupStack::default(),
 		};
 
-		app.set_tab(tab)?;
-
 		Ok(app)
+	}
+
+	/// Activate the requested startup tab after the initial shell
+	/// frame. Showing a tab starts repository reads, so keeping this
+	/// separate from construction lets the terminal become responsive
+	/// before any of those reads begin.
+	pub(crate) fn activate_initial_tab(&mut self) -> Result<()> {
+		if let Some(tab) = self.initial_tab.take() {
+			self.set_tab(tab)?;
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	pub(crate) fn startup_status_scan_pending(&self) -> bool {
+		self.status_tab.anything_pending()
+	}
+
+	#[cfg(test)]
+	pub(crate) const fn has_deferred_initial_tab(&self) -> bool {
+		self.initial_tab.is_some()
 	}
 
 	///
 	pub fn draw(&self, f: &mut Frame) -> Result<()> {
 		let fsize = f.area();
+		let modal_status_height =
+			u16::from(self.key_config.is_modal());
 
 		self.cmdbar.borrow_mut().refresh_width(fsize.width);
 
+		let mut constraints = vec![
+			Constraint::Length(2),
+			Constraint::Min(2),
+			Constraint::Length(self.cmdbar.borrow().height()),
+		];
+		if modal_status_height > 0 {
+			constraints.push(Constraint::Length(modal_status_height));
+		}
 		let chunks_main = Layout::default()
 			.direction(Direction::Vertical)
-			.constraints(
-				[
-					Constraint::Length(2),
-					Constraint::Min(2),
-					Constraint::Length(self.cmdbar.borrow().height()),
-				]
-				.as_ref(),
-			)
+			.constraints(constraints)
 			.split(fsize);
 
 		self.cmdbar.borrow().draw(f, chunks_main[2]);
@@ -301,21 +620,145 @@ impl App {
 				|| self.file_revlog_popup.is_visible();
 
 		if !fullscreen_popup_open {
-			//TODO: macro because of generic draw call
-			match self.tab {
-				0 => self.status_tab.draw(f, chunks_main[1])?,
-				1 => self.revlog.draw(f, chunks_main[1])?,
-				2 => self.files_tab.draw(f, chunks_main[1])?,
-				3 => self.stashing_tab.draw(f, chunks_main[1])?,
-				4 => self.stashlist_tab.draw(f, chunks_main[1])?,
-				5 => self.rebase_tab.draw(f, chunks_main[1])?,
-				_ => bail!("unknown tab"),
+			if self.initial_tab.is_some() {
+				self.draw_initial_loading(f, chunks_main[1]);
+			} else {
+				//TODO: macro because of generic draw call
+				match self.tab {
+					0 => self.status_tab.draw(f, chunks_main[1])?,
+					1 => self.revlog.draw(f, chunks_main[1])?,
+					2 => self.files_tab.draw(f, chunks_main[1])?,
+					3 => self.stashing_tab.draw(f, chunks_main[1])?,
+					4 => {
+						self.stashlist_tab.draw(f, chunks_main[1])?;
+					}
+					5 => self.rebase_tab.draw(f, chunks_main[1])?,
+					6 => self.branches_tab.draw(f, chunks_main[1])?,
+					_ => bail!("unknown tab"),
+				}
 			}
 		}
 
 		self.draw_popups(f)?;
+		if self.key_config.is_modal() {
+			self.draw_modal_status(f, chunks_main[3]);
+			self.modal_input.draw_overlay(
+				f,
+				&self.theme,
+				&self.key_config,
+			);
+		}
 
 		Ok(())
+	}
+
+	fn draw_initial_loading(&self, f: &mut Frame, area: Rect) {
+		let tab = match self.tab {
+			0 => strings::tab_status(&self.key_config),
+			1 => strings::tab_log(&self.key_config),
+			2 => strings::tab_files(&self.key_config),
+			3 => strings::tab_stashing(&self.key_config),
+			4 => strings::tab_stashes(&self.key_config),
+			5 => strings::tab_rebase(&self.key_config),
+			_ => strings::tab_branches(&self.key_config),
+		};
+		let message = format!("Loading {tab}…");
+		f.render_widget(
+			Paragraph::new(message).alignment(Alignment::Center),
+			area,
+		);
+	}
+
+	fn draw_modal_status(&self, f: &mut Frame, area: Rect) {
+		let in_dialog = self.any_popup_visible();
+		let captures_input = self.modal_captures_input();
+		let palette_open =
+			self.modal_input.mode_label() == Some("COMMAND");
+		let tab = match self.tab {
+			0 => "Status",
+			1 => "Log",
+			2 => "Files",
+			3 => "Stashing",
+			4 => "Stashes",
+			5 => "Rebase",
+			6 => "Branches",
+			_ => "",
+		};
+		let selection = if in_dialog || captures_input {
+			None
+		} else {
+			self.components().into_iter().find_map(
+				super::components::Component::selection_status,
+			)
+		};
+		let selected = selection.map_or_else(String::new, |s| {
+			if s.count == 0 {
+				String::new()
+			} else if s.extending {
+				format!("  {} {}", s.count, s.unit)
+			} else {
+				format!("  {} {} selected", s.count, s.unit)
+			}
+		});
+		let contextual_hints = if in_dialog || captures_input {
+			None
+		} else {
+			self.components().into_iter().find_map(
+				super::components::Component::modal_status_hint,
+			)
+		};
+		let (label, style) = if in_dialog {
+			("DIALOG", self.theme.commandbar(false))
+		} else if captures_input {
+			("INPUT", self.theme.commandbar(false))
+		} else if selection.is_some_and(|status| status.extending) {
+			("SELECT", self.theme.commandbar(true))
+		} else {
+			(
+				self.modal_input
+					.mode_label()
+					.or_else(|| {
+						self.modal_input.active().then_some("NORMAL")
+					})
+					.unwrap_or("NORMAL"),
+				self.theme.commandbar(true),
+			)
+		};
+		let hints = if in_dialog {
+			"Enter Select  Esc Cancel".to_owned()
+		} else if palette_open {
+			"↑/↓ Move  Enter Run  Esc Close".to_owned()
+		} else if captures_input {
+			"Esc Cancel".to_owned()
+		} else if let Some(hints) = contextual_hints {
+			hints
+		} else {
+			format!(
+				"{} Select  {} Clear  {} All  {} Item  {} Actions  {} Commands  {} Cancel",
+				self.key_config.get_hint(self.key_config.keys.select_mode),
+				self.key_config.get_hint(self.key_config.keys.select_clear),
+				self.key_config.get_hint(self.key_config.keys.select_all),
+				self.key_config.get_hint(self.key_config.keys.select_item),
+				self.key_config.get_hint(self.key_config.keys.action_prefix),
+				self.key_config.get_hint(self.key_config.keys.command_palette),
+				self.key_config.get_hint(self.key_config.keys.exit_popup),
+			)
+		};
+		let pending = self.modal_input.pending_hint();
+		let pending = if pending.is_empty() {
+			String::new()
+		} else {
+			format!("  {pending}")
+		};
+		let line = Line::from(vec![
+			Span::styled(format!(" {label} "), style),
+			Span::styled(
+				format!(" {tab}{selected}{pending} "),
+				style,
+			),
+			Span::styled(hints, style),
+		]);
+		f.render_widget(Paragraph::new(line).style(style), area);
 	}
 
 	///
@@ -323,21 +766,437 @@ impl App {
 		log::trace!("event: {ev:?}");
 
 		if let InputEvent::Input(ev) = ev {
-			if self.check_hard_exit(&ev) || self.check_quit(&ev) {
+			self.handle_input_event(&ev)?;
+		} else if let InputEvent::State(polling_state) = ev {
+			self.external_editor_popup.hide();
+			if matches!(polling_state, InputState::Paused) {
+				let result = (|| {
+					if let Some(path) = self.file_to_open.take() {
+						ExternalEditorPopup::open_file_in_editor(
+							&self.repo.borrow(),
+							Path::new(&path),
+						)
+					} else {
+						let changes =
+							self.status_tab.get_files_changes()?;
+						self.commit_popup.show_editor(changes)
+					}
+				})();
+
+				if let Err(e) = result {
+					let msg =
+						format!("failed to launch editor:\n{e}");
+					log::error!("{}", msg.as_str());
+					self.input.set_polling(true);
+					self.msg_popup.show_error(msg.as_str())?;
+				} else {
+					self.input.set_polling(true);
+				}
+
+				self.requires_redraw.set(true);
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_input_event(&mut self, ev: &Event) -> Result<()> {
+		if matches!(ev, Event::Key(key) if key.kind == KeyEventKind::Release)
+		{
+			return Ok(());
+		}
+		let repeated = matches!(
+			ev,
+			Event::Key(key) if key.kind == KeyEventKind::Repeat
+		);
+		let repeated_text_input = repeated
+			&& (self.modal_input.captures_text_input()
+				|| self.modal_captures_input())
+			&& matches!(
+				ev,
+				Event::Key(key)
+					if super::modal::repeat_text_editing_key(key)
+			);
+		if repeated
+			&& !self.repeat_key_is_navigation(ev)
+			&& !repeated_text_input
+		{
+			return Ok(());
+		}
+		if self.check_hard_exit(ev) {
+			return Ok(());
+		}
+		if matches!(ev, Event::Mouse(_)) {
+			return self.handle_mouse_event(ev);
+		}
+
+		if !self.key_config.is_modal() {
+			return self.process_unrouted_event(ev);
+		}
+
+		if self.any_popup_visible() || self.modal_captures_input() {
+			self.modal_input.reset();
+			return self.process_unrouted_event(ev);
+		}
+
+		let outcome = self.modal_input.route(ev, &self.key_config);
+		if repeated
+			&& !self.repeat_outcome_is_motion(&outcome)
+			&& !(repeated_text_input
+				&& matches!(&outcome, ModalOutcome::Consumed))
+		{
+			return Ok(());
+		}
+		match outcome {
+			ModalOutcome::Pass(event) => {
+				self.process_unrouted_event(&event)?;
+			}
+			ModalOutcome::Consumed => {
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+			}
+			ModalOutcome::Action(action) => {
+				self.process_modal_action(action)?;
+			}
+			ModalOutcome::OpenPalette => {
+				let commands = self.commands(false);
+				self.modal_input
+					.open_palette(commands, &self.key_config);
+			}
+		}
+
+		Ok(())
+	}
+
+	fn handle_mouse_event(&mut self, ev: &Event) -> Result<()> {
+		let Event::Mouse(mouse) = ev else {
+			return Ok(());
+		};
+		// A palette or text prompt owns the pointer just as it owns the
+		// keyboard. In particular, a click must never reach the pane below it.
+		if self.modal_input.mode_label() == Some("COMMAND") {
+			self.mouse_capture_tab = None;
+			let outcome =
+				self.modal_input.route(ev, &self.key_config);
+			match outcome {
+				ModalOutcome::Action(action) => {
+					self.process_modal_action(action)?;
+				}
+				ModalOutcome::OpenPalette => {
+					let commands = self.commands(false);
+					self.modal_input
+						.open_palette(commands, &self.key_config);
+				}
+				ModalOutcome::Consumed | ModalOutcome::Pass(_) => {}
+			}
+			self.process_queue(NeedsUpdate::COMMANDS)?;
+			return Ok(());
+		}
+
+		if self.any_popup_visible() {
+			self.mouse_capture_tab = None;
+			// Popup order comes from the same list used to paint them. Only
+			// the topmost visible surface receives the event, and the overlay
+			// stack owns the click even when that surface ignores the position.
+			for popup in self.popup_components_mut().into_iter().rev()
+			{
+				if popup.is_visible() {
+					let _ = popup.event(ev)?;
+					break;
+				}
+			}
+			self.process_queue(NeedsUpdate::COMMANDS)?;
+			return Ok(());
+		}
+
+		if self.modal_input.active() {
+			self.modal_input.route(ev, &self.key_config);
+			self.mouse_capture_tab = None;
+			return Ok(());
+		}
+
+		if !self.modal_captures_input()
+			&& mouse.kind == MouseEventKind::Down(MouseButton::Left)
+		{
+			if let Some(tab) =
+				self.tab_at_position(mouse.column, mouse.row)
+			{
+				self.set_tab(tab)?;
+				self.process_queue(NeedsUpdate::COMMANDS)?;
 				return Ok(());
 			}
+		}
 
-			let mut flags = NeedsUpdate::empty();
+		let captured_tab = match mouse.kind {
+			MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+				self.mouse_capture_tab
+			}
+			_ => None,
+		};
+		let route_tab = captured_tab.unwrap_or(self.tab);
+		// Only the active tab receives background pointer events. Its child
+		// components remember their own rendered rectangles and decide whether
+		// the coordinate belongs to them.
+		let mut components = match route_tab {
+			0 => vec![&mut self.status_tab as &mut dyn Component],
+			1 => vec![&mut self.revlog as &mut dyn Component],
+			2 => vec![&mut self.files_tab as &mut dyn Component],
+			3 => vec![&mut self.stashing_tab as &mut dyn Component],
+			4 => vec![&mut self.stashlist_tab as &mut dyn Component],
+			5 => vec![&mut self.rebase_tab as &mut dyn Component],
+			6 => vec![&mut self.branches_tab as &mut dyn Component],
+			_ => bail!("unknown tab"),
+		};
+		let consumed =
+			event_pump(ev, components.as_mut_slice())?.is_consumed();
+		if matches!(
+			mouse.kind,
+			MouseEventKind::Down(MouseButton::Left)
+		) && consumed
+		{
+			self.mouse_capture_tab = Some(self.tab);
+		} else if matches!(mouse.kind, MouseEventKind::Up(_)) {
+			self.mouse_capture_tab = None;
+		}
+		self.process_queue(NeedsUpdate::COMMANDS)?;
+		Ok(())
+	}
 
-			if event_pump(&ev, self.components_mut().as_mut_slice())?
-				.is_consumed()
+	fn tab_at_position(
+		&self,
+		column: u16,
+		row: u16,
+	) -> Option<usize> {
+		self.tab_hit_areas.borrow().iter().find_map(|(tab, area)| {
+			area.contains((column, row).into()).then_some(*tab)
+		})
+	}
+
+	fn repeat_key_is_navigation(&self, event: &Event) -> bool {
+		let Event::Key(key) = event else {
+			return false;
+		};
+		match self.modal_input.mode_label() {
+			Some("COMMAND") => {
+				matches!(
+					key.code,
+					crossterm::event::KeyCode::Up
+						| crossterm::event::KeyCode::Down
+				) || (key.modifiers.contains(
+					crossterm::event::KeyModifiers::CONTROL,
+				) && matches!(
+					key.code,
+					crossterm::event::KeyCode::Char('n' | 'p')
+				))
+			}
+			Some("GOTO" | "ACTION") => false,
+			_ => [
+				self.key_config.keys.move_up,
+				self.key_config.keys.move_down,
+				self.key_config.keys.move_left,
+				self.key_config.keys.move_right,
+				self.key_config.keys.home,
+				self.key_config.keys.end,
+				self.key_config.keys.page_up,
+				self.key_config.keys.page_down,
+			]
+			.iter()
+			.any(|binding| key_match(key, *binding)),
+		}
+	}
+
+	fn repeat_outcome_is_motion(
+		&self,
+		outcome: &ModalOutcome,
+	) -> bool {
+		let key = match outcome {
+			ModalOutcome::Action(ModalAction::Dispatch(key, _)) => {
+				*key
+			}
+			_ => return false,
+		};
+		[
+			self.key_config.keys.move_up,
+			self.key_config.keys.move_down,
+			self.key_config.keys.move_left,
+			self.key_config.keys.move_right,
+			self.key_config.keys.home,
+			self.key_config.keys.end,
+			self.key_config.keys.popup_up,
+			self.key_config.keys.popup_down,
+			self.key_config.keys.page_up,
+			self.key_config.keys.page_down,
+		]
+		.contains(&key)
+	}
+
+	fn modal_captures_input(&self) -> bool {
+		self.components()
+			.into_iter()
+			.any(super::components::Component::captures_input)
+	}
+
+	fn process_modal_dispatch(
+		&mut self,
+		key: crate::keys::GituiKeyEvent,
+		count: usize,
+	) -> Result<()> {
+		let event = Event::Key(KeyEvent::from(&key));
+		for _ in 0..count.clamp(1, crate::modal::MAX_COUNT) {
+			if self.any_popup_visible() || self.modal_captures_input()
 			{
-				flags.insert(NeedsUpdate::COMMANDS);
-			} else if let Event::Key(k) = &ev {
-				let new_flags = if key_match(
-					k,
-					self.key_config.keys.tab_toggle,
-				) {
+				self.modal_input.reset();
+				break;
+			}
+			self.process_unrouted_event(&event)?;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_lines)] // Each modal outcome has distinct live-state checks.
+	fn process_modal_action(
+		&mut self,
+		action: ModalAction,
+	) -> Result<()> {
+		match action {
+			ModalAction::Dispatch(key, count) => {
+				self.process_modal_dispatch(key, count)?;
+			}
+			ModalAction::PaletteDispatch(key) => {
+				let current = self.commands(false);
+				let pressed = KeyEvent::from(&key);
+				let mut equivalent: Vec<(&str, &str, bool, bool)> =
+					Vec::new();
+				for command in current.iter().filter(|command| {
+					command.text.binding.is_some_and(|binding| {
+						key_match(&pressed, binding)
+					})
+				}) {
+					if let Some(existing) = equivalent
+						.iter_mut()
+						.find(|(desc, group, _, _)| {
+							*desc == command.text.desc
+								&& *group == command.text.group
+						}) {
+						existing.2 |= command.available;
+						existing.3 |=
+							command.available && command.enabled;
+					} else {
+						equivalent.push((
+							command.text.desc,
+							command.text.group,
+							command.available,
+							command.available && command.enabled,
+						));
+					}
+				}
+				match equivalent.as_slice() {
+					[(_, _, _, true)] => {
+						self.process_modal_dispatch(key, 1)?;
+					}
+					[(_, _, false, _)] => {
+						self.modal_action_notice(
+							"Command canceled because it is no longer available in this context.",
+							false,
+						)?;
+					}
+					[_] => self.modal_action_notice(
+						"Command is disabled in the current context.",
+						false,
+					)?,
+					_ if equivalent.is_empty() => self.modal_action_notice(
+						"Command canceled because it is no longer available in this context.",
+						false,
+					)?,
+					_ => self.modal_action_notice(
+						"Command canceled because its key now matches multiple commands.",
+						true,
+					)?,
+				}
+			}
+			ModalAction::SwitchTab(tab) => {
+				self.set_tab(tab)?;
+				self.modal_input.reset();
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+			}
+			ModalAction::Branches => {
+				self.queue.push(InternalEvent::SelectBranch);
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+			}
+			ModalAction::Commit => {
+				self.queue.push(InternalEvent::OpenCommitEditor);
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+			}
+			ModalAction::Options => {
+				self.options_popup.show()?;
+				self.modal_input.reset();
+				self.process_queue(NeedsUpdate::ALL)?;
+			}
+			ModalAction::Help => {
+				self.help_popup.show()?;
+				self.modal_input.reset();
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+			}
+			ModalAction::Search => {
+				if self.tab == 1 {
+					self.queue
+						.push(InternalEvent::OpenLogSearchPopup);
+					self.process_queue(NeedsUpdate::COMMANDS)?;
+				} else if self.tab == 2 {
+					let event = Event::Key(KeyEvent::from(
+						&self.key_config.keys.file_find,
+					));
+					self.process_unrouted_event(&event)?;
+				} else if self.tab == 6 {
+					let event = Event::Key(KeyEvent::from(
+						&self.key_config.keys.branch_find,
+					));
+					self.process_unrouted_event(&event)?;
+				} else {
+					self.set_tab(1)?;
+					self.queue
+						.push(InternalEvent::OpenLogSearchPopup);
+					self.process_queue(NeedsUpdate::COMMANDS)?;
+				}
+				self.modal_input.reset();
+			}
+			ModalAction::Rebase => {
+				self.queue.push(InternalEvent::OpenRebase);
+				self.process_queue(NeedsUpdate::COMMANDS)?;
+				self.modal_input.reset();
+			}
+		}
+		Ok(())
+	}
+
+	fn modal_action_notice(
+		&mut self,
+		message: &str,
+		is_error: bool,
+	) -> Result<()> {
+		self.modal_input.reset();
+		self.queue.push(if is_error {
+			InternalEvent::ShowErrorMsg(message.to_owned())
+		} else {
+			InternalEvent::ShowInfoMsg(message.to_owned())
+		});
+		self.process_queue(NeedsUpdate::COMMANDS)
+	}
+
+	fn process_unrouted_event(&mut self, ev: &Event) -> Result<()> {
+		if self.check_quit(ev) {
+			return Ok(());
+		}
+
+		let old_tab = self.tab;
+		let mut flags = NeedsUpdate::empty();
+
+		if event_pump(ev, self.components_mut().as_mut_slice())?
+			.is_consumed()
+		{
+			flags.insert(NeedsUpdate::COMMANDS);
+		} else if let Event::Key(k) = ev {
+			let new_flags =
+				if key_match(k, self.key_config.keys.tab_toggle) {
 					self.toggle_tabs(false)?;
 					NeedsUpdate::COMMANDS
 				} else if key_match(
@@ -364,6 +1223,9 @@ impl App {
 				) || key_match(
 					k,
 					self.key_config.keys.tab_rebase,
+				) || key_match(
+					k,
+					self.key_config.keys.tab_branches,
 				) {
 					self.switch_tab(k)?;
 					NeedsUpdate::COMMANDS
@@ -383,37 +1245,16 @@ impl App {
 					NeedsUpdate::empty()
 				};
 
-				flags.insert(new_flags);
-			}
-
-			self.process_queue(flags)?;
-		} else if let InputEvent::State(polling_state) = ev {
-			self.external_editor_popup.hide();
-			if matches!(polling_state, InputState::Paused) {
-				let result =
-					if let Some(path) = self.file_to_open.take() {
-						ExternalEditorPopup::open_file_in_editor(
-							&self.repo.borrow(),
-							Path::new(&path),
-						)
-					} else {
-						let changes =
-							self.status_tab.get_files_changes()?;
-						self.commit_popup.show_editor(changes)
-					};
-
-				if let Err(e) = result {
-					let msg =
-						format!("failed to launch editor:\n{e}");
-					log::error!("{}", msg.as_str());
-					self.msg_popup.show_error(msg.as_str())?;
-				}
-
-				self.requires_redraw.set(true);
-				self.input.set_polling(true);
-			}
+			flags.insert(new_flags);
 		}
 
+		self.process_queue(flags)?;
+		if old_tab != self.tab
+			|| self.any_popup_visible()
+			|| self.modal_captures_input()
+		{
+			self.modal_input.reset();
+		}
 		Ok(())
 	}
 
@@ -421,6 +1262,7 @@ impl App {
 	/// forward ticking to components that require it
 	pub fn update(&mut self) -> Result<()> {
 		log::trace!("update");
+		self.activate_initial_tab()?;
 
 		self.commit_popup.update();
 		self.status_tab.update()?;
@@ -428,6 +1270,7 @@ impl App {
 		self.files_tab.update()?;
 		self.stashing_tab.update()?;
 		self.stashlist_tab.update()?;
+		self.branches_tab.update()?;
 		self.reset_popup.update()?;
 
 		self.rebase_service.borrow_mut().refresh()?;
@@ -459,7 +1302,16 @@ impl App {
 		ev: AsyncNotification,
 	) -> Result<()> {
 		log::trace!("update_async: {ev:?}");
-
+		if ev
+			== AsyncNotification::App(
+				AsyncAppNotification::DiffHighlighting,
+			) {
+			self.status_tab.update_rendering();
+			self.revlog.update_rendering();
+			self.file_revlog_popup.update_rendering();
+			self.inspect_commit_popup.update_rendering();
+			self.compare_commits_popup.update_rendering();
+		}
 		if let AsyncNotification::Git(ev) = ev {
 			if matches!(ev, AsyncGitNotification::Rebase) {
 				self.rebase_service.borrow_mut().on_worker_event()?;
@@ -476,6 +1328,7 @@ impl App {
 			self.pull_popup.update_git(ev);
 			self.fetch_popup.update_git(ev);
 			self.select_branch_popup.update_git(ev)?;
+			self.branches_tab.update_git(ev)?;
 		}
 
 		self.files_tab.update_async(ev)?;
@@ -496,6 +1349,20 @@ impl App {
 			|| self.input.is_aborted()
 	}
 
+	/// Mark repository status as stale after a filesystem or Git mutation.
+	pub fn invalidate_repository(&mut self) {
+		self.status_tab.invalidate_status();
+		self.stashing_tab.invalidate_status();
+		self.branches_tab.invalidate_branches();
+	}
+
+	/// Start a status refresh when the active request has settled.
+	pub fn poll_repository(&mut self) {
+		self.status_tab.poll_status();
+		self.stashing_tab.poll_status();
+		self.branches_tab.poll_ref_freshness();
+	}
+
 	///
 	pub fn quit_state(&self) -> QuitState {
 		self.do_quit.clone()
@@ -507,6 +1374,7 @@ impl App {
 			|| self.revlog.any_work_pending()
 			|| self.stashing_tab.anything_pending()
 			|| self.files_tab.anything_pending()
+			|| self.branches_tab.anything_pending()
 			|| self.blame_file_popup.any_work_pending()
 			|| self.file_revlog_popup.any_work_pending()
 			|| self.inspect_commit_popup.any_work_pending()
@@ -518,7 +1386,10 @@ impl App {
 			|| self.fetch_popup.any_work_pending()
 			|| self.revision_files_popup.any_work_pending()
 			|| self.tags_popup.any_work_pending()
-			|| self.rebase_service.borrow().is_busy()
+			|| {
+				let service = self.rebase_service.borrow();
+				service.is_busy() || service.is_loading()
+			}
 	}
 
 	///
@@ -573,7 +1444,8 @@ impl App {
 			files_tab,
 			stashing_tab,
 			stashlist_tab,
-			rebase_tab
+			rebase_tab,
+			branches_tab
 		]
 	);
 
@@ -615,7 +1487,7 @@ impl App {
 	);
 
 	fn check_quit(&mut self, ev: &Event) -> bool {
-		if self.any_popup_visible() {
+		if self.any_popup_visible() || self.modal_captures_input() {
 			return false;
 		}
 		if let Event::Key(e) = ev {
@@ -645,6 +1517,7 @@ impl App {
 			&mut self.stashing_tab,
 			&mut self.stashlist_tab,
 			&mut self.rebase_tab,
+			&mut self.branches_tab,
 		]
 	}
 
@@ -672,12 +1545,15 @@ impl App {
 			self.switch_to_tab(&AppTabs::Stashlist)?;
 		} else if key_match(k, self.key_config.keys.tab_rebase) {
 			self.switch_to_tab(&AppTabs::Rebase)?;
+		} else if key_match(k, self.key_config.keys.tab_branches) {
+			self.switch_to_tab(&AppTabs::Branches)?;
 		}
 
 		Ok(())
 	}
 
 	fn set_tab(&mut self, tab: usize) -> Result<()> {
+		self.initial_tab = None;
 		let tabs = self.get_tabs();
 		for (i, t) in tabs.into_iter().enumerate() {
 			if tab == i {
@@ -688,6 +1564,7 @@ impl App {
 		}
 
 		self.tab = tab;
+		self.mouse_capture_tab = None;
 		self.options.borrow_mut().set_current_tab(tab);
 
 		Ok(())
@@ -701,6 +1578,7 @@ impl App {
 			AppTabs::Stashing => self.set_tab(3)?,
 			AppTabs::Stashlist => self.set_tab(4)?,
 			AppTabs::Rebase => self.set_tab(5)?,
+			AppTabs::Branches => self.set_tab(6)?,
 		}
 		Ok(())
 	}
@@ -806,8 +1684,24 @@ impl App {
 				flags
 					.insert(NeedsUpdate::ALL | NeedsUpdate::COMMANDS);
 			}
-			InternalEvent::Update(u) => flags.insert(u),
-			InternalEvent::OpenCommit => self.commit_popup.show()?,
+			InternalEvent::Update(u) => {
+				if u.contains(NeedsUpdate::ALL) {
+					self.invalidate_repository();
+					flags.insert(NeedsUpdate::BRANCHES);
+				}
+				flags.insert(u);
+			}
+			InternalEvent::OpenCommit
+			| InternalEvent::OpenCommitInline => {
+				self.commit_popup.show()?;
+				flags.insert(NeedsUpdate::ALL);
+			}
+			InternalEvent::OpenCommitEditor => {
+				self.commit_popup.open(None)?;
+				self.queue
+					.push(InternalEvent::OpenExternalEditor(None));
+				flags.insert(NeedsUpdate::ALL);
+			}
 			InternalEvent::RewordCommit(id) => {
 				self.commit_popup.open(Some(id))?;
 			}
@@ -913,7 +1807,8 @@ impl App {
 					}
 					AppOption::DiffContextLines
 					| AppOption::DiffIgnoreWhitespaces
-					| AppOption::DiffInterhunkLines => {
+					| AppOption::DiffInterhunkLines
+					| AppOption::DiffPreviewRenderer => {
 						self.status_tab.update_diff()?;
 					}
 				}
@@ -1049,19 +1944,30 @@ impl App {
 					));
 				}
 			}
-			Action::ResetHunk(path, hash) => {
-				sync::reset_hunk(
+			Action::ResetHunk(path, hash, diff) => {
+				sync::reset_hunk_checked(
 					&self.repo.borrow(),
 					&path,
 					hash,
 					Some(self.options.borrow().diff_options()),
+					&diff,
 				)?;
 			}
-			Action::ResetLines(path, lines) => {
-				sync::discard_lines(
+			Action::ResetLines(path, lines, diff) => {
+				sync::discard_lines_checked(
 					&self.repo.borrow(),
 					&path,
 					&lines,
+					&diff,
+				)?;
+			}
+			Action::ResetLinesWithPairs(path, lines, pairs, diff) => {
+				sync::discard_lines_with_pairs_checked(
+					&self.repo.borrow(),
+					&path,
+					&lines,
+					&pairs,
+					&diff,
 				)?;
 			}
 			Action::DeleteLocalBranch(branch_ref) => {
@@ -1122,6 +2028,7 @@ impl App {
 		}
 
 		flags.insert(NeedsUpdate::ALL);
+		self.invalidate_repository();
 
 		Ok(())
 	}
@@ -1191,6 +2098,7 @@ impl App {
 		}
 	}
 
+	#[allow(clippy::too_many_lines)] // The command list intentionally stays in display order.
 	fn commands(&self, force_all: bool) -> Vec<CommandInfo> {
 		let mut res = Vec::new();
 
@@ -1241,6 +2149,74 @@ impl App {
 			.order(100),
 		);
 
+		if self.key_config.is_modal() {
+			let modal_available = !self.any_popup_visible();
+			let selection_available =
+				modal_available && matches!(self.tab, 0 | 1);
+			for (index, (text, available)) in [
+				(
+					strings::commands::selection_mode(
+						&self.key_config,
+					),
+					selection_available,
+				),
+				(
+					strings::commands::selection_clear(
+						&self.key_config,
+					),
+					selection_available,
+				),
+				(
+					strings::commands::selection_all(
+						&self.key_config,
+					),
+					selection_available,
+				),
+				(
+					strings::commands::selection_item(
+						&self.key_config,
+					),
+					selection_available,
+				),
+				(
+					strings::commands::focus_next(&self.key_config),
+					modal_available,
+				),
+				(
+					strings::commands::focus_previous(
+						&self.key_config,
+					),
+					modal_available,
+				),
+				(
+					strings::commands::command_palette(
+						&self.key_config,
+					),
+					modal_available,
+				),
+				(
+					strings::commands::goto_prefix(&self.key_config),
+					modal_available,
+				),
+				(
+					strings::commands::action_prefix(
+						&self.key_config,
+					),
+					modal_available,
+				),
+			]
+			.into_iter()
+			.enumerate()
+			{
+				let command = CommandInfo::new(text, true, available);
+				res.push(if index == 0 {
+					command
+				} else {
+					command.hidden()
+				});
+			}
+		}
+
 		res
 	}
 
@@ -1255,29 +2231,39 @@ impl App {
 			horizontal: 1,
 		});
 
-		let mut tab_labels = vec![
-			Span::raw(strings::tab_status(&self.key_config)),
-			Span::raw(strings::tab_log(&self.key_config)),
-			Span::raw(strings::tab_files(&self.key_config)),
-			Span::raw(strings::tab_stashing(&self.key_config)),
-			Span::raw(strings::tab_stashes(&self.key_config)),
+		let mut tab_entries = vec![
+			(0, Span::raw(strings::tab_status(&self.key_config))),
+			(1, Span::raw(strings::tab_log(&self.key_config))),
+			(2, Span::raw(strings::tab_files(&self.key_config))),
+			(3, Span::raw(strings::tab_stashing(&self.key_config))),
+			(4, Span::raw(strings::tab_stashes(&self.key_config))),
 		];
 		// The rebase workspace appears once there is anything
 		// to show: a draft, an active session, or an outcome.
-		if self.rebase_service.borrow().exists() {
-			tab_labels.push(Span::raw(strings::tab_rebase(
-				&self.key_config,
-			)));
+		if self.key_config.is_modal()
+			|| self.rebase_service.borrow().exists()
+		{
+			tab_entries.push((
+				5,
+				Span::raw(strings::tab_rebase(&self.key_config)),
+			));
 		}
+		tab_entries.push((
+			6,
+			Span::raw(strings::tab_branches(&self.key_config)),
+		));
 		let divider = strings::tab_divider(&self.key_config);
 
 		// heuristic, since tui doesn't provide a way to know
 		// how much space is needed to draw a `Tabs`
-		let tabs_len: usize =
-			tab_labels.iter().map(Span::width).sum::<usize>()
-				+ tab_labels.len().saturating_sub(1)
-					* (divider.width() + DIVIDER_PAD_SPACES)
-				+ SIDE_PADS + MARGIN_LEFT_AND_RIGHT;
+		let tabs_len: usize = tab_entries
+			.iter()
+			.map(|(_, span)| span.width())
+			.sum::<usize>()
+			+ tab_entries.len().saturating_sub(1)
+				* (divider.width() + DIVIDER_PAD_SPACES)
+			+ SIDE_PADS
+			+ MARGIN_LEFT_AND_RIGHT;
 
 		let left_right = Layout::default()
 			.direction(Direction::Horizontal)
@@ -1291,9 +2277,20 @@ impl App {
 
 		let table_area = r; // use entire area to allow drawing the horizontal separator line
 		let text_area = left_right[1];
+		*self.tab_hit_areas.borrow_mut() = calculate_tab_hit_areas(
+			table_area,
+			&tab_entries,
+			divider.width(),
+		);
 
-		let tabs: Vec<Line> =
-			tab_labels.into_iter().map(Line::from).collect();
+		let selected_tab = tab_entries
+			.iter()
+			.position(|(tab, _)| *tab == self.tab)
+			.unwrap_or_default();
+		let tabs: Vec<Line> = tab_entries
+			.into_iter()
+			.map(|(_, label)| Line::from(label))
+			.collect();
 
 		f.render_widget(
 			Tabs::new(tabs)
@@ -1305,7 +2302,7 @@ impl App {
 				.style(self.theme.tab(false))
 				.highlight_style(self.theme.tab(true))
 				.divider(divider)
-				.select(self.tab),
+				.select(selected_tab),
 			table_area,
 		);
 
@@ -1321,4 +2318,40 @@ impl App {
 			text_area,
 		);
 	}
+}
+
+fn calculate_tab_hit_areas(
+	area: Rect,
+	tabs: &[(usize, Span<'_>)],
+	divider_width: usize,
+) -> Vec<(usize, Rect)> {
+	let mut hit_areas = Vec::new();
+	let mut x = area.x;
+	for (index, (tab, label)) in tabs.iter().enumerate() {
+		if x >= area.right() {
+			break;
+		}
+		x = x.saturating_add(1);
+		let width = u16::try_from(label.width())
+			.unwrap_or(u16::MAX)
+			.min(area.right().saturating_sub(x));
+		if width > 0 {
+			hit_areas.push((
+				*tab,
+				Rect {
+					x,
+					y: area.y,
+					width,
+					height: 1.min(area.height),
+				},
+			));
+		}
+		x = x.saturating_add(width);
+		if index + 1 < tabs.len() {
+			x = x.saturating_add(1).saturating_add(
+				u16::try_from(divider_width).unwrap_or(u16::MAX),
+			);
+		}
+	}
+	hit_areas
 }

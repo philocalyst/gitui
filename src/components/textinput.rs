@@ -654,6 +654,10 @@ impl DrawableComponent for TextInputComponent {
 }
 
 impl Component for TextInputComponent {
+	fn captures_input(&self) -> bool {
+		self.is_visible()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,

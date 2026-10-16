@@ -272,7 +272,35 @@ However, you can customize everything to your liking: See [Themes](THEMES.md).
 
 ## 11. <a name="bindings"></a> Key Bindings <small><sup>[Top ▲](#table-of-contents)</sup></small>
 
-The key bindings can be customized: See [Key Config](KEY_CONFIG.md) on how to set them to `vim`-like bindings.
+GitUI starts with a selection-first Helix-inspired keymap (`h j k l`, counts,
+selection, and key prefixes). `s` stages selected files or working-tree diff
+changes, `u` unstages from the staged pane, `c` opens the configured commit
+editor from any Status pane, and `:` opens a searchable command palette. Use
+`gitui --keymap legacy` for the classic arrow-key workflow. See
+[Key Config](KEY_CONFIG.md) for profile details and custom bindings, and the
+[modal workflow design](docs/design/modal-workflow.md) for selection, branch,
+and interactive rebase behavior. In Status and Branches, `Ctrl+T` switches the
+focused diff between native Review and exact Git Patch rows; `z` expands the
+diff and Esc restores the split layout. Revlog keeps a commit inspector beside
+the graph, with the selected commit's files and native diff available as you
+move through history. Read-only Review uses the selected native diff
+presentation. The Options panel chooses Inline suggestions or Plain unified
+rows. Both use the
+same native diff and hunk context; Inline suggestions pair related removed and
+added lines into one row, showing shared text once and both source line
+numbers. Historical Difftastic or Delta option values load as Inline
+suggestions.
+
+The commit log first loads the visible rows plus a bounded lookahead, then
+requests more history as the selection nears the loaded end. Its title shows
+how many commits are loaded, the key for loading older rows, and when another
+range is arriving. Commit IDs and metadata arrive separately and are cached,
+so the graph and selected-commit inspector fill in progressively. Full-history
+search walks the remaining commits only when requested, and Esc cancels that
+walk. File history loads around its visible range as well. In the Branches
+workspace, `+` loads 200 more commits without moving the selected row; `Ctrl+G`
+switches between the full comparison graph and the selected branch's
+contribution.
 
 ## 12. <a name="sponsoring"></a> Sponsoring <small><sup>[Top ▲](#table-of-contents)</sup></small>
 

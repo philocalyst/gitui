@@ -68,6 +68,7 @@ mod components;
 mod gitui;
 mod input;
 mod keys;
+mod modal;
 mod notify_mutex;
 mod options;
 mod popup_stack;
@@ -91,6 +92,11 @@ use asyncgit::{sync::RepoPath, AsyncGitNotification};
 use backtrace::Backtrace;
 use crossbeam_channel::{Receiver, Select};
 use crossterm::{
+	event::{
+		DisableMouseCapture, EnableMouseCapture,
+		KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+		PushKeyboardEnhancementFlags,
+	},
 	terminal::{
 		disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
 		LeaveAlternateScreen,
@@ -106,6 +112,7 @@ use std::{
 	io::{self, Stdout},
 	panic,
 	path::{Path, PathBuf},
+	sync::atomic::{AtomicBool, Ordering},
 	time::{Duration, Instant},
 };
 use ui::style::Theme;
@@ -114,6 +121,8 @@ type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
 static TICK_INTERVAL: Duration = Duration::from_secs(5);
 static SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+static KEYBOARD_ENHANCEMENTS_ACTIVE: AtomicBool =
+	AtomicBool::new(false);
 
 /// Events sent to the event-loop to wake up the UI.
 #[derive(Clone)]
@@ -135,6 +144,8 @@ pub enum SyntaxHighlightProgress {
 pub enum AsyncAppNotification {
 	///
 	SyntaxHighlighting(SyntaxHighlightProgress),
+	/// A native diff row-highlighting job completed and the view should redraw.
+	DiffHighlighting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,12 +182,12 @@ fn main() -> Result<()> {
 	asyncgit::register_tracing_logging();
 	ensure_valid_path(&cliargs.repo_path)?;
 
-	let key_config = KeyConfig::init(
+	let key_config = KeyConfig::init_with_keymap(
 		cliargs.key_bindings_path.as_ref(),
 		cliargs.key_symbols_path.as_ref(),
+		cliargs.keymap,
 	)
-	.map_err(|e| log_eprintln!("KeyConfig loading error: {e}"))
-	.unwrap_or_default();
+	.map_err(|e| anyhow!("KeyConfig loading error: {e}"))?;
 	let theme = Theme::init(&cliargs.theme);
 
 	setup_terminal()?;
@@ -210,6 +221,7 @@ fn main() -> Result<()> {
 		match quit_state {
 			QuitState::OpenSubmodule(p) => {
 				args = CliArgs {
+					keymap: args.keymap,
 					repo_path: p,
 					select_file: None,
 					theme: args.theme,
@@ -274,11 +286,37 @@ fn run_app(
 
 fn setup_terminal() -> Result<()> {
 	enable_raw_mode()?;
-	io::stdout().execute(EnterAlternateScreen)?;
+	if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
+		let _ = disable_raw_mode();
+		return Err(error.into());
+	}
+	if let Err(error) = io::stdout().execute(EnableMouseCapture) {
+		let _ = io::stdout().execute(LeaveAlternateScreen);
+		let _ = disable_raw_mode();
+		return Err(error.into());
+	}
+	if let Err(error) =
+		push_keyboard_enhancement_flags(&mut io::stdout())
+	{
+		let _ = io::stdout().execute(PopKeyboardEnhancementFlags);
+		let _ = io::stdout().execute(DisableMouseCapture);
+		let _ = io::stdout().execute(LeaveAlternateScreen);
+		let _ = disable_raw_mode();
+		return Err(error.into());
+	}
 	Ok(())
 }
 
 fn shutdown_terminal() {
+	if let Err(e) = pop_keyboard_enhancement_flags(&mut io::stdout())
+	{
+		log::error!("pop_keyboard_enhancement_flags failed:\n{e}");
+	}
+
+	if let Err(e) = io::stdout().execute(DisableMouseCapture) {
+		log::error!("disable_mouse_capture failed:\n{e}");
+	}
+
 	let leave_screen =
 		io::stdout().execute(LeaveAlternateScreen).map(|_f| ());
 
@@ -293,12 +331,42 @@ fn shutdown_terminal() {
 	}
 }
 
+pub(crate) const fn keyboard_enhancement_flags(
+) -> KeyboardEnhancementFlags {
+	KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+		.union(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+		.union(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS)
+		.union(
+			KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+		)
+}
+
+pub(crate) fn push_keyboard_enhancement_flags(
+	writer: &mut impl io::Write,
+) -> io::Result<()> {
+	writer.execute(PushKeyboardEnhancementFlags(
+		keyboard_enhancement_flags(),
+	))?;
+	KEYBOARD_ENHANCEMENTS_ACTIVE.store(true, Ordering::SeqCst);
+	Ok(())
+}
+
+pub(crate) fn pop_keyboard_enhancement_flags(
+	writer: &mut impl io::Write,
+) -> io::Result<()> {
+	if KEYBOARD_ENHANCEMENTS_ACTIVE.load(Ordering::SeqCst) {
+		writer.execute(PopKeyboardEnhancementFlags)?;
+		KEYBOARD_ENHANCEMENTS_ACTIVE.store(false, Ordering::SeqCst);
+	}
+	Ok(())
+}
+
 fn draw<B: ratatui::backend::Backend>(
 	terminal: &mut ratatui::Terminal<B>,
 	app: &App,
 ) -> Result<(), B::Error> {
 	if app.requires_redraw() {
-		terminal.clear()?;
+		clear_terminal_for_full_redraw(terminal)?;
 	}
 
 	terminal.draw(|f| {
@@ -308,6 +376,15 @@ fn draw<B: ratatui::backend::Backend>(
 	})?;
 
 	Ok(())
+}
+
+/// Clear terminal contents and invalidate Ratatui's previous frame without
+/// querying the cursor, which can race the input reader after an editor exits.
+fn clear_terminal_for_full_redraw<B: ratatui::backend::Backend>(
+	terminal: &mut ratatui::Terminal<B>,
+) -> Result<(), B::Error> {
+	let area = terminal.size()?.into();
+	terminal.resize(area)
 }
 
 fn ensure_valid_path(repo_path: &RepoPath) -> Result<()> {
@@ -348,7 +425,7 @@ fn select_event(
 		2 => oper.recv(rx_app).map(|e| {
 			QueueEvent::AsyncEvent(AsyncNotification::App(e))
 		}),
-		3 => oper.recv(rx_ticker).map(|_| QueueEvent::Notify),
+		3 => oper.recv(rx_ticker).map(|_| QueueEvent::Tick),
 		4 => oper.recv(rx_notify).map(|()| QueueEvent::Notify),
 		5 => oper.recv(rx_spinner).map(|_| QueueEvent::SpinnerUpdate),
 		_ => bail!("unknown select source"),
@@ -380,7 +457,7 @@ fn start_terminal(
 
 	let mut terminal = Terminal::new(backend)?;
 	terminal.hide_cursor()?;
-	terminal.clear()?;
+	clear_terminal_for_full_redraw(&mut terminal)?;
 
 	Ok(terminal)
 }
@@ -398,4 +475,137 @@ fn set_panic_handler() -> Result<()> {
 		.build_global()?;
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod terminal_redraw_tests {
+	use super::clear_terminal_for_full_redraw;
+	use ratatui::{
+		backend::{Backend, ClearType, TestBackend, WindowSize},
+		buffer::Cell,
+		layout::{Position, Size},
+		widgets::Paragraph,
+		Terminal,
+	};
+	use std::{convert::Infallible, io};
+
+	struct CursorQueryFailureBackend {
+		inner: TestBackend,
+	}
+
+	impl CursorQueryFailureBackend {
+		fn new(width: u16, height: u16) -> Self {
+			Self {
+				inner: TestBackend::new(width, height),
+			}
+		}
+	}
+
+	fn convert_infallible<T>(
+		result: Result<T, Infallible>,
+	) -> Result<T, io::Error> {
+		result.map_err(|never| match never {})
+	}
+
+	impl Backend for CursorQueryFailureBackend {
+		type Error = io::Error;
+
+		fn draw<'a, I>(
+			&mut self,
+			content: I,
+		) -> Result<(), Self::Error>
+		where
+			I: Iterator<Item = (u16, u16, &'a Cell)>,
+		{
+			convert_infallible(self.inner.draw(content))
+		}
+
+		fn flush(&mut self) -> Result<(), Self::Error> {
+			convert_infallible(self.inner.flush())
+		}
+
+		fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+			convert_infallible(self.inner.hide_cursor())
+		}
+
+		fn show_cursor(&mut self) -> Result<(), Self::Error> {
+			convert_infallible(self.inner.show_cursor())
+		}
+
+		fn get_cursor_position(
+			&mut self,
+		) -> Result<Position, Self::Error> {
+			Err(io::Error::other(
+				"cursor-position query must not be used during redraw",
+			))
+		}
+
+		fn set_cursor_position<P: Into<Position>>(
+			&mut self,
+			position: P,
+		) -> Result<(), Self::Error> {
+			convert_infallible(
+				self.inner.set_cursor_position(position),
+			)
+		}
+
+		fn clear(&mut self) -> Result<(), Self::Error> {
+			convert_infallible(self.inner.clear())
+		}
+
+		fn clear_region(
+			&mut self,
+			clear_type: ClearType,
+		) -> Result<(), Self::Error> {
+			convert_infallible(self.inner.clear_region(clear_type))
+		}
+
+		fn size(&self) -> Result<Size, Self::Error> {
+			convert_infallible(self.inner.size())
+		}
+
+		fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+			convert_infallible(self.inner.window_size())
+		}
+	}
+
+	#[test]
+	fn full_redraw_reset_restores_ui_without_querying_cursor() {
+		let mut terminal =
+			Terminal::new(CursorQueryFailureBackend::new(24, 3))
+				.unwrap();
+		terminal
+			.draw(|frame| {
+				frame.render_widget(
+					Paragraph::new("previous view"),
+					frame.area(),
+				);
+			})
+			.unwrap();
+
+		terminal.backend_mut().inner.clear().unwrap();
+		clear_terminal_for_full_redraw(&mut terminal).unwrap();
+		terminal
+			.draw(|frame| {
+				frame.render_widget(
+					Paragraph::new("restored interface"),
+					frame.area(),
+				);
+			})
+			.unwrap();
+
+		let buffer = terminal.backend().inner.buffer();
+		let rendered = (0..buffer.area.height)
+			.map(|y| {
+				(0..buffer.area.width)
+					.map(|x| buffer[(x, y)].symbol())
+					.collect::<String>()
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(
+			rendered.contains("restored interface"),
+			"{rendered}"
+		);
+	}
 }

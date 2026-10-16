@@ -50,7 +50,7 @@ struct LastResult<P, R> {
 
 ///
 pub struct AsyncDiff {
-	current: Arc<Mutex<Request<u64, FileDiff>>>,
+	current: Arc<Mutex<Request<Option<u64>, FileDiff>>>,
 	last: Arc<Mutex<Option<LastResult<DiffParams, FileDiff>>>>,
 	sender: Sender<AsyncGitNotification>,
 	pending: Arc<AtomicUsize>,
@@ -65,7 +65,7 @@ impl AsyncDiff {
 	) -> Self {
 		Self {
 			repo,
-			current: Arc::new(Mutex::new(Request(0, None))),
+			current: Arc::new(Mutex::new(Request(None, None))),
 			last: Arc::new(Mutex::new(None)),
 			sender: sender.clone(),
 			pending: Arc::new(AtomicUsize::new(0)),
@@ -105,11 +105,11 @@ impl AsyncDiff {
 		{
 			let mut current = self.current.lock()?;
 
-			if current.0 == hash {
+			if current.0 == Some(hash) {
 				return Ok(current.1.clone());
 			}
 
-			current.0 = hash;
+			current.0 = Some(hash);
 			current.1 = None;
 		}
 
@@ -133,20 +133,21 @@ impl AsyncDiff {
 			let notify = match notify {
 				Err(e) => {
 					log::error!("get_diff_helper error: {e}");
-					true
+					if let Err(clear_error) =
+						Self::clear_current_if_hash(
+							&arc_current,
+							hash,
+						) {
+						log::error!(
+							"could not clear failed diff request: {clear_error}"
+						);
+					}
+					false
 				}
 				Ok(notify) => notify,
 			};
 
-			arc_pending.fetch_sub(1, Ordering::Relaxed);
-
-			sender
-				.send(if notify {
-					AsyncGitNotification::Diff
-				} else {
-					AsyncGitNotification::FinishUnchanged
-				})
-				.expect("error sending diff");
+			Self::finish_request(&sender, &arc_pending, notify);
 		});
 
 		Ok(None)
@@ -158,7 +159,7 @@ impl AsyncDiff {
 		arc_last: &Arc<
 			Mutex<Option<LastResult<DiffParams, FileDiff>>>,
 		>,
-		arc_current: &Arc<Mutex<Request<u64, FileDiff>>>,
+		arc_current: &Arc<Mutex<Request<Option<u64>, FileDiff>>>,
 		hash: u64,
 	) -> Result<bool> {
 		let res = match params.diff_type {
@@ -191,7 +192,7 @@ impl AsyncDiff {
 		let mut notify = false;
 		{
 			let mut current = arc_current.lock()?;
-			if current.0 == hash {
+			if current.0 == Some(hash) {
 				current.1 = Some(res.clone());
 				notify = true;
 			}
@@ -214,8 +215,99 @@ impl AsyncDiff {
 
 	fn clear_current(&self) -> Result<()> {
 		let mut current = self.current.lock()?;
-		current.0 = 0;
+		current.0 = None;
 		current.1 = None;
 		Ok(())
+	}
+
+	fn clear_current_if_hash(
+		current: &Arc<Mutex<Request<Option<u64>, FileDiff>>>,
+		hash: u64,
+	) -> Result<()> {
+		let mut current = current.lock()?;
+		if current.0 == Some(hash) {
+			current.0 = None;
+			current.1 = None;
+		}
+		Ok(())
+	}
+
+	fn finish_request(
+		sender: &Sender<AsyncGitNotification>,
+		pending: &AtomicUsize,
+		notify: bool,
+	) {
+		pending.fetch_sub(1, Ordering::Relaxed);
+		let notification = if notify {
+			AsyncGitNotification::Diff
+		} else {
+			AsyncGitNotification::FinishUnchanged
+		};
+		if sender.send(notification).is_err() {
+			log::debug!(
+				"diff notification receiver closed before completion"
+			);
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::Duration;
+
+	#[test]
+	fn closed_receiver_is_a_cancelled_completion_and_clears_pending()
+	{
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		drop(receiver);
+		let pending = AtomicUsize::new(1);
+
+		AsyncDiff::finish_request(&sender, &pending, true);
+
+		assert_eq!(pending.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn failed_request_invalidation_does_not_clear_a_newer_request() {
+		let current = Arc::new(Mutex::new(Request(Some(17), None)));
+		AsyncDiff::clear_current_if_hash(&current, 16).unwrap();
+		assert_eq!(current.lock().unwrap().0, Some(17));
+
+		AsyncDiff::clear_current_if_hash(&current, 17).unwrap();
+		assert_eq!(current.lock().unwrap().0, None);
+	}
+
+	#[test]
+	fn failed_request_completes_unchanged_and_retries_only_when_requested(
+	) {
+		let directory = tempfile::tempdir().unwrap();
+		let repo_path: RepoPath =
+			directory.path().to_str().unwrap().into();
+		let (sender, receiver) = crossbeam_channel::unbounded();
+		let diff = AsyncDiff::new(repo_path, &sender);
+		let params = DiffParams {
+			path: String::from("missing.txt"),
+			diff_type: DiffType::WorkDir,
+			options: DiffOptions::default(),
+		};
+
+		assert!(diff.request(params.clone()).unwrap().is_none());
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::FinishUnchanged
+		);
+		assert!(!diff.is_pending());
+		assert!(receiver.try_recv().is_err());
+
+		// The failed request was invalidated, so an explicit retry starts
+		// one new worker and emits one completion without an automatic loop.
+		assert!(diff.request(params).unwrap().is_none());
+		assert_eq!(
+			receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+			AsyncGitNotification::FinishUnchanged
+		);
+		assert!(!diff.is_pending());
+		assert!(receiver.try_recv().is_err());
 	}
 }

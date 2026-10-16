@@ -55,6 +55,11 @@ impl ChangesComponent {
 		Ok(())
 	}
 
+	/// Keep the nested tree's loading view aligned with the async status scan.
+	pub const fn set_pending(&mut self, pending: bool) {
+		self.files.set_pending(pending);
+	}
+
 	///
 	pub fn selection(&self) -> Option<FileTreeItem> {
 		self.files.selection()
@@ -77,55 +82,69 @@ impl ChangesComponent {
 	}
 
 	fn index_add_remove(&self) -> Result<bool> {
-		if let Some(tree_item) = self.selection() {
-			if self.is_working_dir {
-				if let FileTreeItemKind::File(i) = tree_item.kind {
-					let path = Path::new(i.path.as_str());
-					match i.status {
-						StatusItemType::Deleted => {
-							sync::stage_addremoved(
-								&self.repo.borrow(),
-								path,
-							)?;
-						}
-						_ => sync::stage_add_file(
-							&self.repo.borrow(),
-							path,
-						)?,
-					}
-				} else {
-					let config =
-						self.options.borrow().status_show_untracked();
-
-					//TODO: check if we can handle the one file case with it as well
-					sync::stage_add_all(
-						&self.repo.borrow(),
-						tree_item.info.full_path.as_str(),
-						config,
-					)?;
-				}
-
-				//TODO: this might be slow in big repos,
-				// in theory we should be able to ask the tree structure
-				// if we are currently on a leaf or a lonely branch that
-				// would mean that after staging the workdir becomes empty
-				if sync::is_workdir_clean(
-					&self.repo.borrow(),
-					self.options.borrow().status_show_untracked(),
-				)? {
-					self.queue
-						.push(InternalEvent::StatusLastFileMoved);
-				}
-			} else {
-				// this is a staged entry, so lets unstage it
-				let path = tree_item.info.full_path.as_str();
-				sync::reset_stage(&self.repo.borrow(), path)?;
-			}
-
+		let marked =
+			self.files.selected_paths().cloned().collect::<Vec<_>>();
+		if marked.is_empty()
+			&& self.files.is_pending()
+			&& self.selection().is_some_and(|item| {
+				matches!(item.kind, FileTreeItemKind::Path(_))
+			}) {
+			self.queue.push(InternalEvent::ShowErrorMsg(
+				"Folder stage or unstage is unavailable while the status scan is loading".to_string(),
+			));
 			return Ok(true);
 		}
+		let files = if marked.is_empty() {
+			self.files.selection_file_items()
+		} else {
+			marked
+				.iter()
+				.map(|path| {
+					self.files
+						.status_for_path(path)
+						.map(|status| StatusItem {
+							path: path.clone(),
+							status,
+						})
+						.ok_or_else(|| {
+							anyhow::anyhow!(
+							"selected file is no longer in the status list: {path:?}"
+						)
+						})
+				})
+				.collect::<Result<Vec<_>>>()?
+		};
+		if files.is_empty() {
+			return Ok(false);
+		}
 
-		Ok(false)
+		if self.is_working_dir {
+			let mut staged_paths = Vec::new();
+			for file in &files {
+				if file.status == StatusItemType::Deleted {
+					sync::stage_addremoved(
+						&self.repo.borrow(),
+						Path::new(&file.path),
+					)?;
+				} else {
+					staged_paths.push(file.path.as_str());
+				}
+			}
+			if !staged_paths.is_empty() {
+				sync::stage_add_paths(
+					&self.repo.borrow(),
+					&staged_paths,
+				)?;
+			}
+		} else {
+			let paths = files
+				.iter()
+				.map(|file| file.path.as_str())
+				.collect::<Vec<_>>();
+			sync::reset_stage_paths(&self.repo.borrow(), &paths)?;
+		}
+
+		Ok(true)
 	}
 
 	fn index_add_all(&self) -> Result<()> {
@@ -147,11 +166,21 @@ impl ChangesComponent {
 	}
 
 	fn dispatch_reset_workdir(&self) -> bool {
+		let selected =
+			self.files.selected_paths().cloned().collect::<Vec<_>>();
+		if selected.len() > 1 {
+			self.queue.push(InternalEvent::ShowErrorMsg(
+				"reset is disabled for multiple selected files; select one file or clear selection".to_string(),
+			));
+			return true;
+		}
 		if let Some(tree_item) = self.selection() {
+			let path = selected
+				.first()
+				.cloned()
+				.unwrap_or(tree_item.info.full_path);
 			self.queue.push(InternalEvent::ConfirmAction(
-				Action::Reset(ResetItem {
-					path: tree_item.info.full_path,
-				}),
+				Action::Reset(ResetItem { path }),
 			));
 
 			return true;
@@ -160,16 +189,15 @@ impl ChangesComponent {
 	}
 
 	fn add_to_ignore(&self) -> bool {
-		if let Some(tree_item) = self.selection() {
-			if let Err(e) = sync::add_to_ignore(
-				&self.repo.borrow(),
-				&tree_item.info.full_path,
-			) {
+		let selected = self.files.selected_paths().next().cloned();
+		if let Some(path) = selected.or_else(|| {
+			self.selection().map(|item| item.info.full_path)
+		}) {
+			if let Err(e) =
+				sync::add_to_ignore(&self.repo.borrow(), &path)
+			{
 				self.queue.push(InternalEvent::ShowErrorMsg(
-					format!(
-						"ignore error:\n{}\nfile:\n{:?}",
-						e, tree_item.info.full_path
-					),
+					format!("ignore error:\n{e}\nfile:\n{path:?}"),
 				));
 			} else {
 				self.queue
@@ -200,6 +228,10 @@ impl Component for ChangesComponent {
 		self.files.commands(out, force_all);
 
 		let some_selection = self.selection().is_some();
+		let can_index_selection = some_selection
+			&& (!self.files.is_pending()
+				|| self.files.is_file_selected()
+				|| self.files.has_selection());
 
 		if self.is_working_dir {
 			out.push(CommandInfo::new(
@@ -209,8 +241,8 @@ impl Component for ChangesComponent {
 			));
 			out.push(CommandInfo::new(
 				strings::commands::stage_item(&self.key_config),
-				true,
-				some_selection && self.focused(),
+				can_index_selection,
+				can_index_selection && self.focused(),
 			));
 			out.push(CommandInfo::new(
 				strings::commands::reset_item(&self.key_config),
@@ -225,8 +257,8 @@ impl Component for ChangesComponent {
 		} else {
 			out.push(CommandInfo::new(
 				strings::commands::unstage_item(&self.key_config),
-				true,
-				some_selection && self.focused(),
+				can_index_selection,
+				can_index_selection && self.focused(),
 			));
 			out.push(CommandInfo::new(
 				strings::commands::unstage_all(&self.key_config),
@@ -245,7 +277,21 @@ impl Component for ChangesComponent {
 
 		if self.focused() {
 			if let Event::Key(e) = ev {
-				return if key_match(
+				return if !self.is_working_dir
+					&& key_match(
+						e,
+						self.key_config.keys.status_unstage_item,
+					) {
+					try_or_popup!(
+						self,
+						"unstaging error:",
+						self.index_add_remove()
+					);
+					self.queue.push(InternalEvent::Update(
+						NeedsUpdate::ALL,
+					));
+					Ok(EventState::Consumed)
+				} else if key_match(
 					e,
 					self.key_config.keys.stage_unstage_item,
 				) {
@@ -288,6 +334,12 @@ impl Component for ChangesComponent {
 				) && self.is_working_dir
 					&& !self.is_empty()
 				{
+					if self.files.selected_paths().count() > 1 {
+						self.queue.push(InternalEvent::ShowErrorMsg(
+							"ignore is disabled for multiple selected files; select one file or clear selection".to_string(),
+						));
+						return Ok(EventState::Consumed);
+					}
 					Ok(self.add_to_ignore().into())
 				} else {
 					Ok(EventState::NotConsumed)
@@ -300,6 +352,12 @@ impl Component for ChangesComponent {
 
 	fn focused(&self) -> bool {
 		self.files.focused()
+	}
+
+	fn selection_status(
+		&self,
+	) -> Option<crate::components::SelectionStatus> {
+		self.files.selection_status()
 	}
 
 	fn focus(&mut self, focus: bool) {
@@ -317,5 +375,223 @@ impl Component for ChangesComponent {
 	fn show(&mut self) -> Result<()> {
 		self.files.show()?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		app::Environment,
+		keys::{KeyConfig, Keymap},
+	};
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+	use std::{fs, path::Path as FsPath, process::Command, rc::Rc};
+
+	fn key(code: KeyCode) -> Event {
+		Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+	}
+
+	fn cached_paths(repo_path: &FsPath) -> Vec<Vec<u8>> {
+		let output = Command::new("git")
+			.arg("diff")
+			.arg("--cached")
+			.arg("--name-only")
+			.arg("-z")
+			.current_dir(repo_path)
+			.output()
+			.unwrap();
+		assert!(output.status.success());
+		output
+			.stdout
+			.split(|byte| *byte == 0)
+			.filter(|path| !path.is_empty())
+			.map(<[u8]>::to_vec)
+			.collect()
+	}
+
+	fn path_bytes(
+		paths: impl IntoIterator<Item = String>,
+	) -> Vec<Vec<u8>> {
+		let mut paths = paths
+			.into_iter()
+			.map(String::into_bytes)
+			.collect::<Vec<_>>();
+		paths.sort();
+		paths
+	}
+
+	#[test]
+	fn selected_exact_paths_stage_and_unstage_without_touching_glob_sibling(
+	) {
+		let (temp, _repo) = git2_testing::repo_init_empty();
+		let paths = [
+			"[brackets].txt",
+			"file*.txt",
+			"file?.txt",
+			"fileX.txt",
+			"line\nname.txt",
+		];
+		let mut paths = paths
+			.iter()
+			.map(|path| (*path).to_string())
+			.collect::<Vec<_>>();
+		paths.sort();
+		for path in &paths {
+			fs::write(temp.path().join(path), "content").unwrap();
+		}
+		let statuses = paths
+			.iter()
+			.map(|path| StatusItem {
+				path: path.clone(),
+				status: StatusItemType::New,
+			})
+			.collect::<Vec<_>>();
+
+		let mut env = Environment::test_env();
+		env.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		env.repo.replace(temp.path().to_path_buf().into());
+		let mut workdir =
+			ChangesComponent::new(&env, "workdir", true, true);
+		workdir.set_items(&statuses).unwrap();
+		workdir.event(&key(KeyCode::Char('u'))).unwrap();
+		assert!(cached_paths(temp.path()).is_empty());
+		for event in [
+			key(KeyCode::Char('x')),
+			key(KeyCode::Char('j')),
+			key(KeyCode::Char('x')),
+			key(KeyCode::Enter),
+		] {
+			workdir.event(&event).unwrap();
+		}
+		assert!(
+			cached_paths(temp.path()).is_empty(),
+			"Enter must not stage marked files in the worktree pane"
+		);
+		workdir.event(&key(KeyCode::Char('s'))).unwrap();
+		let selected = workdir
+			.files
+			.selected_paths()
+			.cloned()
+			.collect::<Vec<_>>();
+		assert_eq!(selected.len(), 2);
+		assert_eq!(
+			cached_paths(temp.path()),
+			path_bytes(selected.clone())
+		);
+		assert!(!cached_paths(temp.path())
+			.iter()
+			.any(|path| path == b"fileX.txt"));
+
+		// Stage every sibling, then ensure Enter does not unstage the marked
+		// paths. Helix's explicit `u` action should unstage only those paths.
+		for path in &paths {
+			sync::stage_add_file(&env.repo.borrow(), Path::new(path))
+				.unwrap();
+		}
+		let staged_statuses = paths
+			.iter()
+			.map(|path| StatusItem {
+				path: path.clone(),
+				status: StatusItemType::New,
+			})
+			.collect::<Vec<_>>();
+		let mut index =
+			ChangesComponent::new(&env, "index", true, false);
+		index.set_items(&staged_statuses).unwrap();
+		for event in [
+			key(KeyCode::Char('x')),
+			key(KeyCode::Char('j')),
+			key(KeyCode::Char('x')),
+			key(KeyCode::Enter),
+		] {
+			index.event(&event).unwrap();
+		}
+		assert_eq!(
+			cached_paths(temp.path()),
+			path_bytes(paths.clone())
+		);
+		index.event(&key(KeyCode::Char('u'))).unwrap();
+		let remaining = paths.into_iter().skip(2).collect::<Vec<_>>();
+		assert_eq!(cached_paths(temp.path()), path_bytes(remaining));
+	}
+
+	#[test]
+	fn literal_folder_selection_stages_and_unstages_only_its_descendants(
+	) {
+		let (temp, _repo) = git2_testing::repo_init_empty();
+		let folder_file = "[x]/inside.txt";
+		let sibling_file = "x/sibling.txt";
+		for path in [folder_file, sibling_file] {
+			fs::create_dir_all(
+				temp.path().join(path).parent().unwrap(),
+			)
+			.unwrap();
+			fs::write(temp.path().join(path), "changed").unwrap();
+		}
+		let statuses = [folder_file, sibling_file]
+			.into_iter()
+			.map(|path| StatusItem {
+				path: path.to_string(),
+				status: StatusItemType::New,
+			})
+			.collect::<Vec<_>>();
+
+		let mut env = Environment::test_env();
+		env.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		env.repo.replace(temp.path().to_path_buf().into());
+		let mut workdir =
+			ChangesComponent::new(&env, "workdir", true, true);
+		workdir.set_items(&statuses).unwrap();
+		assert_eq!(
+			workdir.selection().unwrap().info.full_path,
+			"[x]"
+		);
+		workdir.set_pending(true);
+		workdir.event(&key(KeyCode::Char('s'))).unwrap();
+		assert!(
+			cached_paths(temp.path()).is_empty(),
+			"cursor-folder staging must wait for the full status scan"
+		);
+		workdir.set_pending(false);
+		workdir.event(&key(KeyCode::Char('s'))).unwrap();
+		assert_eq!(
+			cached_paths(temp.path()),
+			path_bytes([folder_file.into()])
+		);
+
+		// Stage the similarly named sibling as well, then unstage the selected
+		// literal folder. Its component path must not match the `x` directory.
+		sync::stage_add_file(
+			&env.repo.borrow(),
+			Path::new(sibling_file),
+		)
+		.unwrap();
+		let staged_statuses = statuses
+			.iter()
+			.map(|item| StatusItem {
+				path: item.path.clone(),
+				status: StatusItemType::Modified,
+			})
+			.collect::<Vec<_>>();
+		let mut index =
+			ChangesComponent::new(&env, "index", true, false);
+		index.set_items(&staged_statuses).unwrap();
+		assert_eq!(index.selection().unwrap().info.full_path, "[x]");
+		index.set_pending(true);
+		index.event(&key(KeyCode::Char('u'))).unwrap();
+		assert_eq!(
+			cached_paths(temp.path()),
+			path_bytes([folder_file.into(), sibling_file.into()]),
+			"cursor-folder unstaging must wait for the full status scan"
+		);
+		index.set_pending(false);
+		index.event(&key(KeyCode::Char('u'))).unwrap();
+		assert_eq!(
+			cached_paths(temp.path()),
+			path_bytes([sibling_file.into()])
+		);
 	}
 }

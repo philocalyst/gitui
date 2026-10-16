@@ -118,6 +118,34 @@ impl ItemBatch {
 		self.items.iter()
 	}
 
+	/// Read an entry by its stable index in the original commit list.
+	pub fn get_at(&self, index: usize) -> Option<&LogEntry> {
+		let relative = index.checked_sub(self.index_offset())?;
+		self.items.get(relative)
+	}
+
+	/// Number of metadata rows currently cached in this contiguous window.
+	pub const fn len(&self) -> usize {
+		self.items.len()
+	}
+
+	/// Whether the metadata window is empty.
+	pub const fn is_empty(&self) -> bool {
+		self.items.is_empty()
+	}
+
+	/// Update cached row highlighting without replacing metadata.
+	pub fn set_highlights(
+		&mut self,
+		highlighted: Option<&IndexSet<CommitId>>,
+	) {
+		self.highlighting = highlighted.is_some();
+		for entry in &mut self.items {
+			entry.highlighted = highlighted
+				.is_some_and(|ids| ids.contains(&entry.id));
+		}
+	}
+
 	/// clear current list of items
 	pub fn clear(&mut self) {
 		self.items.clear();

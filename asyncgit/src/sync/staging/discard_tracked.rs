@@ -1,10 +1,16 @@
-use super::{apply_selection, load_file};
+use super::{
+	apply_selection_with_pairs, load_file, validate_selected_pairs,
+	DiffLineReplacement,
+};
 use crate::{
 	error::Result,
 	sync::{
-		diff::DiffLinePosition, patches::get_file_diff_patch,
-		patches::patch_get_hunklines, repository::repo,
-		utils::repo_write_file, RepoPath,
+		diff::{DiffLinePosition, FileDiff},
+		patches::get_file_diff_patch,
+		patches::patch_get_hunklines,
+		repository::repo,
+		utils::repo_write_file,
+		RepoPath,
 	},
 };
 use scopetime::scope_time;
@@ -15,9 +21,57 @@ pub fn discard_lines(
 	file_path: &str,
 	lines: &[DiffLinePosition],
 ) -> Result<()> {
+	discard_lines_inner(repo_path, file_path, lines, &[], None)
+}
+
+pub fn discard_lines_checked(
+	repo_path: &RepoPath,
+	file_path: &str,
+	lines: &[DiffLinePosition],
+	expected_diff: &FileDiff,
+) -> Result<()> {
+	discard_lines_inner(
+		repo_path,
+		file_path,
+		lines,
+		&[],
+		Some(expected_diff),
+	)
+}
+
+/// Discard explicitly paired compact replacement rows while preserving the
+/// current file's original line ordering.
+pub fn discard_lines_with_pairs_checked(
+	repo_path: &RepoPath,
+	file_path: &str,
+	lines: &[DiffLinePosition],
+	pairs: &[DiffLineReplacement],
+	expected_diff: &FileDiff,
+) -> Result<()> {
+	discard_lines_inner(
+		repo_path,
+		file_path,
+		lines,
+		pairs,
+		Some(expected_diff),
+	)
+}
+
+fn discard_lines_inner(
+	repo_path: &RepoPath,
+	file_path: &str,
+	lines: &[DiffLinePosition],
+	pairs: &[DiffLineReplacement],
+	expected_diff: Option<&FileDiff>,
+) -> Result<()> {
 	scope_time!("discard_lines");
 
 	if lines.is_empty() {
+		if !pairs.is_empty() {
+			return Err(crate::error::Error::Generic(String::from(
+				"replacement pairs require selected diff rows",
+			)));
+		}
 		return Ok(());
 	}
 
@@ -30,11 +84,34 @@ pub fn discard_lines(
 		let patch =
 			get_file_diff_patch(&repo, file_path, false, false)?;
 		let hunks = patch_get_hunklines(&patch)?;
+		if let Some(expected_diff) = expected_diff {
+			super::stage_tracked::validate_selected_lines(
+				lines, &hunks,
+			)?;
+			if !pairs.is_empty() {
+				validate_selected_pairs(lines, pairs, &hunks)?;
+			}
+			super::stage_tracked::validate_selected_content(
+				expected_diff,
+				lines,
+				&hunks,
+			)?;
+		}
 
 		let working_content = load_file(&repo, file_path)?;
-		let old_lines = working_content.lines().collect::<Vec<_>>();
+		if let Some(expected_diff) = expected_diff {
+			validate_working_lines(
+				expected_diff,
+				lines,
+				&working_content,
+			)?;
+		}
+		let old_lines =
+			working_content.split_inclusive('\n').collect::<Vec<_>>();
 
-		apply_selection(lines, &hunks, &old_lines, false, true)?
+		apply_selection_with_pairs(
+			lines, pairs, &hunks, &old_lines, false, true,
+		)?
 	};
 
 	repo_write_file(&repo, file_path, new_content.as_str())?;
@@ -42,10 +119,87 @@ pub fn discard_lines(
 	Ok(())
 }
 
+fn validate_working_lines(
+	expected_diff: &FileDiff,
+	lines: &[DiffLinePosition],
+	working_content: &str,
+) -> Result<()> {
+	let working_lines =
+		working_content.split_inclusive('\n').collect::<Vec<_>>();
+	for selected in lines {
+		let Some(new_line_number) = selected.new_lineno else {
+			continue;
+		};
+		let expected = expected_diff
+			.hunks
+			.iter()
+			.flat_map(|hunk| &hunk.lines)
+			.find(|line| {
+				line.position == *selected
+					&& line.line_type
+						== crate::sync::diff::DiffLineType::Add
+			});
+		let actual = usize::try_from(new_line_number)
+			.ok()
+			.and_then(|line| line.checked_sub(1))
+			.and_then(|line| working_lines.get(line));
+		let matches_source = match (expected, actual) {
+			(Some(expected), Some(actual)) => {
+				expected.content.as_ref()
+					== actual.trim_end_matches('\n')
+			}
+			_ => false,
+		};
+		if !matches_source {
+			return Err(crate::error::Error::Generic(String::from(
+				"diff changed since selection; refresh and retry",
+			)));
+		}
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod test {
 	use super::*;
-	use crate::sync::tests::{repo_init, write_commit_file};
+	use crate::sync::{
+		diff::get_diff,
+		tests::{repo_init, write_commit_file},
+	};
+	use std::fs;
+
+	#[test]
+	fn checked_discard_rejects_same_coordinate_replacement() {
+		let (repo_path, repo) = repo_init().unwrap();
+		let repo_path: &RepoPath =
+			&repo_path.path().to_str().unwrap().into();
+		write_commit_file(
+			&repo,
+			"test.txt",
+			"one\ntwo\nthree\n",
+			"c1",
+		);
+		let working = repo.path().parent().unwrap().join("test.txt");
+		fs::write(&working, "one\ndisplayed\nthree\n").unwrap();
+		let displayed =
+			get_diff(repo_path, "test.txt", false, None).unwrap();
+		fs::write(&working, "one\nreplacement\nthree\n").unwrap();
+
+		assert!(discard_lines_checked(
+			repo_path,
+			"test.txt",
+			&[DiffLinePosition {
+				old_lineno: None,
+				new_lineno: Some(2),
+			}],
+			&displayed,
+		)
+		.is_err());
+		assert_eq!(
+			fs::read_to_string(working).unwrap(),
+			"one\nreplacement\nthree\n"
+		);
+	}
 
 	#[test]
 	fn test_discard() {

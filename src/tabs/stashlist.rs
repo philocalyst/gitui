@@ -3,6 +3,7 @@ use crate::{
 	components::{
 		visibility_blocking, CommandBlocking, CommandInfo,
 		CommitList, Component, DrawableComponent, EventState,
+		SelectionStatus,
 	},
 	keys::{key_match, SharedKeyConfig},
 	popups::InspectCommitOpen,
@@ -47,6 +48,10 @@ impl StashList {
 	}
 
 	fn apply_stash(&self) {
+		if self.modal_selection_blocks_action() {
+			self.report_marked_stash_action();
+			return;
+		}
 		if let Some(e) = self.list.selected_entry() {
 			match sync::stash_apply(&self.repo.borrow(), e.id, false)
 			{
@@ -63,6 +68,10 @@ impl StashList {
 	}
 
 	fn drop_stash(&self) {
+		if self.modal_selection_blocks_action() {
+			self.report_marked_stash_action();
+			return;
+		}
 		if self.list.marked_count() > 0 {
 			self.queue.push(InternalEvent::ConfirmAction(
 				Action::StashDrop(self.list.marked_commits()),
@@ -75,11 +84,25 @@ impl StashList {
 	}
 
 	fn pop_stash(&self) {
+		if self.modal_selection_blocks_action() {
+			self.report_marked_stash_action();
+			return;
+		}
 		if let Some(e) = self.list.selected_entry() {
 			self.queue.push(InternalEvent::ConfirmAction(
 				Action::StashPop(e.id),
 			));
 		}
+	}
+
+	fn modal_selection_blocks_action(&self) -> bool {
+		self.key_config.is_modal() && self.list.marked_count() > 0
+	}
+
+	fn report_marked_stash_action(&self) {
+		self.queue.push(InternalEvent::ShowErrorMsg(
+			"Clear the stash selection before this action".to_owned(),
+		));
 	}
 
 	fn inspect(&self) {
@@ -147,6 +170,14 @@ impl DrawableComponent for StashList {
 }
 
 impl Component for StashList {
+	fn selection_status(&self) -> Option<SelectionStatus> {
+		if self.visible && self.key_config.is_modal() {
+			self.list.selection_status()
+		} else {
+			None
+		}
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -157,14 +188,16 @@ impl Component for StashList {
 
 			let selection_valid =
 				self.list.selected_entry().is_some();
+			let single_stash_action_valid = selection_valid
+				&& !self.modal_selection_blocks_action();
 			out.push(CommandInfo::new(
 				strings::commands::stashlist_pop(&self.key_config),
-				selection_valid,
+				single_stash_action_valid,
 				true,
 			));
 			out.push(CommandInfo::new(
 				strings::commands::stashlist_apply(&self.key_config),
-				selection_valid,
+				single_stash_action_valid,
 				true,
 			));
 			out.push(CommandInfo::new(
@@ -172,7 +205,7 @@ impl Component for StashList {
 					&self.key_config,
 					self.list.marked_count(),
 				),
-				selection_valid,
+				single_stash_action_valid,
 				true,
 			));
 			out.push(CommandInfo::new(

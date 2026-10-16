@@ -41,6 +41,7 @@ mod commit_details;
 mod commitlist;
 mod cred;
 mod diff;
+pub mod diff_preview;
 pub mod rebase;
 mod revision_files;
 mod status_tree;
@@ -55,6 +56,7 @@ pub use commit_details::CommitDetailsComponent;
 pub use commitlist::CommitList;
 pub use cred::CredComponent;
 pub use diff::DiffComponent;
+pub use diff_preview::DiffPreviewController;
 pub use rebase::{rail_items, Inspector, Rail};
 pub use revision_files::RevisionFilesComponent;
 pub use syntax_text::SyntaxTextComponent;
@@ -112,12 +114,13 @@ macro_rules! draw_popups {
     ($self:ident, [$($element:ident),+]) => {
         fn draw_popups(& $self, f: &mut Frame) -> Result<()>{
             //TODO: move the layout part out and feed it into `draw_popups`
+            let modal_status_height = u16::from($self.key_config.is_modal());
             let size = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
                     Constraint::Min(1),
-                    Constraint::Length($self.cmdbar.borrow().height()),
+                    Constraint::Length($self.cmdbar.borrow().height() + modal_status_height),
                 ]
                 .as_ref(),
             )
@@ -135,6 +138,12 @@ macro_rules! draw_popups {
 #[macro_export]
 macro_rules! setup_popups {
     ($self:ident, [$($element:ident),+]) => {
+        fn popup_components_mut(&mut $self) -> Vec<&mut dyn $crate::components::Component> {
+            vec![
+                $(&mut $self.$element,)+
+            ]
+        }
+
         $crate::any_popup_visible!($self, [$($element),+]);
         $crate::draw_popups!($self, [ $($element),+ ]);
     };
@@ -218,10 +227,18 @@ pub trait DrawableComponent {
 }
 
 ///
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EventState {
 	Consumed,
 	NotConsumed,
+}
+
+/// The selected target of the focused pane, shown in the modal status line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionStatus {
+	pub extending: bool,
+	pub count: usize,
+	pub unit: &'static str,
 }
 
 #[derive(Copy, Clone)]
@@ -257,6 +274,21 @@ pub trait Component {
 
 	///
 	fn event(&mut self, ev: &Event) -> Result<EventState>;
+
+	/// Focused text editors own every printable key, including modal prefixes.
+	fn captures_input(&self) -> bool {
+		false
+	}
+
+	/// Report selection from the focused child, or None for a hidden pane.
+	fn selection_status(&self) -> Option<SelectionStatus> {
+		None
+	}
+
+	/// Replace generic modal hints when the focused view has different controls.
+	fn modal_status_hint(&self) -> Option<String> {
+		None
+	}
 
 	///
 	fn focused(&self) -> bool {

@@ -1,3 +1,5 @@
+pub mod diff_highlight;
+pub mod diff_presentation;
 mod reflow;
 mod scrollbar;
 mod scrolllist;

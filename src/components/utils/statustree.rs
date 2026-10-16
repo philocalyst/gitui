@@ -45,6 +45,21 @@ impl SelectionChange {
 }
 
 impl StatusTree {
+	/// Return the current cursor index in the flattened tree.
+	pub const fn selection_index(&self) -> Option<usize> {
+		self.selection
+	}
+
+	/// Return the indices that can be reached by the cursor while respecting
+	/// collapsed folders.
+	pub fn visible_selection_indices(
+		&self,
+	) -> impl Iterator<Item = usize> + '_ {
+		self.available_selections
+			.iter()
+			.copied()
+			.filter(|index| self.is_visible_index(*index))
+	}
 	/// update tree with a new list, try to retain selection and collapse states
 	pub fn update(&mut self, list: &[StatusItem]) -> Result<()> {
 		let last_collapsed = self.all_collapsed();
@@ -951,5 +966,17 @@ mod tests {
 
 		assert!(res.move_selection(MoveSelection::Left)); // jump to 0
 		assert_eq!(res.selection, Some(0));
+	}
+
+	#[test]
+	fn visible_selection_indices_skip_collapsed_descendants() {
+		let mut tree = StatusTree::default();
+		tree.update(&string_vec_to_status(&["a/b", "a/c", "d"]))
+			.unwrap();
+		tree.collapse("a", 0);
+		assert_eq!(
+			tree.visible_selection_indices().collect::<Vec<_>>(),
+			vec![0, 3]
+		);
 	}
 }

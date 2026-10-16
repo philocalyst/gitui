@@ -1,7 +1,7 @@
 use crate::notify_mutex::NotifiableMutex;
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use crossterm::event::{self, Event, Event::Key, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind};
 use std::{
 	sync::{
 		atomic::{AtomicBool, Ordering},
@@ -99,6 +99,13 @@ impl Input {
 		}
 	}
 
+	fn should_forward_event(event: &Event) -> bool {
+		!matches!(
+			event,
+			Event::Key(key) if key.kind == KeyEventKind::Release
+		)
+	}
+
 	fn input_loop(
 		arc_desired: &Arc<NotifiableMutex<bool>>,
 		arc_current: &Arc<AtomicBool>,
@@ -115,11 +122,10 @@ impl Input {
 				arc_current.store(true, Ordering::Relaxed);
 
 				if let Some(e) = Self::poll(poll_duration)? {
-					// windows send key release too, only process key press
-					if let Key(key) = e {
-						if key.kind != KeyEventKind::Press {
-							continue;
-						}
+					// Ignore release events while preserving native repeats so
+					// the App router can repeat navigation only.
+					if !Self::should_forward_event(&e) {
+						continue;
 					}
 
 					tx.send(InputEvent::Input(e))?;
@@ -142,5 +148,33 @@ impl Input {
 				arc_desired.wait(true);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+	fn key_event(kind: KeyEventKind) -> Event {
+		Event::Key(KeyEvent::new_with_kind(
+			KeyCode::Char('j'),
+			KeyModifiers::NONE,
+			kind,
+		))
+	}
+
+	#[test]
+	fn input_transport_drops_releases_but_forwards_press_and_repeat()
+	{
+		assert!(Input::should_forward_event(&key_event(
+			KeyEventKind::Press
+		)));
+		assert!(Input::should_forward_event(&key_event(
+			KeyEventKind::Repeat
+		)));
+		assert!(!Input::should_forward_event(&key_event(
+			KeyEventKind::Release
+		)));
 	}
 }

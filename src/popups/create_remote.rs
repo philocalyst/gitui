@@ -51,6 +51,10 @@ impl DrawableComponent for CreateRemotePopup {
 }
 
 impl Component for CreateRemotePopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.input.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,

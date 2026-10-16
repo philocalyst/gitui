@@ -57,8 +57,8 @@ pub use commit_filter::{
 };
 pub use commit_revert::{commit_revert, revert_commit, revert_head};
 pub use commits_info::{
-	commit_parent, get_commit_info, get_commits_info, CommitId,
-	CommitInfo,
+	commit_parent, get_commit_info, get_commits_info,
+	get_commits_info_from_repo, CommitId, CommitInfo,
 };
 pub use config::{
 	get_config_string, untracked_files_config,
@@ -71,7 +71,10 @@ pub use hooks::{
 	hooks_pre_push, hooks_prepare_commit_msg, HookResult,
 	PrePushTarget, PrepareCommitMsgSource,
 };
-pub use hunks::{reset_hunk, stage_hunk, unstage_hunk};
+pub use hunks::{
+	reset_hunk, reset_hunk_checked, stage_file_checked, stage_hunk,
+	stage_hunk_checked, unstage_hunk, unstage_hunk_checked,
+};
 pub use ignore::add_to_ignore;
 pub use logwalker::{LogWalker, LogWalkerWithoutFilter, WalkEntry};
 pub use merge::{
@@ -88,9 +91,17 @@ pub use remotes::{
 };
 pub(crate) use repository::{gix_repo, repo};
 pub use repository::{RepoPath, RepoPathRef};
-pub use reset::{reset_repo, reset_stage, reset_workdir};
+pub use reset::{
+	reset_repo, reset_stage, reset_stage_paths, reset_workdir,
+	reset_workdir_path, stage_add_paths,
+};
 pub use reword::reword;
-pub use staging::{discard_lines, stage_lines};
+pub use staging::{
+	discard_lines, discard_lines_checked,
+	discard_lines_with_pairs_checked, stage_lines,
+	stage_lines_checked, stage_lines_with_pairs_checked,
+	DiffLineReplacement,
+};
 pub use stash::{
 	get_stashes, stash_apply, stash_drop, stash_pop, stash_save,
 };

@@ -112,6 +112,7 @@ pub fn get_compare_commits_diff(
 		opts.interhunk_lines(options.interhunk_lines);
 	}
 	if let Some(p) = &pathspec {
+		opts.disable_pathspec_match(true);
 		opts.pathspec(p.clone());
 	}
 

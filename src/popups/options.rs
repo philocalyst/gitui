@@ -12,7 +12,9 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::sync::ShowUntrackedFilesConfig;
-use crossterm::event::Event;
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::{
 	layout::{Alignment, Rect},
 	style::{Modifier, Style},
@@ -27,6 +29,7 @@ pub enum AppOption {
 	DiffIgnoreWhitespaces,
 	DiffContextLines,
 	DiffInterhunkLines,
+	DiffPreviewRenderer,
 }
 
 pub struct OptionsPopup {
@@ -36,6 +39,7 @@ pub struct OptionsPopup {
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
 	theme: SharedTheme,
+	content_area: std::cell::Cell<Rect>,
 }
 
 impl OptionsPopup {
@@ -48,6 +52,7 @@ impl OptionsPopup {
 			key_config: env.key_config.clone(),
 			options: env.options.clone(),
 			theme: env.theme.clone(),
+			content_area: std::cell::Cell::new(Rect::default()),
 		}
 	}
 
@@ -99,6 +104,22 @@ impl OptionsPopup {
 			&diff.interhunk_lines.to_string(),
 			self.is_select(AppOption::DiffInterhunkLines),
 		);
+		let renderer =
+			match self.options.borrow().diff_preview_preference() {
+				crate::options::DiffPreviewPreference::Auto => {
+					"Inline suggestions"
+				}
+				crate::options::DiffPreviewPreference::Unified => {
+					"Plain unified"
+				}
+			};
+		self.add_entry(
+			txt,
+			width,
+			"Review presentation",
+			renderer,
+			self.is_select(AppOption::DiffPreviewRenderer),
+		);
 	}
 
 	fn is_select(&self, kind: AppOption) -> bool {
@@ -138,7 +159,7 @@ impl OptionsPopup {
 		if up {
 			self.selection = match self.selection {
 				AppOption::StatusShowUntracked => {
-					AppOption::DiffInterhunkLines
+					AppOption::DiffPreviewRenderer
 				}
 				AppOption::DiffIgnoreWhitespaces => {
 					AppOption::StatusShowUntracked
@@ -148,6 +169,9 @@ impl OptionsPopup {
 				}
 				AppOption::DiffInterhunkLines => {
 					AppOption::DiffContextLines
+				}
+				AppOption::DiffPreviewRenderer => {
+					AppOption::DiffInterhunkLines
 				}
 			};
 		} else {
@@ -161,7 +185,8 @@ impl OptionsPopup {
 				AppOption::DiffContextLines => {
 					AppOption::DiffInterhunkLines
 				}
-				AppOption::DiffInterhunkLines => {
+				AppOption::DiffInterhunkLines
+				| AppOption::DiffPreviewRenderer => {
 					AppOption::StatusShowUntracked
 				}
 			};
@@ -207,6 +232,9 @@ impl OptionsPopup {
 						.borrow_mut()
 						.diff_hunk_lines_change(true);
 				}
+				AppOption::DiffPreviewRenderer => {
+					self.cycle_preview_renderer();
+				}
 			}
 		} else {
 			match self.selection {
@@ -246,11 +274,24 @@ impl OptionsPopup {
 						.borrow_mut()
 						.diff_hunk_lines_change(false);
 				}
+				AppOption::DiffPreviewRenderer => {
+					self.cycle_preview_renderer();
+				}
 			}
 		}
 
 		self.queue
 			.push(InternalEvent::OptionSwitched(self.selection));
+	}
+
+	fn cycle_preview_renderer(&self) {
+		use crate::options::DiffPreviewPreference as P;
+		let current = self.options.borrow().diff_preview_preference();
+		let next = match current {
+			P::Auto => P::Unified,
+			P::Unified => P::Auto,
+		};
+		self.options.borrow_mut().set_diff_preview_preference(next);
 	}
 }
 
@@ -278,6 +319,12 @@ impl DrawableComponent for OptionsPopup {
 					.alignment(Alignment::Left),
 				area,
 			);
+			self.content_area.set(area.inner(
+				ratatui::layout::Margin {
+					vertical: 1,
+					horizontal: 1,
+				},
+			));
 		}
 
 		Ok(())
@@ -319,16 +366,59 @@ impl Component for OptionsPopup {
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = event {
+				let area = self.content_area.get();
+				match mouse.kind {
+					MouseEventKind::Down(MouseButton::Left)
+						if area.contains(
+							(mouse.column, mouse.row).into(),
+						) =>
+					{
+						let row = mouse.row.saturating_sub(area.y);
+						self.selection = match row {
+							1 => AppOption::StatusShowUntracked,
+							4 => AppOption::DiffIgnoreWhitespaces,
+							5 => AppOption::DiffContextLines,
+							6 => AppOption::DiffInterhunkLines,
+							7 => AppOption::DiffPreviewRenderer,
+							_ => self.selection,
+						};
+					}
+					MouseEventKind::ScrollUp
+						if area.contains(
+							(mouse.column, mouse.row).into(),
+						) =>
+					{
+						self.move_selection(true);
+					}
+					MouseEventKind::ScrollDown
+						if area.contains(
+							(mouse.column, mouse.row).into(),
+						) =>
+					{
+						self.move_selection(false);
+					}
+					_ => {}
+				}
+				return Ok(EventState::Consumed);
+			}
 			if let Event::Key(key) = &event {
+				let modal_up = self.key_config.is_modal()
+					&& key.code == KeyCode::Up
+					&& key.modifiers == KeyModifiers::NONE;
+				let modal_down = self.key_config.is_modal()
+					&& key.code == KeyCode::Down
+					&& key.modifiers == KeyModifiers::NONE;
+
 				if key_match(key, self.key_config.keys.exit_popup) {
 					self.hide();
-				} else if key_match(key, self.key_config.keys.move_up)
+				} else if modal_up
+					|| key_match(key, self.key_config.keys.move_up)
 				{
 					self.move_selection(true);
-				} else if key_match(
-					key,
-					self.key_config.keys.move_down,
-				) {
+				} else if modal_down
+					|| key_match(key, self.key_config.keys.move_down)
+				{
 					self.move_selection(false);
 				} else if key_match(
 					key,
@@ -361,5 +451,86 @@ impl Component for OptionsPopup {
 		self.visible = true;
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::keys::{KeyConfig, Keymap};
+
+	#[test]
+	fn modal_arrow_down_moves_options_selection() {
+		let mut env = Environment::test_env();
+		env.key_config =
+			std::rc::Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let mut popup = OptionsPopup::new(&env);
+		popup.show().unwrap();
+
+		popup
+			.event(&Event::Key(crossterm::event::KeyEvent::new(
+				KeyCode::Down,
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+
+		assert!(matches!(
+			popup.selection,
+			AppOption::DiffIgnoreWhitespaces
+		));
+	}
+
+	#[test]
+	fn pointer_selects_only_rendered_option_rows_and_wheel_moves_selection(
+	) {
+		let env = Environment::test_env();
+		let mut popup = OptionsPopup::new(&env);
+		popup.show().unwrap();
+		let backend = ratatui::backend::TestBackend::new(80, 24);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| popup.draw(frame, frame.area()).unwrap())
+			.unwrap();
+
+		let area = popup.content_area.get();
+		let option_row = area.y + 4;
+		popup
+			.event(&Event::Mouse(crossterm::event::MouseEvent {
+				kind: MouseEventKind::Down(MouseButton::Left),
+				column: area.x + 1,
+				row: option_row,
+				modifiers: KeyModifiers::NONE,
+			}))
+			.unwrap();
+		assert!(matches!(
+			popup.selection,
+			AppOption::DiffIgnoreWhitespaces
+		));
+
+		popup
+			.event(&Event::Mouse(crossterm::event::MouseEvent {
+				kind: MouseEventKind::ScrollDown,
+				column: area.x + 1,
+				row: option_row,
+				modifiers: KeyModifiers::NONE,
+			}))
+			.unwrap();
+		assert!(matches!(
+			popup.selection,
+			AppOption::DiffContextLines
+		));
+
+		popup
+			.event(&Event::Mouse(crossterm::event::MouseEvent {
+				kind: MouseEventKind::Down(MouseButton::Left),
+				column: 0,
+				row: 0,
+				modifiers: KeyModifiers::NONE,
+			}))
+			.unwrap();
+		assert!(matches!(
+			popup.selection,
+			AppOption::DiffContextLines
+		));
 	}
 }

@@ -1,11 +1,4 @@
-use super::utils::graphrow::{
-	SYM_BRANCH_UP, SYM_BRANCH_UP_RIGHT, SYM_COMMIT,
-	SYM_COMMIT_BRANCH, SYM_COMMIT_MERGE, SYM_COMMIT_STASH,
-	SYM_COMMIT_UNCOMMITTED, SYM_HORIZONTAL, SYM_MERGE_BRIDGE_END,
-	SYM_MERGE_BRIDGE_MID, SYM_MERGE_BRIDGE_START, SYM_SPACE,
-	SYM_TEE_DOWN, SYM_TEE_LEFT, SYM_TEE_RIGHT, SYM_TEE_UP,
-	SYM_VERTICAL, SYM_VERTICAL_DOTTED,
-};
+use super::utils::graphrow::{symbol, SYM_HORIZONTAL, SYM_SPACE};
 use super::utils::logitems::{ItemBatch, LogEntry};
 use crate::{
 	app::Environment,
@@ -22,19 +15,22 @@ use crate::{
 };
 use anyhow::Result;
 use asyncgit::{
-	graph::{ConnectionType, GraphRow},
+	graph::GraphRow,
 	sync::{
-		self, checkout_commit, BranchDetails, BranchInfo, CommitId,
-		RepoPathRef, Tags,
+		checkout_commit, BranchDetails, BranchInfo, CommitId,
+		CommitInfo, RepoPathRef, Tags,
 	},
+	LogRangeStatus,
 };
 use chrono::{DateTime, Local};
-use crossterm::event::Event;
+use crossterm::event::{
+	Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use ratatui::{
 	layout::{Alignment, Rect},
-	style::{Color, Style},
+	style::{Color, Modifier, Style},
 	text::{Line, Span},
 	widgets::{Block, Borders, Paragraph},
 	Frame,
@@ -42,11 +38,23 @@ use ratatui::{
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::{
-	cell::Cell, cmp, collections::BTreeMap, rc::Rc, time::Instant,
+	cell::{Cell, RefCell},
+	cmp,
+	collections::BTreeMap,
+	rc::Rc,
+	time::Instant,
 };
+use unicode_width::UnicodeWidthStr;
 
 const ELEMENTS_PER_LINE: usize = 9;
-const SLICE_SIZE: usize = 1200;
+const LOG_PREFETCH_ROWS: usize = 32;
+const DEFAULT_LOG_VIEWPORT_ROWS: usize = 22;
+const GRAPH_DETAIL_RESERVE: usize = 12;
+const GRAPH_WIDTH_LIMIT: usize = 32;
+
+fn escape_display_label(label: &str) -> String {
+	label.chars().flat_map(char::escape_debug).collect()
+}
 
 const GRAPH_COLORS: &[Color] = &[
 	Color::Blue,
@@ -57,6 +65,33 @@ const GRAPH_COLORS: &[Color] = &[
 	Color::Red,
 ];
 
+#[cfg(test)]
+const fn translate_scroll_top(
+	old_index_offset: usize,
+	old_scroll_top: usize,
+	new_index_offset: usize,
+) -> usize {
+	old_index_offset
+		.saturating_add(old_scroll_top)
+		.saturating_sub(new_index_offset)
+}
+
+const fn clamp_scroll_top(
+	current_top: usize,
+	height_in_lines: usize,
+	selection: usize,
+	item_count: usize,
+) -> usize {
+	let next_top =
+		calc_scroll_top(current_top, height_in_lines, selection);
+	let max_top = item_count.saturating_sub(height_in_lines);
+	if next_top < max_top {
+		next_top
+	} else {
+		max_top
+	}
+}
+
 /// Renders the commit log with a side-bar graph.
 pub struct CommitList {
 	repo: RepoPathRef,
@@ -66,10 +101,14 @@ pub struct CommitList {
 	items: ItemBatch,
 	highlights: Option<Rc<IndexSet<CommitId>>>,
 	commits: IndexSet<CommitId>,
+	history_status: Option<LogRangeStatus>,
 	/// The marked commits.
 	/// `self.marked[].0` holds the commit index into `self.items.items` - used for ordering the list.
 	/// `self.marked[].1` is the commit id of the marked commit.
 	marked: Vec<(usize, CommitId)>,
+	/// The stable commit at which a modal selection started.
+	selection_anchor: Option<CommitId>,
+	selection_extending: bool,
 	scroll_state: (Instant, f32),
 	tags: Option<Tags>,
 	local_branches: BTreeMap<CommitId, Vec<BranchInfo>>,
@@ -81,6 +120,10 @@ pub struct CommitList {
 	key_config: SharedKeyConfig,
 	show_graph: bool,
 	graph_col_width: Cell<usize>,
+	last_draw_area: Cell<Rect>,
+	last_draw_rows: RefCell<Vec<CommitId>>,
+	pointer_dragging: bool,
+	pointer_anchor: Option<CommitId>,
 }
 
 impl CommitList {
@@ -89,7 +132,10 @@ impl CommitList {
 		Self {
 			repo: env.repo.clone(),
 			items: ItemBatch::default(),
+			history_status: None,
 			marked: Vec::with_capacity(2),
+			selection_anchor: None,
+			selection_extending: false,
 			selection: 0,
 			highlighted_selection: None,
 			commits: IndexSet::new(),
@@ -106,6 +152,10 @@ impl CommitList {
 			title: title.into(),
 			show_graph: true,
 			graph_col_width: Cell::new(0),
+			last_draw_area: Cell::new(Rect::default()),
+			last_draw_rows: RefCell::new(Vec::new()),
+			pointer_dragging: false,
+			pointer_anchor: None,
 		}
 	}
 
@@ -114,16 +164,69 @@ impl CommitList {
 		self.show_graph
 	}
 
-	/// Whether the loaded window already has up-to-date graph rows.
-	pub const fn is_graph_ready(&self) -> bool {
-		self.items.graph_ready
+	/// Current viewport plus bounded lookahead, in stable history indices.
+	pub fn requested_log_range(&self) -> (usize, usize) {
+		let height = self
+			.current_size()
+			.map_or(DEFAULT_LOG_VIEWPORT_ROWS, |size| {
+				usize::from(size.1).max(1)
+			});
+		let start = calc_scroll_top(
+			self.scroll_top.get(),
+			height,
+			self.selection,
+		);
+		(
+			start,
+			start
+				.saturating_add(height)
+				.saturating_add(LOG_PREFETCH_ROWS),
+		)
 	}
 
-	///
-	pub fn get_loaded_slice(&self) -> (Vec<CommitId>, usize) {
-		let offset = self.items.index_offset();
-		let ids = self.items.iter().map(|e| e.id).collect();
-		(ids, offset)
+	/// Whether the visible tail is close enough to request another bounded page.
+	pub fn should_load_more(&self) -> bool {
+		if self.history_status.is_some_and(|status| {
+			!status.has_more || status.pending || status.complete
+		}) {
+			return false;
+		}
+		let loaded = self.loaded_commit_count();
+		let (_, requested_end) = self.requested_log_range();
+		let visible_end =
+			requested_end.saturating_sub(LOG_PREFETCH_ROWS);
+		loaded == 0 || visible_end.saturating_add(8) >= loaded
+	}
+
+	/// Commit IDs available from the bounded log walk so far.
+	pub fn loaded_commit_count(&self) -> usize {
+		if self.commits.is_empty() {
+			self.items.index_offset().saturating_add(self.items.len())
+		} else {
+			self.commits.len()
+		}
+	}
+
+	/// Update the lazy-history status shown by the log.
+	pub const fn set_history_status(
+		&mut self,
+		status: LogRangeStatus,
+	) {
+		self.history_status = Some(status);
+	}
+
+	/// Install a cache-only metadata range returned by the background log worker.
+	pub fn set_metadata_range(
+		&mut self,
+		start: usize,
+		commits: Vec<CommitInfo>,
+	) {
+		self.items.set_items(
+			start,
+			commits,
+			self.highlights.as_ref(),
+		);
+		self.update_modal_range();
 	}
 
 	///
@@ -140,11 +243,14 @@ impl CommitList {
 	pub fn clear(&mut self) {
 		self.items.clear();
 		self.commits.clear();
-	}
-
-	///
-	pub fn copy_items(&self) -> Vec<CommitId> {
-		self.commits.iter().copied().collect_vec()
+		self.selection = 0;
+		self.highlighted_selection = None;
+		self.history_status = None;
+		self.scroll_top.set(0);
+		self.graph_col_width.set(0);
+		self.selection_anchor = None;
+		self.selection_extending = false;
+		self.marked.clear();
 	}
 
 	///
@@ -154,9 +260,40 @@ impl CommitList {
 
 	///
 	pub fn selected_entry(&self) -> Option<&LogEntry> {
-		self.items.iter().nth(
-			self.selection.saturating_sub(self.items.index_offset()),
+		self.items.get_at(self.selection)
+	}
+
+	/// Return the selected ID even while its metadata row is still loading.
+	pub fn selected_commit_id(&self) -> Option<CommitId> {
+		self.commits.get_index(self.selection).copied().or_else(
+			|| {
+				self.items
+					.get_at(self.selection)
+					.map(|entry| entry.id)
+			},
 		)
+	}
+
+	/// Return the commit targeted by a single-commit action.
+	///
+	/// Modal selections take precedence over the cursor when exactly one
+	/// commit is marked. Multiple marked commits have no single target.
+	/// Legacy keymaps continue to target the cursor.
+	pub fn action_commit(&self) -> Option<CommitId> {
+		if self.key_config.is_modal() {
+			match self.marked.as_slice() {
+				[(_, id)] => Some(*id),
+				[_, _, ..] => None,
+				[] => self.selected_commit_id(),
+			}
+		} else {
+			self.selected_commit_id()
+		}
+	}
+
+	/// Whether a modal single-commit action has an ambiguous target.
+	pub fn has_multiple_action_commits(&self) -> bool {
+		self.key_config.is_modal() && self.marked.len() > 1
 	}
 
 	///
@@ -167,6 +304,147 @@ impl CommitList {
 	///
 	pub fn clear_marked(&mut self) {
 		self.marked.clear();
+	}
+
+	/// Finish a modal range without discarding its selected commit ids.
+	///
+	/// Containers call this when the commit list stops being the active
+	/// component, so a later key press cannot continue extending a hidden range.
+	pub const fn finish_selection(&mut self) {
+		self.selection_anchor = None;
+		self.selection_extending = false;
+	}
+
+	/// Return the current modal commit selection for command bars and titles.
+	pub fn selection_status(
+		&self,
+	) -> Option<crate::components::SelectionStatus> {
+		if !self.key_config.is_modal()
+			|| (self.selection_anchor.is_none()
+				&& self.marked.is_empty())
+		{
+			return None;
+		}
+		Some(crate::components::SelectionStatus {
+			extending: self.selection_extending,
+			count: self.marked.len(),
+			unit: if self.selection_anchor.is_some() {
+				"loaded commits"
+			} else {
+				"commits"
+			},
+		})
+	}
+
+	fn selection_range_ids(&self) -> Vec<CommitId> {
+		let Some(anchor) = self.selection_anchor else {
+			return Vec::new();
+		};
+		if !self.commits.is_empty() {
+			let Some(anchor_idx) = self.commits.get_index_of(&anchor)
+			else {
+				return Vec::new();
+			};
+			if self.selection >= self.commits.len() {
+				return Vec::new();
+			}
+			let (start, finish) = if anchor_idx <= self.selection {
+				(anchor_idx, self.selection)
+			} else {
+				(self.selection, anchor_idx)
+			};
+			return self
+				.commits
+				.iter()
+				.skip(start)
+				.take(finish - start + 1)
+				.copied()
+				.collect();
+		}
+		let Some(anchor_idx) =
+			self.items.iter().position(|e| e.id == anchor)
+		else {
+			return Vec::new();
+		};
+		let current = self.selection;
+		let offset = self.items.index_offset();
+		let item_count = self.items.iter().count();
+		if current < offset
+			|| current >= offset.saturating_add(item_count)
+		{
+			return Vec::new();
+		}
+		let end = current - offset;
+		let (start, finish) = if anchor_idx <= end {
+			(anchor_idx, end)
+		} else {
+			(end, anchor_idx)
+		};
+		self.items
+			.iter()
+			.skip(start)
+			.take(finish - start + 1)
+			.map(|e| e.id)
+			.collect()
+	}
+
+	fn update_modal_range(&mut self) {
+		if !self.selection_extending {
+			return;
+		}
+		let Some(anchor) = self.selection_anchor else {
+			self.selection_extending = false;
+			self.marked.clear();
+			return;
+		};
+		let anchor_available = if self.commits.is_empty() {
+			self.items.iter().any(|entry| entry.id == anchor)
+		} else {
+			self.commits.get_index_of(&anchor).is_some()
+		};
+		if !anchor_available {
+			// Discard only the generated range when its stable anchor is no
+			// longer available. Explicit marks are retained after extension ends.
+			self.selection_anchor = None;
+			self.selection_extending = false;
+			self.marked.clear();
+			return;
+		}
+		let ids = self.selection_range_ids();
+		if ids.is_empty() {
+			// The cursor can temporarily move beyond the loaded slice before
+			// its replacement arrives. Keep the prior range until then.
+			return;
+		}
+		let first_index = self
+			.commits
+			.get_index_of(&ids[0])
+			.unwrap_or_else(|| self.items.index_offset());
+		self.marked = ids
+			.into_iter()
+			.enumerate()
+			.map(|(offset, id)| (first_index + offset, id))
+			.collect();
+	}
+
+	fn begin_modal_selection(&mut self) {
+		let Some(id) = self.selected_commit_id() else {
+			return;
+		};
+		self.selection_anchor = Some(id);
+		self.selection_extending = true;
+		self.marked.clear();
+		self.update_modal_range();
+	}
+
+	fn clear_modal_selection(&mut self) -> bool {
+		let changed = self.selection_anchor.is_some()
+			|| self.selection_extending
+			|| !self.marked.is_empty();
+		self.selection_anchor = None;
+		self.selection_extending = false;
+		self.marked.clear();
+		changed
 	}
 
 	///
@@ -180,14 +458,7 @@ impl CommitList {
 	/// Build string of marked or selected (if none are marked) commit ids
 	fn concat_selected_commit_ids(&self) -> Option<String> {
 		match self.marked.as_slice() {
-			[] => self
-				.items
-				.iter()
-				.nth(
-					self.selection
-						.saturating_sub(self.items.index_offset()),
-				)
-				.map(|e| e.id.to_string()),
+			[] => self.selected_commit_id().map(|id| id.to_string()),
 			marked => Some(
 				marked
 					.iter()
@@ -211,9 +482,11 @@ impl CommitList {
 
 	///
 	pub fn checkout(&self) {
-		if let Some(commit_hash) =
-			self.selected_entry().map(|entry| entry.id)
-		{
+		if self.has_multiple_action_commits() {
+			self.queue.push(InternalEvent::ShowErrorMsg(
+				"This action requires one commit; clear selection or select one".to_owned(),
+			));
+		} else if let Some(commit_hash) = self.action_commit() {
 			try_or_popup!(
 				self,
 				"failed to checkout commit:",
@@ -276,22 +549,46 @@ impl CommitList {
 	pub fn set_commits(&mut self, commits: IndexSet<CommitId>) {
 		if commits != self.commits {
 			self.items.clear();
+			self.scroll_top.set(0);
+			self.graph_col_width.set(0);
 			self.commits = commits;
-			self.fetch_commits(false);
+			self.selection = self
+				.selection
+				.min(self.commits.len().saturating_sub(1));
+			self.highlighted_selection = None;
+			self.selection_anchor = None;
+			self.selection_extending = false;
+			self.marked.clear();
 		}
 	}
 
-	///
+	/// Append IDs published by the bounded background log walk.
 	pub fn refresh_extend_data(&mut self, commits: Vec<CommitId>) {
-		let new_commits = !commits.is_empty();
 		self.commits.extend(commits);
+		self.update_modal_range();
+	}
 
-		let selection = self.selection();
-		let selection_max = self.selection_max();
+	/// Rebuild the displayed metadata range from the worker's ID cache.
+	pub fn refresh_metadata_range(
+		&mut self,
+		start: usize,
+		infos: Vec<CommitInfo>,
+	) {
+		self.set_metadata_range(start, infos);
+	}
 
-		if self.needs_data(selection, selection_max) || new_commits {
-			self.fetch_commits(false);
-		}
+	/// IDs in a requested metadata range, bounded by the known log prefix.
+	pub fn ids_in_range(
+		&self,
+		start: usize,
+		end: usize,
+	) -> Vec<CommitId> {
+		self.commits
+			.iter()
+			.skip(start)
+			.take(end.saturating_sub(start))
+			.copied()
+			.collect()
 	}
 
 	///
@@ -308,10 +605,10 @@ impl CommitList {
 		} else {
 			highlighting
 		};
+		self.items.set_highlights(self.highlights.as_deref());
 
 		self.select_next_highlight();
 		self.set_highlighted_selection_index();
-		self.fetch_commits(true);
 	}
 
 	///
@@ -341,13 +638,9 @@ impl CommitList {
 		self.highlighted_selection =
 			self.highlights.as_ref().and_then(|highlights| {
 				highlights.iter().position(|entry| {
-					entry == &self.commits[self.selection]
+					Some(entry) == self.selected_commit_id().as_ref()
 				})
 			});
-	}
-
-	const fn selection(&self) -> usize {
-		self.selection
 	}
 
 	/// will return view size or None before the first render
@@ -356,12 +649,12 @@ impl CommitList {
 	}
 
 	fn selection_max(&self) -> usize {
-		self.commits.len().saturating_sub(1)
+		self.loaded_commit_count().saturating_sub(1)
 	}
 
 	fn selected_entry_marked(&self) -> bool {
-		self.selected_entry()
-			.and_then(|e| self.is_marked(&e.id))
+		self.selected_commit_id()
+			.and_then(|id| self.is_marked(&id))
 			.unwrap_or_default()
 	}
 
@@ -418,10 +711,18 @@ impl CommitList {
 		&mut self,
 		scroll: ScrollType,
 	) -> Result<bool> {
-		self.update_scroll_speed();
+		if self.key_config.is_modal() {
+			self.scroll_state.1 = 0.0;
+		} else {
+			self.update_scroll_speed();
+		}
 
 		#[allow(clippy::cast_possible_truncation)]
-		let speed_int = usize::try_from(self.scroll_state.1 as i64)?.max(1);
+		let speed_int = if self.key_config.is_modal() {
+			1
+		} else {
+			usize::try_from(self.scroll_state.1 as i64)?.max(1)
+		};
 
 		let page_offset = usize::from(
 			self.current_size.get().unwrap_or_default().1,
@@ -450,16 +751,19 @@ impl CommitList {
 		let needs_update = new_selection != self.selection;
 
 		self.selection = new_selection;
+		self.update_modal_range();
 
 		Ok(needs_update)
 	}
 
 	fn mark(&mut self) {
-		if let Some(e) = self.selected_entry() {
-			let id = e.id;
+		if let Some(id) = self.selected_commit_id() {
+			// Selection is an index into the full commit set. Fall back to it
+			// for tests and lists whose backing set has not been populated.
 			let selected = self
-				.selection
-				.saturating_sub(self.items.index_offset());
+				.commits
+				.get_index_of(&id)
+				.unwrap_or(self.selection);
 			if self.is_marked(&id).unwrap_or_default() {
 				self.marked.retain(|marked| marked.1 != id);
 			} else {
@@ -469,6 +773,13 @@ impl CommitList {
 					first.0.cmp(&second.0)
 				});
 			}
+		}
+	}
+
+	fn toggle_modal_item(&mut self) {
+		self.mark();
+		if self.selection_extending {
+			self.finish_selection();
 		}
 	}
 
@@ -506,60 +817,24 @@ impl CommitList {
 		}
 	}
 
-	fn build_graph_spans<'a>(
-		row: &'a GraphRow,
+	pub(crate) fn graph_row_spans(
+		row: &GraphRow,
 		graph_col_width: usize,
-		empty_lanes: &std::collections::HashSet<usize>,
-	) -> Vec<Span<'a>> {
+		_empty_lanes: &std::collections::HashSet<usize>,
+	) -> Vec<Span<'static>> {
 		let mut spans = Vec::new();
+		let lane_limit = graph_col_width / 2;
 
-		for (lane_index, conn) in row.lanes.iter().enumerate() {
-			if empty_lanes.contains(&lane_index) {
-				continue;
-			}
+		for (lane_index, conn) in
+			row.lanes.iter().take(lane_limit).enumerate()
+		{
 			let (sym, graph_color) = match conn {
 				None => (SYM_SPACE, Color::Reset),
-				Some((conn_type, color_idx)) => {
-					let color = GRAPH_COLORS[usize::from(*color_idx)
-						% GRAPH_COLORS.len()];
-					let sym = match conn_type {
-						ConnectionType::Vertical => SYM_VERTICAL,
-						ConnectionType::VerticalDotted => {
-							SYM_VERTICAL_DOTTED
-						}
-						ConnectionType::TeeLeft => SYM_TEE_LEFT,
-						ConnectionType::TeeRight => SYM_TEE_RIGHT,
-						ConnectionType::TeeUp => SYM_TEE_UP,
-						ConnectionType::TeeDown => SYM_TEE_DOWN,
-						ConnectionType::BranchUpRight => {
-							SYM_BRANCH_UP_RIGHT
-						}
-						ConnectionType::CommitNormal => SYM_COMMIT,
-						ConnectionType::CommitBranch => {
-							SYM_COMMIT_BRANCH
-						}
-						ConnectionType::CommitMerge => {
-							SYM_COMMIT_MERGE
-						}
-						ConnectionType::CommitStash => {
-							SYM_COMMIT_STASH
-						}
-						ConnectionType::CommitUncommitted => {
-							SYM_COMMIT_UNCOMMITTED
-						}
-						ConnectionType::MergeBridgeStart => {
-							SYM_MERGE_BRIDGE_START
-						}
-						ConnectionType::MergeBridgeMid => {
-							SYM_MERGE_BRIDGE_MID
-						}
-						ConnectionType::MergeBridgeEnd => {
-							SYM_MERGE_BRIDGE_END
-						}
-						ConnectionType::BranchUp => SYM_BRANCH_UP,
-					};
-					(sym, color)
-				}
+				Some((conn_type, color_idx)) => (
+					symbol(*conn_type),
+					GRAPH_COLORS[usize::from(*color_idx)
+						% GRAPH_COLORS.len()],
+				),
 			};
 			spans.push(Span::styled(
 				sym,
@@ -603,9 +878,24 @@ impl CommitList {
 			spans.push(Span::raw(SYM_SPACE));
 		}
 
+		let truncated = row.lanes.len() > lane_limit
+			|| row
+				.merge_bridge
+				.into_iter()
+				.chain(row.branches.iter().copied())
+				.any(|(_, finish)| usize::from(finish) >= lane_limit);
 		let current_width = spans.len();
 		for _ in current_width..graph_col_width {
 			spans.push(Span::raw(SYM_SPACE));
+		}
+		if truncated && lane_limit > 0 {
+			// The graph continues beyond the visible lanes. Reserve its final
+			// cell for an explicit continuation mark instead of silently hiding
+			// parent or branch lanes at the right edge of a narrow pane.
+			if let Some(last) = spans.get_mut(graph_col_width - 1) {
+				last.content = Cow::Borrowed("…");
+				last.style = Style::default().fg(Color::Gray);
+			}
 		}
 
 		spans
@@ -616,6 +906,7 @@ impl CommitList {
 		&self,
 		e: &'a LogEntry,
 		selected: bool,
+		cursor: bool,
 		tags: Option<String>,
 		local_branches: Option<String>,
 		remote_branches: Option<String>,
@@ -628,9 +919,18 @@ impl CommitList {
 		let mut txt: Vec<Span> = Vec::with_capacity(
 			ELEMENTS_PER_LINE + if marked.is_some() { 2 } else { 0 },
 		);
+		let row_selected = selected
+			|| (self.key_config.is_modal()
+				&& marked.unwrap_or(false));
 
 		if self.show_graph {
+			let graph_start = txt.len();
 			self.add_graph_spans(e, &mut txt, empty_lanes);
+			if row_selected {
+				for span in &mut txt[graph_start..] {
+					span.style = theme.selected(span.style, true);
+				}
+			}
 		}
 
 		let normal = !self.items.highlighting()
@@ -639,14 +939,22 @@ impl CommitList {
 		let splitter = Span::styled(
 			Cow::from(symbol::EMPTY_SPACE),
 			if normal {
-				theme.text(true, selected)
+				theme.text(true, row_selected)
 			} else {
-				Style::default()
+				theme.selected(Style::default(), row_selected)
 			},
 		);
 
 		// marker
-		if let Some(marked) = marked {
+		if self.key_config.is_modal() {
+			txt.push(Span::styled(
+				Cow::from(if cursor { "›" } else { " " }),
+				theme
+					.log_marker(row_selected)
+					.add_modifier(Modifier::BOLD),
+			));
+			txt.push(splitter.clone());
+		} else if let Some(marked) = marked {
 			txt.push(Span::styled(
 				Cow::from(if marked {
 					symbol::CHECKMARK
@@ -661,7 +969,7 @@ impl CommitList {
 		Self::add_entry_details(
 			e,
 			&mut txt,
-			selected,
+			row_selected,
 			normal,
 			theme,
 			width,
@@ -682,7 +990,7 @@ impl CommitList {
 		empty_lanes: &std::collections::HashSet<usize>,
 	) {
 		if let Some(ref row) = e.graph {
-			txt.extend(Self::build_graph_spans(
+			txt.extend(Self::graph_row_spans(
 				row,
 				self.graph_col_width.get(),
 				empty_lanes,
@@ -692,7 +1000,9 @@ impl CommitList {
 				" ".repeat(self.graph_col_width.get()),
 			));
 		}
-		txt.push(Span::raw(" "));
+		if self.graph_col_width.get() > 0 {
+			txt.push(Span::raw(" "));
+		}
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -726,7 +1036,8 @@ impl CommitList {
 				theme.text(true, selected),
 			)
 		} else {
-			let s = theme.commit_unhighlighted();
+			let s = theme
+				.selected(theme.commit_unhighlighted(), selected);
 			(s, s, s, s, s, s)
 		};
 
@@ -766,100 +1077,100 @@ impl CommitList {
 
 		txt.push(splitter.clone());
 
-		let message_width = width.saturating_sub(
-			txt.iter().map(|span| span.content.len()).sum(),
-		);
+		let used_width = txt
+			.iter()
+			.map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+			.sum();
+		let message_width = width.saturating_sub(used_width);
+		let message = escape_display_label(e.msg.as_ref());
+		let message_padding = message_width
+			.saturating_sub(UnicodeWidthStr::width(message.as_str()));
 
 		// commit msg
 		txt.push(Span::styled(
-			format!("{:message_width$}", e.msg),
+			format!("{}{}", message, " ".repeat(message_padding)),
 			style_msg,
 		));
 	}
 
 	fn get_text(&self, height: usize, width: usize) -> Vec<Line<'_>> {
-		let selection = self.relative_selection();
 		let now = Local::now();
 		let any_marked = !self.marked.is_empty();
 
 		if self.show_graph {
-			let view = self
+			// Keep lane positions stable while the viewport scrolls. Compacting
+			// from the rows on screen alone made a lane shift horizontally as
+			// soon as its only visible connector scrolled away.
+			let max_lane = self
 				.items
 				.iter()
-				.skip(self.scroll_top.get())
-				.take(height);
-
-			let max_lane = view
-				.clone()
 				.filter_map(|e| e.graph.as_ref())
 				.map(|row| row.lanes.len())
 				.max()
 				.unwrap_or(0);
-
-			let empty_lanes: std::collections::HashSet<usize> = (0..max_lane)
-            .filter(|&index| {
-                view.clone().filter_map(|entry| entry.graph.as_ref()).all(|row| {
-                    row.lanes.get(index).is_none_or(|conn| {
-                        matches!(conn, None | Some((ConnectionType::MergeBridgeMid, _)))
-                    })
-                })
-            })
-            .collect();
-
-			self.graph_col_width.set(
-				((max_lane.saturating_sub(empty_lanes.len())) * 2)
-					.max(2),
-			);
-
-			self.collect_entries(
-				height,
-				width,
-				selection,
-				now,
-				any_marked,
-				&empty_lanes,
-			)
+			// Leave room for the commit id and selection marker. A capped graph
+			// row shows an ellipsis in its last visible graph cell.
+			let graph_width = GRAPH_WIDTH_LIMIT
+				.min(width / 3)
+				.min(width.saturating_sub(GRAPH_DETAIL_RESERVE));
+			let visible_lanes = max_lane.min(graph_width / 2);
+			self.graph_col_width.set(visible_lanes * 2);
 		} else {
 			self.graph_col_width.set(0);
-			self.collect_entries(
-				height,
-				width,
-				selection,
-				now,
-				any_marked,
-				&HashSet::new(),
-			)
 		}
+
+		self.collect_entries(height, width, now, any_marked)
 	}
 
 	fn collect_entries(
 		&self,
 		height: usize,
 		width: usize,
-		selection: usize,
 		now: DateTime<Local>,
 		any_marked: bool,
-		empty_lanes: &HashSet<usize>,
 	) -> Vec<Line<'_>> {
-		self.items
-			.iter()
-			.skip(self.scroll_top.get())
-			.take(height)
-			.enumerate()
-			.map(|(index, entry)| {
-				let tags = self
-					.tags
+		let loaded = self.loaded_commit_count();
+		let start = self.scroll_top.get().min(loaded);
+		(start..start.saturating_add(height).min(loaded))
+			.filter_map(|global_index| {
+				let id = self.display_commit_id(global_index)?;
+				let cursor = global_index == self.selection;
+				let is_highlighted = self
+					.highlights
 					.as_ref()
-					.and_then(|t| t.get(&entry.id))
-					.map(|tags| {
-						tags.iter()
-							.map(|tag| format!("<{}>", tag.name))
-							.join(" ")
-					});
+					.is_some_and(|ids| ids.contains(&id));
+				let marked = if self.key_config.is_modal() {
+					Some(self.is_marked(&id).unwrap_or(false))
+				} else {
+					any_marked.then(|| self.is_marked(&id)).flatten()
+				};
+				let selected = cursor
+					|| (self.key_config.is_modal()
+						&& marked.unwrap_or(false));
+
+				let Some(entry) = self.items.get_at(global_index)
+				else {
+					return Some(self.get_pending_entry_to_add(
+						id,
+						selected,
+						cursor,
+						width,
+						marked,
+						is_highlighted,
+					));
+				};
+				let tags =
+					self.tags.as_ref().and_then(|t| t.get(&id)).map(
+						|tags| {
+							tags.iter()
+								.map(|tag| format!("<{}>", tag.name))
+								.join(" ")
+						},
+					);
 
 				let local_branches = self
 					.local_branches
-					.get(&entry.id)
+					.get(&id)
 					.map(|local_branch| {
 						local_branch
 							.iter()
@@ -869,13 +1180,10 @@ impl CommitList {
 							.join(" ")
 					});
 
-				let marked = any_marked
-					.then(|| self.is_marked(&entry.id))
-					.flatten();
-
-				self.get_entry_to_add(
+				Some(self.get_entry_to_add(
 					entry,
-					index + self.scroll_top.get() == selection,
+					selected,
+					cursor,
 					tags,
 					local_branches,
 					self.remote_branches_string(entry),
@@ -883,10 +1191,68 @@ impl CommitList {
 					width,
 					now,
 					marked,
-					empty_lanes,
-				)
+					&HashSet::new(),
+				))
 			})
 			.collect()
+	}
+
+	fn get_pending_entry_to_add(
+		&self,
+		id: CommitId,
+		selected: bool,
+		cursor: bool,
+		width: usize,
+		marked: Option<bool>,
+		highlighted: bool,
+	) -> Line<'static> {
+		let mut spans: Vec<Span<'static>> = Vec::new();
+		if self.show_graph {
+			spans.push(Span::raw(" ".repeat(
+				self.graph_col_width.get().saturating_add(1),
+			)));
+		}
+		if self.key_config.is_modal() {
+			spans.push(Span::styled(
+				if cursor { "›" } else { " " },
+				self.theme
+					.log_marker(selected)
+					.add_modifier(Modifier::BOLD),
+			));
+			spans.push(Span::raw(" "));
+		} else if let Some(marked) = marked {
+			spans.push(Span::styled(
+				if marked { symbol::CHECKMARK } else { " " },
+				self.theme.log_marker(selected),
+			));
+			spans.push(Span::raw(" "));
+		}
+
+		let hash_style = if highlighted {
+			self.theme
+				.selected(self.theme.commit_unhighlighted(), selected)
+		} else {
+			self.theme.commit_hash(selected)
+		};
+		spans.push(Span::styled(id.get_short_string(), hash_style));
+		spans.push(Span::styled(
+			" ".to_owned(),
+			self.theme.text(true, selected),
+		));
+		spans.push(Span::raw(
+			" ".repeat(10 + (width / 3).clamp(3, 20) + 1),
+		));
+		spans.push(Span::styled(
+			"Loading…".to_owned(),
+			self.theme.text(true, selected),
+		));
+		Line::from(spans)
+	}
+
+	fn display_commit_id(&self, index: usize) -> Option<CommitId> {
+		self.commits.get_index(index).copied().or_else(|| {
+			self.items.get_at(index).map(|entry| entry.id)
+		})
 	}
 
 	fn remote_branches_string(&self, e: &LogEntry) -> Option<String> {
@@ -932,8 +1298,147 @@ impl CommitList {
 		})
 	}
 
-	fn relative_selection(&self) -> usize {
-		self.selection.saturating_sub(self.items.index_offset())
+	const fn relative_selection(&self) -> usize {
+		self.selection
+	}
+
+	fn pointer_entry_id(
+		&self,
+		column: u16,
+		row: u16,
+	) -> Option<CommitId> {
+		let area = self.last_draw_area.get();
+		if column < area.x.saturating_add(1)
+			|| column
+				>= area.x.saturating_add(area.width.saturating_sub(1))
+			|| row < area.y.saturating_add(1)
+			|| row
+				>= area
+					.y
+					.saturating_add(area.height.saturating_sub(1))
+		{
+			return None;
+		}
+		let row_offset =
+			usize::from(row.saturating_sub(area.y.saturating_add(1)));
+		self.last_draw_rows.borrow().get(row_offset).copied()
+	}
+
+	const fn pointer_inside(&self, column: u16, row: u16) -> bool {
+		let area = self.last_draw_area.get();
+		column >= area.x.saturating_add(1)
+			&& column
+				< area.x.saturating_add(area.width.saturating_sub(1))
+			&& row >= area.y.saturating_add(1)
+			&& row
+				< area.y.saturating_add(area.height.saturating_sub(1))
+	}
+
+	fn pointer_event(
+		&mut self,
+		mouse: MouseEvent,
+	) -> Result<EventState> {
+		match mouse.kind {
+			MouseEventKind::Down(MouseButton::Left) => {
+				let Some(id) =
+					self.pointer_entry_id(mouse.column, mouse.row)
+				else {
+					return Ok(EventState::NotConsumed);
+				};
+				// The draw-time row map may outlive a refresh of the loaded
+				// commit window. Consume that stale hit without disturbing a
+				// deliberate selection or starting a drag from the old cursor.
+				if self.commits.get_index_of(&id).is_none()
+					&& !self.items.iter().any(|entry| entry.id == id)
+				{
+					return Ok(EventState::Consumed);
+				}
+				let old_anchor =
+					self.selected_entry().map(|entry| entry.id);
+				let shift = self.key_config.is_modal()
+					&& mouse.modifiers.contains(KeyModifiers::SHIFT);
+				if self.key_config.is_modal()
+					&& self.selection_extending
+					&& !shift
+				{
+					self.clear_modal_selection();
+				}
+				self.set_pointer_selection(id);
+				self.pointer_anchor =
+					self.selected_entry().map(|entry| entry.id);
+				self.pointer_dragging = true;
+				if shift {
+					if let Some(anchor) = old_anchor {
+						self.selection_anchor = Some(anchor);
+						self.selection_extending = true;
+						self.update_modal_range();
+					}
+				}
+				Ok(EventState::Consumed)
+			}
+			MouseEventKind::Drag(MouseButton::Left)
+				if self.pointer_dragging =>
+			{
+				if let Some(id) =
+					self.pointer_entry_id(mouse.column, mouse.row)
+				{
+					self.set_pointer_selection(id);
+					if self.key_config.is_modal() {
+						if let Some(anchor) = self.pointer_anchor {
+							if !self.selection_extending {
+								self.selection_anchor = Some(anchor);
+								self.selection_extending = true;
+							}
+							self.update_modal_range();
+						}
+					}
+				}
+				Ok(EventState::Consumed)
+			}
+			MouseEventKind::Up(MouseButton::Left)
+				if self.pointer_dragging =>
+			{
+				self.pointer_dragging = false;
+				self.pointer_anchor = None;
+				if self.selection_extending {
+					self.finish_selection();
+				}
+				Ok(EventState::Consumed)
+			}
+			MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+				if !self.pointer_inside(mouse.column, mouse.row) {
+					return Ok(EventState::NotConsumed);
+				}
+				let dir =
+					if matches!(mouse.kind, MouseEventKind::ScrollUp)
+					{
+						ScrollType::Up
+					} else {
+						ScrollType::Down
+					};
+				self.move_selection(dir)?;
+				Ok(EventState::Consumed)
+			}
+			_ => Ok(EventState::NotConsumed),
+		}
+	}
+
+	fn set_pointer_selection(&mut self, id: CommitId) -> bool {
+		let index = self.commits.get_index_of(&id).or_else(|| {
+			self.items.iter().position(|entry| entry.id == id).map(
+				|relative| {
+					self.items.index_offset().saturating_add(relative)
+				},
+			)
+		});
+		let Some(index) = index else {
+			return false;
+		};
+		let changed = self.selection != index;
+		self.selection = index;
+		self.set_highlighted_selection_index();
+		self.update_modal_range();
+		changed
 	}
 
 	fn select_next_highlight(&mut self) {
@@ -975,70 +1480,69 @@ impl CommitList {
 	}
 
 	fn selection_highlighted(&self) -> bool {
-		let commit = self.commits[self.selection];
-
-		self.highlights
-			.as_ref()
-			.is_some_and(|highlights| highlights.contains(&commit))
-	}
-
-	fn needs_data(&self, idx: usize, idx_max: usize) -> bool {
-		self.items.needs_data(idx, idx_max)
-	}
-
-	// checks if first entry in items is the same commit as we expect
-	fn is_list_in_sync(&self) -> bool {
-		self.items
-			.index_offset_raw()
-			.and_then(|index| {
-				self.items
-					.iter()
-					.next()
-					.map(|item| item.id == self.commits[index])
+		self.selected_commit_id().is_some_and(|commit| {
+			self.highlights.as_ref().is_some_and(|highlights| {
+				highlights.contains(&commit)
 			})
-			.unwrap_or_default()
+		})
 	}
 
-	fn fetch_commits(&mut self, force: bool) {
-		let want_min =
-			self.selection().saturating_sub(SLICE_SIZE / 2);
-		let commits = self.commits.len();
-
-		let want_min = want_min.min(commits);
-
-		let index_in_sync = self
-			.items
-			.index_offset_raw()
-			.is_some_and(|index| want_min == index);
-
-		if !index_in_sync || !self.is_list_in_sync() || force {
-			let commits = sync::get_commits_info(
-				&self.repo.borrow(),
-				self.commits
-					.iter()
-					.skip(want_min)
-					.take(SLICE_SIZE)
-					.copied()
-					.collect_vec()
-					.as_slice(),
-				self.current_size()
-					.map_or(100u16, |size| size.0)
-					.into(),
-			);
-
-			if let Ok(commits) = commits {
-				self.items.set_items(
-					want_min,
-					commits,
-					self.highlights.as_ref(),
-				);
-			}
-		}
+	fn title(&self) -> String {
+		let loaded = self.loaded_commit_count();
+		let selected_position = if loaded == 0 {
+			0
+		} else {
+			self.selection.saturating_add(1)
+		};
+		let more_text = if self
+			.history_status
+			.is_none_or(|status| status.has_more && !status.complete)
+		{
+			format!(
+				" · {} older",
+				self.key_config.get_hint(
+					self.key_config.keys.branches_load_more
+				)
+			)
+		} else {
+			String::new()
+		};
+		format!(
+			"{} {} / {} loaded{}{}{}",
+			self.title,
+			selected_position,
+			loaded,
+			more_text,
+			if self
+				.history_status
+				.is_some_and(|status| status.pending)
+			{
+				" · loading"
+			} else {
+				""
+			},
+			self.selection_status().map_or_else(
+				String::new,
+				|status| {
+					format!(
+						"  [{} {}{}]",
+						status.count,
+						status.unit,
+						if status.extending {
+							" · extending"
+						} else {
+							""
+						}
+					)
+				}
+			),
+		)
 	}
 }
 
 impl DrawableComponent for CommitList {
 	fn draw(&self, f: &mut Frame, area: Rect) -> Result<()> {
+		self.last_draw_area.set(area);
 		let current_size = (
 			area.width.saturating_sub(2),
 			area.height.saturating_sub(2),
@@ -1048,18 +1552,33 @@ impl DrawableComponent for CommitList {
 		let height_in_lines = current_size.1 as usize;
 		let selection = self.relative_selection();
 
-		self.scroll_top.set(calc_scroll_top(
+		self.scroll_top.set(clamp_scroll_top(
 			self.scroll_top.get(),
 			height_in_lines,
 			selection,
+			self.loaded_commit_count(),
 		));
-
-		let title = format!(
-			"{} {}/{}",
-			self.title,
-			self.commits.len().saturating_sub(self.selection),
-			self.commits.len(),
-		);
+		*self.last_draw_rows.borrow_mut() = self
+			.commits
+			.iter()
+			.skip(self.scroll_top.get())
+			.take(height_in_lines)
+			.copied()
+			.collect();
+		if self.commits.is_empty() {
+			*self.last_draw_rows.borrow_mut() = self
+				.items
+				.iter()
+				.skip(
+					self.scroll_top
+						.get()
+						.saturating_sub(self.items.index_offset()),
+				)
+				.take(height_in_lines)
+				.map(|entry| entry.id)
+				.collect();
+		}
+		let title = self.title();
 
 		f.render_widget(
 			Paragraph::new(
@@ -1095,8 +1614,58 @@ impl DrawableComponent for CommitList {
 }
 
 impl Component for CommitList {
+	fn selection_status(
+		&self,
+	) -> Option<crate::components::SelectionStatus> {
+		Self::selection_status(self)
+	}
+
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
+		if let Event::Mouse(mouse) = ev {
+			return self.pointer_event(*mouse);
+		}
+
 		if let Event::Key(k) = ev {
+			if self.key_config.is_modal() {
+				if key_match(k, self.key_config.keys.select_mode) {
+					if self.selection_extending {
+						self.finish_selection();
+					} else {
+						self.begin_modal_selection();
+					}
+					return Ok(EventState::Consumed);
+				}
+				if key_match(k, self.key_config.keys.select_clear)
+					&& self.clear_modal_selection()
+				{
+					return Ok(EventState::Consumed);
+				}
+				if key_match(k, self.key_config.keys.select_all) {
+					let ids: Vec<_> = self
+						.items
+						.iter()
+						.map(|entry| entry.id)
+						.collect();
+					if let (Some(first), false) =
+						(ids.first().copied(), ids.is_empty())
+					{
+						self.selection_anchor = Some(first);
+						self.selection_extending = false;
+						self.marked = ids
+							.into_iter()
+							.enumerate()
+							.map(|(idx, id)| {
+								(self.items.index_offset() + idx, id)
+							})
+							.collect();
+					}
+					return Ok(EventState::Consumed);
+				}
+				if key_match(k, self.key_config.keys.select_item) {
+					self.toggle_modal_item();
+					return Ok(EventState::Consumed);
+				}
+			}
 			let selection_changed =
 				if key_match(k, self.key_config.keys.move_up) {
 					self.move_selection(ScrollType::Up)?
@@ -1122,7 +1691,11 @@ impl Component for CommitList {
 					k,
 					self.key_config.keys.log_mark_commit,
 				) {
-					self.mark();
+					if self.key_config.is_modal() {
+						self.toggle_modal_item();
+					} else {
+						self.mark();
+					}
 					true
 				} else if key_match(
 					k,
@@ -1170,11 +1743,25 @@ impl Component for CommitList {
 		));
 		CommandBlocking::PassingOn
 	}
+
+	fn focus(&mut self, focused: bool) {
+		if !focused {
+			self.pointer_dragging = false;
+			self.pointer_anchor = None;
+			if self.selection_extending {
+				self.finish_selection();
+			}
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
-	use asyncgit::sync::CommitInfo;
+	use super::super::utils::graphrow::{SYM_COMMIT, SYM_VERTICAL};
+	use crate::keys::{KeyConfig, Keymap};
+	use asyncgit::graph::ConnectionType;
+	use asyncgit::sync::{CommitInfo, RepoPath};
+	use crossterm::event::{KeyModifiers, MouseEvent};
 
 	use super::*;
 
@@ -1188,7 +1775,10 @@ mod tests {
 				tags: Option::None,
 				items: ItemBatch::default(),
 				commits: IndexSet::default(),
+				history_status: None,
 				marked: Vec::default(),
+				selection_anchor: None,
+				selection_extending: false,
 				scroll_top: Cell::default(),
 				local_branches: BTreeMap::default(),
 				remote_branches: BTreeMap::default(),
@@ -1196,12 +1786,16 @@ mod tests {
 				key_config: SharedKeyConfig::default(),
 				scroll_state: (Instant::now(), 0.0),
 				current_size: Cell::default(),
-				repo: RepoPathRef::new(sync::RepoPath::Path(
+				repo: RepoPathRef::new(RepoPath::Path(
 					std::path::PathBuf::default(),
 				)),
 				queue: Queue::default(),
 				show_graph: true,
 				graph_col_width: Cell::new(0),
+				last_draw_area: Cell::new(Rect::default()),
+				last_draw_rows: RefCell::new(Vec::new()),
+				pointer_dragging: false,
+				pointer_anchor: None,
 			}
 		}
 	}
@@ -1263,6 +1857,155 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn log_range_tracks_a_bounded_viewport_and_tail_loading_state() {
+		let mut list = build_commit_list_with_some_commits();
+		let ids = (0..160)
+			.map(|idx| {
+				CommitId::from_str_unchecked(&format!("{idx:040}"))
+					.unwrap()
+			})
+			.collect();
+		list.set_commits(ids);
+
+		let (start, end) = list.requested_log_range();
+		assert_eq!(start, 0);
+		assert_eq!(
+			end,
+			DEFAULT_LOG_VIEWPORT_ROWS + LOG_PREFETCH_ROWS
+		);
+		assert!(!list.should_load_more());
+
+		list.selection = 151;
+		assert!(list.should_load_more());
+		list.set_history_status(LogRangeStatus {
+			generation: 1,
+			loaded: 160,
+			pending: true,
+			has_more: true,
+			complete: false,
+		});
+		assert!(!list.should_load_more());
+		list.set_history_status(LogRangeStatus {
+			generation: 1,
+			loaded: 160,
+			pending: false,
+			has_more: false,
+			complete: true,
+		});
+		assert!(!list.should_load_more());
+	}
+
+	fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+		Event::Mouse(MouseEvent {
+			kind,
+			column,
+			row,
+			modifiers: KeyModifiers::NONE,
+		})
+	}
+
+	#[test]
+	fn commit_summary_display_escapes_controls_and_preserves_unicode()
+	{
+		assert_eq!(
+			escape_display_label("wide界\tmessage\\\u{1b}"),
+			"wide界\\tmessage\\\\\\u{1b}"
+		);
+	}
+
+	#[test]
+	fn pointer_hits_follow_drawn_commit_ids_after_scroll() {
+		let mut list = build_commit_list_with_some_commits();
+		list.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let backend = ratatui::backend::TestBackend::new(40, 8);
+		let mut terminal = ratatui::Terminal::new(backend).unwrap();
+		let area = Rect::new(2, 1, 30, 7);
+
+		terminal
+			.draw(|frame| list.draw(frame, area).unwrap())
+			.unwrap();
+		let first = list.last_draw_rows.borrow()[0];
+		assert_eq!(
+			list.event(&mouse(
+				MouseEventKind::Down(MouseButton::Left),
+				2,
+				2
+			))
+			.unwrap(),
+			EventState::NotConsumed,
+		);
+		list.event(&mouse(
+			MouseEventKind::Down(MouseButton::Left),
+			3,
+			2,
+		))
+		.unwrap();
+		assert_eq!(list.selected_entry().unwrap().id, first);
+		list.event(&mouse(
+			MouseEventKind::Up(MouseButton::Left),
+			3,
+			2,
+		))
+		.unwrap();
+
+		list.selection = 12;
+		list.scroll_top.set(5);
+		terminal
+			.draw(|frame| list.draw(frame, area).unwrap())
+			.unwrap();
+		let first_scrolled = list.last_draw_rows.borrow()[0];
+		list.event(&mouse(
+			MouseEventKind::Down(MouseButton::Left),
+			3,
+			2,
+		))
+		.unwrap();
+		assert_eq!(list.selected_entry().unwrap().id, first_scrolled);
+		list.event(&mouse(
+			MouseEventKind::Up(MouseButton::Left),
+			3,
+			2,
+		))
+		.unwrap();
+
+		let before_wheel = list.selected_entry().unwrap().id;
+		list.event(&mouse(MouseEventKind::ScrollDown, 3, 6))
+			.unwrap();
+		assert_ne!(list.selected_entry().unwrap().id, before_wheel);
+	}
+
+	#[test]
+	fn modal_marked_commit_is_a_full_row_highlight_without_checkmark()
+	{
+		let mut list = build_commit_list_with_some_commits();
+		list.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let entry = list.selected_entry().unwrap();
+		let line = list.get_entry_to_add(
+			entry,
+			false,
+			false,
+			None,
+			None,
+			None,
+			&list.theme,
+			60,
+			Local::now(),
+			Some(true),
+			&HashSet::new(),
+		);
+		assert!(line
+			.spans
+			.iter()
+			.all(|span| span.style.bg.is_some()));
+		assert!(line
+			.spans
+			.iter()
+			.all(|span| !span.content.contains('✓')));
+	}
+
 	/// Build a value for cl.marked based on indices into cl.items
 	fn build_marked_from_indices(
 		cl: &CommitList,
@@ -1275,6 +2018,48 @@ mod tests {
 				(*idx, cl.items.iter().nth(*idx - offset).unwrap().id)
 			})
 			.collect()
+	}
+
+	#[test]
+	fn action_commit_prefers_one_modal_mark_after_cursor_moves() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		cl.marked = build_marked_from_indices(&cl, &[3]);
+		cl.selection = 8;
+
+		assert_eq!(
+			cl.action_commit(),
+			cl.marked.first().map(|m| m.1)
+		);
+	}
+
+	#[test]
+	fn action_commit_rejects_multiple_modal_marks() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		cl.marked = build_marked_from_indices(&cl, &[3, 5]);
+
+		assert_eq!(cl.action_commit(), None);
+		assert!(cl.has_multiple_action_commits());
+	}
+
+	#[test]
+	fn action_commit_without_marks_uses_cursor_for_both_keymaps() {
+		let legacy = build_commit_list_with_some_commits();
+		let mut modal = build_commit_list_with_some_commits();
+		modal.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+
+		assert_eq!(
+			legacy.action_commit(),
+			legacy.selected_entry().map(|e| e.id)
+		);
+		assert_eq!(
+			modal.action_commit(),
+			modal.selected_entry().map(|e| e.id)
+		);
 	}
 
 	#[test]
@@ -1352,6 +2137,482 @@ mod tests {
 	}
 
 	#[test]
+	fn modal_range_is_stable_when_selection_reverses() {
+		let mut cl = build_commit_list_with_some_commits();
+		let anchor = cl
+			.items
+			.iter()
+			.nth(6 - cl.items.index_offset())
+			.unwrap()
+			.id;
+		cl.selection = 6;
+		cl.selection_anchor = Some(anchor);
+		cl.selection_extending = true;
+		cl.update_modal_range();
+		assert_eq!(cl.marked_commits().len(), 1);
+
+		cl.selection = 3;
+		cl.update_modal_range();
+		let selected = cl.marked_commits();
+		assert_eq!(selected.len(), 4);
+		assert_eq!(
+			selected.first().unwrap(),
+			&CommitId::from_str_unchecked(
+				"0000000000000000000000000000000000000001"
+			)
+			.unwrap()
+		);
+		assert_eq!(
+			selected.last().unwrap(),
+			&CommitId::from_str_unchecked(
+				"0000000000000000000000000000000000000004"
+			)
+			.unwrap()
+		);
+	}
+
+	#[test]
+	fn modal_range_reversal_at_loaded_boundaries_includes_both_ends()
+	{
+		let mut cl = build_commit_list_with_some_commits();
+		cl.selection =
+			cl.items.index_offset() + cl.items.iter().count() - 1;
+		cl.selection_anchor =
+			cl.selected_entry().map(|entry| entry.id);
+		cl.selection_extending = true;
+		cl.selection = cl.items.index_offset();
+		cl.update_modal_range();
+		assert_eq!(cl.marked.len(), cl.items.iter().count());
+		assert_eq!(
+			cl.marked.first().unwrap().1,
+			cl.items.iter().next().unwrap().id
+		);
+		assert_eq!(
+			cl.marked.last().unwrap().1,
+			cl.items.iter().last().unwrap().id
+		);
+		assert_eq!(
+			cl.marked.first().unwrap().0,
+			cl.items.index_offset()
+		);
+		assert_eq!(
+			cl.marked.last().unwrap().0,
+			cl.items.index_offset() + cl.items.iter().count() - 1
+		);
+	}
+
+	#[test]
+	fn modal_status_reports_marks_after_extension_finishes() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config = Rc::new(crate::keys::KeyConfig::with_keymap(
+			crate::keys::Keymap::Helix,
+		));
+		cl.commits = cl.items.iter().map(|entry| entry.id).collect();
+		cl.selection = 6;
+		cl.begin_modal_selection();
+		cl.selection = 9;
+		cl.update_modal_range();
+		assert_eq!(cl.selection_status().unwrap().count, 4);
+		assert_eq!(
+			cl.selection_status().unwrap().unit,
+			"loaded commits"
+		);
+
+		// Toggling off the current marked commit ends the range and leaves
+		// the actual remaining marks as the selection.
+		cl.toggle_modal_item();
+		let marked_count = cl.marked.len();
+		assert!(!cl.selection_extending);
+		assert_eq!(
+			cl.selection_status().unwrap().count,
+			marked_count
+		);
+		assert_eq!(cl.selection_status().unwrap().unit, "commits");
+
+		cl.selection = 12;
+		cl.update_modal_range();
+		assert_eq!(
+			cl.selection_status().unwrap().count,
+			marked_count
+		);
+	}
+
+	#[test]
+	fn modal_status_includes_a_single_x_mark_without_an_anchor() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config = Rc::new(crate::keys::KeyConfig::with_keymap(
+			crate::keys::Keymap::Helix,
+		));
+		cl.selection = 4;
+		cl.mark();
+
+		let status = cl.selection_status().unwrap();
+		assert_eq!(status.count, 1);
+		assert_eq!(status.unit, "commits");
+		assert!(!status.extending);
+	}
+
+	#[test]
+	fn modal_select_all_status_names_loaded_commit_scope() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let first = cl.items.iter().next().unwrap().id;
+		cl.selection_anchor = Some(first);
+		cl.marked = cl
+			.items
+			.iter()
+			.enumerate()
+			.map(|(idx, entry)| {
+				(cl.items.index_offset() + idx, entry.id)
+			})
+			.collect();
+
+		let status = cl.selection_status().unwrap();
+		assert_eq!(status.count, cl.items.iter().count());
+		assert_eq!(status.unit, "loaded commits");
+		assert!(!status.extending);
+	}
+
+	#[test]
+	fn scroll_top_tracks_the_same_global_row_when_the_loaded_window_moves(
+	) {
+		assert_eq!(translate_scroll_top(800, 100, 850), 50);
+		assert_eq!(translate_scroll_top(800, 100, 950), 0);
+	}
+
+	#[test]
+	fn scroll_top_clamps_to_a_short_loaded_window_after_resize() {
+		let mut cl = build_commit_list_with_some_commits();
+		let info = CommitInfo {
+			message: String::new(),
+			time: 0,
+			author: String::new(),
+			id: CommitId::from_str_unchecked(
+				"9999999999999999999999999999999999999998",
+			)
+			.unwrap(),
+			parents: Vec::new().into(),
+		};
+		let last_id = CommitId::from_str_unchecked(
+			"9999999999999999999999999999999999999999",
+		)
+		.unwrap();
+		cl.set_commits([info.id, last_id].into_iter().collect());
+		cl.set_metadata_range(
+			0,
+			vec![
+				info.clone(),
+				CommitInfo {
+					id: last_id,
+					..info
+				},
+			],
+		);
+		cl.selection = 1;
+		cl.scroll_top.set(clamp_scroll_top(900, 80, 1, 2));
+
+		let rows = cl.get_text(80, 60);
+
+		assert_eq!(cl.scroll_top.get(), 0);
+		assert_eq!(rows.len(), 2);
+	}
+
+	#[test]
+	fn growing_commit_stream_keeps_selection_stable_while_metadata_loads(
+	) {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config =
+			Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let commit_ids: Vec<_> = (0..384)
+			.map(|idx| {
+				CommitId::from_str_unchecked(&format!("{idx:040}"))
+					.unwrap()
+			})
+			.collect();
+		cl.set_commits(commit_ids[..128].iter().copied().collect());
+		assert!(cl.items.is_empty());
+		assert_eq!(cl.loaded_commit_count(), 128);
+
+		cl.refresh_extend_data(commit_ids[128..256].to_vec());
+		assert_eq!(cl.loaded_commit_count(), 256);
+
+		cl.selection = 138;
+		let selected_id = commit_ids[cl.selection];
+		assert_eq!(cl.selected_commit_id(), Some(selected_id));
+
+		cl.refresh_extend_data(commit_ids[256..].to_vec());
+		assert_eq!(cl.loaded_commit_count(), 384);
+		assert_eq!(cl.selected_commit_id(), Some(selected_id));
+		assert!(cl.selected_entry().is_none());
+
+		cl.set_metadata_range(
+			138,
+			vec![CommitInfo {
+				message: "selected commit".to_owned(),
+				time: 0,
+				author: "author".to_owned(),
+				id: selected_id,
+				parents: Vec::new().into(),
+			}],
+		);
+		assert_eq!(
+			cl.selected_entry().map(|entry| entry.id),
+			Some(selected_id)
+		);
+
+		let height = 38;
+		cl.scroll_top.set(clamp_scroll_top(
+			cl.scroll_top.get(),
+			height,
+			cl.relative_selection(),
+			cl.loaded_commit_count(),
+		));
+		let rows = cl.get_text(height, 120);
+		let row_index = cl.selection - cl.scroll_top.get();
+		let selected_row = &rows[row_index];
+		let rendered_row = selected_row
+			.spans
+			.iter()
+			.map(|span| span.content.as_ref())
+			.collect::<String>();
+		assert!(rendered_row.contains('›'));
+		let selected_prefix = selected_id.get_short_string();
+		assert!(rendered_row.contains(&selected_prefix));
+	}
+
+	#[test]
+	fn graph_lane_positions_do_not_shift_when_scrolling_the_viewport()
+	{
+		let mut cl = build_commit_list_with_some_commits();
+		let short_row = GraphRow {
+			lanes: vec![Some((
+				ConnectionType::CommitNormal,
+				0.into(),
+			))],
+			..GraphRow::default()
+		};
+		let wide_row = GraphRow {
+			lanes: (0..15)
+				.map(|index| {
+					Some((
+						if index == 0 {
+							ConnectionType::CommitMerge
+						} else {
+							ConnectionType::Vertical
+						},
+						index.into(),
+					))
+				})
+				.collect(),
+			..GraphRow::default()
+		};
+		let mut rows =
+			vec![short_row.clone(); cl.items.iter().count()];
+		rows[1] = wide_row;
+		cl.set_graph_rows(rows);
+
+		let _ = cl.get_text(1, 90);
+		let width_at_first_row = cl.graph_col_width.get();
+		cl.scroll_top.set(2);
+		let _ = cl.get_text(1, 90);
+
+		assert_eq!(width_at_first_row, 30);
+		assert_eq!(cl.graph_col_width.get(), width_at_first_row);
+		let spans = CommitList::graph_row_spans(
+			cl.items.iter().nth(1).unwrap().graph.as_ref().unwrap(),
+			width_at_first_row,
+			&HashSet::new(),
+		);
+		assert_eq!(spans[28].content, SYM_VERTICAL);
+
+		let info = CommitInfo {
+			message: String::new(),
+			time: 0,
+			author: String::new(),
+			id: CommitId::from_str_unchecked(
+				"8888888888888888888888888888888888888888",
+			)
+			.unwrap(),
+			parents: Vec::new().into(),
+		};
+		cl.items.set_items(100, vec![info], None);
+		cl.set_graph_rows(vec![short_row]);
+		cl.scroll_top.set(0);
+		let _ = cl.get_text(1, 90);
+
+		assert_eq!(cl.graph_col_width.get(), 2);
+	}
+
+	#[test]
+	fn graph_width_leaves_message_space_in_a_narrow_pane() {
+		let mut cl = build_commit_list_with_some_commits();
+		let info = CommitInfo {
+			message: "short merge".to_owned(),
+			time: 0,
+			author: "A. Author".to_owned(),
+			id: CommitId::from_str_unchecked(
+				"7777777777777777777777777777777777777777",
+			)
+			.unwrap(),
+			parents: Vec::new().into(),
+		};
+		cl.items.set_items(0, vec![info], None);
+		let row = GraphRow {
+			lane_count: 16.into(),
+			commit_lane: 0.into(),
+			is_merge: true,
+			lanes: (0..16)
+				.map(|index| {
+					Some((
+						match index {
+							0 => ConnectionType::MergeBridgeStart,
+							15 => ConnectionType::MergeBridgeEnd,
+							_ => ConnectionType::MergeBridgeMid,
+						},
+						index.into(),
+					))
+				})
+				.collect(),
+			merge_bridge: Some((0.into(), 15.into())),
+			..GraphRow::default()
+		};
+		cl.set_graph_rows(vec![row]);
+
+		let line = cl.get_text(1, 90).remove(0);
+		let text: String = line
+			.spans
+			.iter()
+			.map(|span| span.content.as_ref())
+			.collect();
+
+		assert_eq!(cl.graph_col_width.get(), 30);
+		assert!(text.contains("…"));
+		assert!(text.contains("short merge"));
+	}
+
+	#[test]
+	fn narrow_graph_row_marks_clipped_parent_lanes() {
+		let row = GraphRow {
+			lane_count: 15.into(),
+			commit_lane: 0.into(),
+			is_merge: true,
+			lanes: (0..15)
+				.map(|index| {
+					Some((
+						match index {
+							0 => ConnectionType::MergeBridgeStart,
+							14 => ConnectionType::MergeBridgeEnd,
+							_ => ConnectionType::MergeBridgeMid,
+						},
+						index.into(),
+					))
+				})
+				.collect(),
+			merge_bridge: Some((0.into(), 14.into())),
+			..GraphRow::default()
+		};
+		let spans = CommitList::graph_row_spans(
+			&row,
+			8,
+			&std::collections::HashSet::new(),
+		);
+
+		assert_eq!(spans.len(), 8);
+		assert_eq!(spans.last().unwrap().content, "…");
+	}
+
+	#[test]
+	fn explicit_marks_survive_window_refresh_and_keep_commit_order() {
+		let mut cl = build_commit_list_with_some_commits();
+		let before_window = [
+			CommitId::from_str_unchecked(
+				"fffffffffffffffffffffffffffffffffffffffe",
+			)
+			.unwrap(),
+			CommitId::from_str_unchecked(
+				"ffffffffffffffffffffffffffffffffffffffff",
+			)
+			.unwrap(),
+		];
+		cl.commits = before_window
+			.into_iter()
+			.chain(cl.items.iter().map(|entry| entry.id))
+			.collect();
+		cl.selection = 5;
+		cl.mark();
+		let selected_id = cl.marked[0].1;
+
+		let info = CommitInfo {
+			message: String::new(),
+			time: 0,
+			author: String::new(),
+			id: cl.commits[8],
+			parents: Vec::new().into(),
+		};
+		cl.items.set_items(8, vec![info], None);
+		cl.selection_anchor = None;
+		cl.selection_extending = false;
+
+		assert_eq!(cl.marked_commits(), vec![selected_id]);
+		assert_eq!(cl.marked[0].0, 5);
+	}
+
+	#[test]
+	fn modal_anchor_is_cleared_when_commit_data_changes() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.key_config = Rc::new(crate::keys::KeyConfig::with_keymap(
+			crate::keys::Keymap::Helix,
+		));
+		cl.commits = cl.items.iter().map(|entry| entry.id).collect();
+		cl.selection_anchor =
+			cl.items.iter().next().map(|entry| entry.id);
+		cl.selection_extending = true;
+		cl.set_commits(IndexSet::new());
+		assert!(cl.selection_anchor.is_none());
+		assert!(!cl.selection_extending);
+		assert!(cl.marked.is_empty());
+	}
+
+	#[test]
+	fn explicit_marks_survive_ordinary_cursor_movement() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.mark();
+		let marked = cl.marked_commits();
+		cl.move_selection_normal(ScrollType::Down).unwrap();
+		assert_eq!(cl.marked_commits(), marked);
+	}
+
+	#[test]
+	fn stale_anchor_cannot_map_marks_into_a_new_window() {
+		let mut cl = build_commit_list_with_some_commits();
+		cl.selection_anchor = cl
+			.items
+			.iter()
+			.nth(4 - cl.items.index_offset())
+			.map(|e| e.id);
+		cl.selection_extending = true;
+		cl.update_modal_range();
+		assert!(!cl.marked.is_empty());
+
+		let info = CommitInfo {
+			message: String::new(),
+			time: 0,
+			author: String::new(),
+			id: CommitId::from_str_unchecked(
+				"9999999999999999999999999999999999999999",
+			)
+			.unwrap(),
+			parents: Vec::new().into(),
+		};
+		cl.items.set_items(0, vec![info], None);
+		cl.update_modal_range();
+		assert!(cl.selection_anchor.is_none());
+		assert!(!cl.selection_extending);
+		assert!(cl.marked.is_empty());
+	}
+
+	#[test]
 	fn test_build_graph_spans() {
 		let row = GraphRow {
 			lane_count: 1.into(),
@@ -1366,14 +2627,36 @@ mod tests {
 			merge_bridge: None,
 			branches: vec![],
 		};
-		let spans = CommitList::build_graph_spans(
+		let spans = CommitList::graph_row_spans(
 			&row,
-			1,
+			2,
 			&std::collections::HashSet::new(),
 		);
 
 		assert_eq!(spans.len(), 2);
 		assert_eq!(spans[0].content, Cow::from(SYM_COMMIT));
 		assert_eq!(spans[1].content, Cow::from(SYM_SPACE));
+	}
+
+	#[test]
+	fn graph_spans_preserve_physical_lane_positions() {
+		let row = GraphRow {
+			lanes: vec![
+				None,
+				Some((ConnectionType::Vertical, 1.into())),
+			],
+			..GraphRow::default()
+		};
+		let spans = CommitList::graph_row_spans(
+			&row,
+			4,
+			&std::collections::HashSet::new(),
+		);
+
+		assert_eq!(spans.len(), 4);
+		assert_eq!(spans[0].content, SYM_SPACE);
+		assert_eq!(spans[1].content, SYM_SPACE);
+		assert_eq!(spans[2].content, SYM_VERTICAL);
+		assert_eq!(spans[3].content, SYM_SPACE);
 	}
 }

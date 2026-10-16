@@ -83,24 +83,28 @@ impl Gitui {
 	{
 		let spinner_ticker = tick(SPINNER_INTERVAL);
 		let mut spinner = Spinner::default();
-		let mut first_update = true;
 
+		// Paint a lightweight shell before activating the requested
+		// tab. Showing tabs starts repository reads, so activation must
+		// happen only after the first frame reaches the terminal.
+		self.draw(terminal)?;
+		self.app.activate_initial_tab()?;
 		self.app.update()?;
+		// `App::update` starts the initial asynchronous repository
+		// reads; paint their pending state before waiting for results.
+		self.draw(terminal)?;
+		spinner.set_state(self.app.any_work_pending());
+		spinner.draw(terminal)?;
 
 		loop {
-			let event = if first_update {
-				first_update = false;
-				QueueEvent::Notify
-			} else {
-				select_event(
-					&self.rx_input,
-					&self.rx_git,
-					&self.rx_app,
-					&self.rx_ticker,
-					&self.rx_watcher,
-					&spinner_ticker,
-				)?
-			};
+			let event = select_event(
+				&self.rx_input,
+				&self.rx_git,
+				&self.rx_app,
+				&self.rx_ticker,
+				&self.rx_watcher,
+				&spinner_ticker,
+			)?;
 
 			{
 				if matches!(event, QueueEvent::SpinnerUpdate) {
@@ -122,7 +126,12 @@ impl Gitui {
 						}
 						self.app.event(ev)?;
 					}
-					QueueEvent::Tick | QueueEvent::Notify => {
+					QueueEvent::Tick => {
+						self.app.poll_repository();
+						self.app.update()?;
+					}
+					QueueEvent::Notify => {
+						self.app.invalidate_repository();
 						self.app.update()?;
 					}
 					QueueEvent::AsyncEvent(ev) => {
@@ -160,8 +169,8 @@ impl Gitui {
 	}
 
 	#[cfg(test)]
-	fn update_async(&mut self, event: crate::AsyncNotification) {
-		self.app.update_async(event).unwrap();
+	fn activate_initial_tab(&mut self) {
+		self.app.activate_initial_tab().unwrap();
 	}
 
 	#[cfg(test)]
@@ -179,14 +188,34 @@ impl Gitui {
 	}
 
 	#[cfg(test)]
+	fn input_event_kind(
+		&mut self,
+		code: KeyCode,
+		modifiers: KeyModifiers,
+		kind: crossterm::event::KeyEventKind,
+	) {
+		let event = crossterm::event::KeyEvent::new_with_kind(
+			code, modifiers, kind,
+		);
+		self.app
+			.event(crate::input::InputEvent::Input(
+				crossterm::event::Event::Key(event),
+			))
+			.unwrap();
+	}
+
+	#[cfg(test)]
 	fn wait_for_async_git_notification(
-		&self,
+		&mut self,
 		expected: AsyncGitNotification,
 	) {
 		loop {
 			let actual = self
 				.rx_git
 				.recv_timeout(std::time::Duration::from_millis(100))
+				.unwrap();
+			self.app
+				.update_async(crate::AsyncNotification::Git(actual))
 				.unwrap();
 
 			if actual == expected {
@@ -237,7 +266,7 @@ impl Gitui {
 
 #[cfg(test)]
 mod tests {
-	use std::path::PathBuf;
+	use std::{cell::RefCell, path::PathBuf};
 
 	use asyncgit::{sync::RepoPath, AsyncGitNotification};
 	use crossterm::event::{KeyCode, KeyModifiers};
@@ -247,7 +276,7 @@ mod tests {
 
 	use crate::{
 		args::CliArgs, gitui::Gitui, keys::KeyConfig,
-		ui::style::Theme, AsyncNotification, Updater,
+		ui::style::Theme, Updater,
 	};
 
 	// Macro adapted from: https://insta.rs/docs/cmd/
@@ -267,7 +296,7 @@ mod tests {
 			// letters in the prefix and are pinned dates,
 			// so they deliberately do not match and stay
 			// unmasked.
-			settings.add_filter(r"│[o ]{0,10}[a-f0-9]{7} ", "│[AAAAA] ");
+			settings.add_filter(r"(│[*o ]{0,10})[a-f0-9]{7} ", "$1[AAAAA] ");
 			// The rebase e2e sandbox repository (its absolute
 			// path shows trimmed in the top bar; everything
 			// inside the repo is date-deterministic, so oids
@@ -284,6 +313,7 @@ mod tests {
 		let (temp_dir, _repo) = repo_init_suffix(Some("-insta"));
 		let path: RepoPath = temp_dir.path().to_str().unwrap().into();
 		let cliargs = CliArgs {
+			keymap: crate::keys::Keymap::Legacy,
 			theme: PathBuf::from("theme.ron"),
 			select_file: None,
 			repo_path: path,
@@ -305,10 +335,12 @@ mod tests {
 		gitui.draw(&mut terminal).unwrap();
 
 		assert_snapshot!("app_loading", terminal.backend());
+		assert!(gitui.app.has_deferred_initial_tab());
+		assert!(!gitui.app.startup_status_scan_pending());
+		gitui.activate_initial_tab();
+		gitui.app.update().unwrap();
 
-		let event =
-			AsyncNotification::Git(AsyncGitNotification::Status);
-		gitui.update_async(event);
+		gitui.pump();
 
 		gitui.draw(&mut terminal).unwrap();
 
@@ -325,6 +357,7 @@ mod tests {
 		);
 
 		gitui.update();
+		gitui.pump();
 
 		gitui.draw(&mut terminal).unwrap();
 
@@ -332,6 +365,39 @@ mod tests {
 			"app_log_tab_showing_one_commit",
 			terminal.backend()
 		);
+	}
+
+	#[test]
+	fn saved_tab_is_shown_in_the_shell_before_repository_reads() {
+		let (temp_dir, _repo) = repo_init_suffix(None::<&str>);
+		let repo = RefCell::new(RepoPath::Path(
+			temp_dir.path().to_path_buf(),
+		));
+		let options = crate::options::Options::new(repo);
+		options.borrow_mut().set_current_tab(1);
+
+		let cliargs = CliArgs {
+			keymap: crate::keys::Keymap::Legacy,
+			theme: PathBuf::from("theme.ron"),
+			select_file: None,
+			repo_path: RepoPath::Path(temp_dir.path().to_path_buf()),
+			notify_watcher: false,
+			key_bindings_path: None,
+			key_symbols_path: None,
+		};
+		let theme = Theme::init(&PathBuf::new());
+		let key_config = KeyConfig::default();
+		let gitui =
+			Gitui::new(cliargs, theme, &key_config, Updater::Ticker)
+				.unwrap();
+		let mut terminal =
+			Terminal::new(TestBackend::new(90, 12)).unwrap();
+		gitui.draw(&mut terminal).unwrap();
+
+		let rendered = terminal.backend().to_string();
+		assert!(rendered.contains("Loading Log"), "{rendered}");
+		assert!(gitui.app.has_deferred_initial_tab());
+		assert!(!gitui.app.startup_status_scan_pending());
 	}
 
 	// ------------------------------------------------------------------
@@ -548,7 +614,15 @@ done
 		/// Build the real app over this repository (the
 		/// harness must be installed first).
 		fn app(&self) -> Gitui {
+			self.app_with_keymap(crate::keys::Keymap::Legacy)
+		}
+
+		fn app_with_keymap(
+			&self,
+			keymap: crate::keys::Keymap,
+		) -> Gitui {
 			let cliargs = CliArgs {
+				keymap,
 				theme: PathBuf::from("theme.ron"),
 				select_file: None,
 				repo_path: RepoPath::Path(self.repo()),
@@ -557,9 +631,17 @@ done
 				key_symbols_path: None,
 			};
 			let theme = Theme::init(&PathBuf::new());
-			let key_config = KeyConfig::default();
-			Gitui::new(cliargs, theme, &key_config, Updater::Ticker)
-				.unwrap()
+			let key_config = KeyConfig::with_keymap(keymap);
+			let mut app = Gitui::new(
+				cliargs,
+				theme,
+				&key_config,
+				Updater::Ticker,
+			)
+			.unwrap();
+			app.activate_initial_tab();
+			app.app.update().unwrap();
+			app
 		}
 	}
 
@@ -578,6 +660,385 @@ done
 		gitui.pump();
 	}
 
+	fn modal_key(app: &mut Gitui, c: char) {
+		app.input_event(KeyCode::Char(c), KeyModifiers::NONE);
+	}
+
+	fn rendered(app: &Gitui, width: u16, height: u16) -> String {
+		let mut terminal =
+			Terminal::new(TestBackend::new(width, height)).unwrap();
+		app.draw(&mut terminal).unwrap();
+		terminal.backend().to_string()
+	}
+
+	#[test]
+	fn legacy_repeat_navigation_moves_but_repeat_stage_is_ignored() {
+		let sandbox = Sandbox::new();
+		sandbox.write("base.txt", "base\n");
+		sandbox.commit("base");
+		sandbox.write("a.txt", "changed a\n");
+		sandbox.write("b.txt", "changed b\n");
+		let _harness = sandbox.harness();
+		let mut app = sandbox.app();
+		settle(&mut app);
+
+		app.input_event_kind(
+			KeyCode::Enter,
+			KeyModifiers::NONE,
+			crossterm::event::KeyEventKind::Repeat,
+		);
+		assert_eq!(
+			sandbox
+				.git_ok(&["diff", "--cached", "--name-only", "-z"])
+				.stdout,
+			b""
+		);
+
+		app.input_event_kind(
+			KeyCode::Down,
+			KeyModifiers::NONE,
+			crossterm::event::KeyEventKind::Repeat,
+		);
+		app.input_event(KeyCode::Enter, KeyModifiers::NONE);
+		settle(&mut app);
+		assert_eq!(
+			sandbox
+				.git_ok(&["diff", "--cached", "--name-only", "-z"])
+				.stdout,
+			b"b.txt\0"
+		);
+	}
+
+	#[test]
+	fn modal_e2e_reverse_range_stages_only_the_visible_selection() {
+		let s = Sandbox::new();
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			s.write(name, "base\n");
+		}
+		s.commit("base");
+		let original_head = s.head();
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			s.write(name, "changed\n");
+		}
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		modal_key(&mut app, 'v');
+		modal_key(&mut app, 'j');
+		modal_key(&mut app, 'k');
+		assert!(rendered(&app, 100, 25).contains("SELECT 1 files"));
+		modal_key(&mut app, 's');
+		let staged = s
+			.git_ok(&["diff", "--cached", "--name-only", "-z"])
+			.stdout;
+		assert_eq!(staged, b"a.txt\0");
+		assert_eq!(s.head(), original_head);
+	}
+
+	#[test]
+	fn modal_e2e_explicit_marks_do_not_extend_with_cursor_motion() {
+		let s = Sandbox::new();
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			s.write(name, "base\n");
+		}
+		s.commit("base");
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			s.write(name, "changed\n");
+		}
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		modal_key(&mut app, 'x');
+		modal_key(&mut app, '2');
+		modal_key(&mut app, 'j');
+		modal_key(&mut app, 'x');
+		modal_key(&mut app, 's');
+		let staged = s
+			.git_ok(&["diff", "--cached", "--name-only", "-z"])
+			.stdout;
+		assert_eq!(staged, b"a.txt\0c.txt\0");
+	}
+
+	#[test]
+	fn modal_e2e_prefix_palette_and_branch_filter_own_printable_input(
+	) {
+		let s = Sandbox::new();
+		s.four_commits();
+		s.git_ok(&["branch", "feature/topic"]);
+		let original_head = s.head();
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		modal_key(&mut app, 'g');
+		modal_key(&mut app, 'q');
+		assert!(matches!(
+			app.app.quit_state(),
+			crate::app::QuitState::None
+		));
+		app.input_event(KeyCode::Esc, KeyModifiers::NONE);
+		modal_key(&mut app, ':');
+		for c in "qhjkl g".chars() {
+			modal_key(&mut app, c);
+		}
+		assert!(rendered(&app, 100, 25).contains("qhjkl g"));
+		assert!(matches!(
+			app.app.quit_state(),
+			crate::app::QuitState::None
+		));
+		app.input_event(KeyCode::Esc, KeyModifiers::NONE);
+		modal_key(&mut app, ' ');
+		modal_key(&mut app, 'B');
+		for c in "feature/topic".chars() {
+			modal_key(&mut app, c);
+		}
+		assert!(rendered(&app, 120, 30).contains("feature/topic"));
+		modal_key(&mut app, ' ');
+		app.input_event(KeyCode::Esc, KeyModifiers::NONE);
+		assert!(rendered(&app, 120, 30).contains("Branches"));
+		assert_eq!(s.head(), original_head);
+	}
+
+	#[test]
+	fn modal_e2e_mouse_then_stage_targets_the_drawn_file() {
+		use crossterm::event::{
+			MouseButton, MouseEvent, MouseEventKind,
+		};
+		let sandbox = Sandbox::new();
+		for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+			sandbox.write(name, "base\n");
+		}
+		sandbox.commit("base");
+		for name in ["alpha.txt", "beta.txt", "gamma.txt"] {
+			sandbox.write(name, "changed\n");
+		}
+		let _harness = sandbox.harness();
+		let mut app =
+			sandbox.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		let screen = rendered(&app, 132, 36);
+		let (row, column) = screen
+			.lines()
+			.enumerate()
+			.find_map(|(row, line)| {
+				line.find("beta.txt")
+					.filter(|column| *column < 65)
+					.map(|column| (row, column))
+			})
+			.expect("beta must be visible in the working tree");
+		for kind in [
+			MouseEventKind::Down(MouseButton::Left),
+			MouseEventKind::Up(MouseButton::Left),
+		] {
+			app.app
+				.event(crate::input::InputEvent::Input(
+					crossterm::event::Event::Mouse(MouseEvent {
+						kind,
+						column: u16::try_from(column).unwrap(),
+						row: u16::try_from(row).unwrap(),
+						modifiers: KeyModifiers::NONE,
+					}),
+				))
+				.unwrap();
+			let _ = rendered(&app, 132, 36);
+		}
+		modal_key(&mut app, 's');
+		assert_eq!(
+			sandbox
+				.git_ok(&["diff", "--cached", "--name-only", "-z"])
+				.stdout,
+			b"beta.txt\0"
+		);
+		settle(&mut app);
+		assert!(rendered(&app, 132, 36).contains("Staged Changes"));
+	}
+
+	#[test]
+	fn modal_e2e_mouse_routes_worktree_and_staged_rows_after_diff_focus(
+	) {
+		use crossterm::event::{
+			MouseButton, MouseEvent, MouseEventKind,
+		};
+		let sandbox = Sandbox::new();
+		for name in ["recovery.txt", "staged.txt"] {
+			sandbox.write(name, "base\n");
+		}
+		sandbox.commit("base");
+		sandbox.write("recovery.txt", "worktree edit\n");
+		sandbox.write("staged.txt", "staged edit\n");
+		sandbox.git_ok(&["add", "staged.txt"]);
+
+		let _harness = sandbox.harness();
+		let mut app =
+			sandbox.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		app.input_event(KeyCode::Tab, KeyModifiers::NONE);
+		app.input_event(KeyCode::Tab, KeyModifiers::NONE);
+
+		let click_label = |app: &mut Gitui, label: &str| {
+			let screen = rendered(app, 132, 36);
+			let (row, column) = screen
+				.lines()
+				.enumerate()
+				.find_map(|(row, line)| {
+					line.find(label)
+						.filter(|column| *column < 65)
+						.map(|column| (row, column))
+				})
+				.unwrap_or_else(|| {
+					panic!("{label:?} must be visible")
+				});
+			for kind in [
+				MouseEventKind::Down(MouseButton::Left),
+				MouseEventKind::Up(MouseButton::Left),
+			] {
+				app.app
+					.event(crate::input::InputEvent::Input(
+						crossterm::event::Event::Mouse(MouseEvent {
+							kind,
+							column: u16::try_from(column).unwrap(),
+							row: u16::try_from(row).unwrap(),
+							modifiers: KeyModifiers::NONE,
+						}),
+					))
+					.unwrap();
+				let _ = rendered(app, 132, 36);
+			}
+		};
+
+		// Diff focus targets the staged side and changes the vertical pane
+		// proportions. The visible worktree file must still route to Workdir.
+		click_label(&mut app, "recovery.txt");
+		modal_key(&mut app, 's');
+		settle(&mut app);
+		assert_eq!(
+			sandbox
+				.git_ok(&["diff", "--cached", "--name-only", "-z"])
+				.stdout,
+			b"recovery.txt\0staged.txt\0"
+		);
+
+		click_label(&mut app, "staged.txt");
+		modal_key(&mut app, 'u');
+		settle(&mut app);
+		assert_eq!(
+			sandbox
+				.git_ok(&["diff", "--cached", "--name-only", "-z"])
+				.stdout,
+			b"recovery.txt\0"
+		);
+		assert_eq!(
+			sandbox.git_ok(&["diff", "--name-only", "-z"]).stdout,
+			b"staged.txt\0"
+		);
+	}
+
+	#[test]
+	fn modal_e2e_enter_stages_one_line_and_preserves_another_hunk() {
+		let s = Sandbox::new();
+		let base = (0..30)
+			.map(|i| format!("line {i}\n"))
+			.collect::<String>();
+		s.write("file.txt", &base);
+		s.commit("base");
+		s.write(
+			"file.txt",
+			&base
+				.replace("line 2\n", "first edit\n")
+				.replace("line 22\n", "second edit\n"),
+		);
+		let diff = asyncgit::sync::diff::get_diff(
+			&RepoPath::Path(s.repo()),
+			"file.txt",
+			false,
+			None,
+		)
+		.unwrap();
+		let selected = diff
+			.hunks
+			.iter()
+			.flat_map(|h| &h.lines)
+			.position(|line| {
+				line.line_type == asyncgit::DiffLineType::Add
+					&& line.content.contains("first edit")
+			})
+			.unwrap();
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		app.update();
+		settle(&mut app);
+		// App input is not a paint cycle. Establish the projection the user
+		// can see before navigation and the following line-stage action.
+		let _screen = rendered(&app, 120, 40);
+		app.input_event(KeyCode::Char('l'), KeyModifiers::CONTROL);
+		modal_key(&mut app, 'g');
+		modal_key(&mut app, 'g');
+		if selected > 0 {
+			for c in selected.to_string().chars() {
+				modal_key(&mut app, c);
+			}
+			modal_key(&mut app, 'j');
+		}
+		app.input_event(KeyCode::Enter, KeyModifiers::NONE);
+		let index = s.git_ok(&["show", ":file.txt"]).stdout;
+		let index = String::from_utf8(index).unwrap();
+		assert!(index.contains("first edit"));
+		assert!(!index.contains("second edit"));
+		let remaining = s.git_ok(&["diff", "--", "file.txt"]).stdout;
+		assert!(String::from_utf8(remaining)
+			.unwrap()
+			.contains("second edit"));
+	}
+
+	#[test]
+	fn modal_e2e_checkout_uses_the_marked_commit_after_cursor_moves()
+	{
+		let s = Sandbox::new();
+		s.four_commits();
+		let expected = String::from_utf8(
+			s.git_ok(&["rev-parse", "HEAD~1"]).stdout,
+		)
+		.unwrap()
+		.trim()
+		.to_owned();
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		modal_key(&mut app, 'g');
+		modal_key(&mut app, '2');
+		settle(&mut app);
+		modal_key(&mut app, 'j');
+		modal_key(&mut app, 'x');
+		modal_key(&mut app, 'g');
+		modal_key(&mut app, 'g');
+		app.input_event(KeyCode::Char('S'), KeyModifiers::SHIFT);
+		assert_eq!(s.head(), expected);
+	}
+
+	#[test]
+	fn modal_e2e_multi_commit_selection_cannot_checkout_the_cursor() {
+		let s = Sandbox::new();
+		s.four_commits();
+		let expected = s.head();
+		let _harness = s.harness();
+		let mut app = s.app_with_keymap(crate::keys::Keymap::Helix);
+		modal_key(&mut app, 'g');
+		modal_key(&mut app, '2');
+		settle(&mut app);
+		modal_key(&mut app, 'v');
+		modal_key(&mut app, 'j');
+		app.input_event(KeyCode::Char('S'), KeyModifiers::SHIFT);
+		assert_eq!(s.head(), expected);
+		assert_eq!(
+			s.git_ok(&["symbolic-ref", "--short", "HEAD"]).stdout,
+			b"main\n"
+		);
+		assert!(rendered(&app, 120, 30).contains("one commit"));
+	}
+
 	#[test]
 	fn rebase_e2e_draft() {
 		apply_common_filters!();
@@ -589,6 +1050,7 @@ done
 		let mut gitui = s.app();
 		let mut terminal =
 			Terminal::new(TestBackend::new(100, 30)).unwrap();
+		settle(&mut gitui);
 
 		// Log tab, then select `one` (third row of the
 		// newest-first list) and rewrite from there: the
@@ -703,6 +1165,7 @@ done
 					Some(shim),
 				)
 				.unwrap();
+			wait_idle(&mut service);
 
 			service.create_draft(
 				asyncgit::rebase::engine::Base::Upstream(
@@ -772,18 +1235,21 @@ done
 	/// outcomes channel itself is private; the events surface
 	/// through `on_worker_event`).
 	fn wait_idle(service: &mut crate::rebase_service::RebaseService) {
+		if service.is_loading() {
+			service.refresh().unwrap();
+		}
 		let deadline = std::time::Instant::now()
 			+ std::time::Duration::from_secs(60);
 		loop {
 			let _ = service.on_worker_event();
-			if !service.is_busy() {
+			if !service.is_busy() && !service.is_loading() {
 				// one final drain in case an observation is
 				// still landing
 				std::thread::sleep(std::time::Duration::from_millis(
 					30,
 				));
 				let _ = service.on_worker_event();
-				if !service.is_busy() {
+				if !service.is_busy() && !service.is_loading() {
 					return;
 				}
 			}

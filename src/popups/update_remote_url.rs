@@ -36,6 +36,10 @@ impl DrawableComponent for UpdateRemoteUrlPopup {
 }
 
 impl Component for UpdateRemoteUrlPopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.input.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<crate::components::CommandInfo>,

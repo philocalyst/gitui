@@ -177,14 +177,61 @@ pub fn commit_message_prettify(
 	repo_path: &RepoPath,
 	message: String,
 ) -> Result<String> {
-	let comment_char = repo(repo_path)?
+	let comment_char =
+		commit_message_comment_char(repo_path, &message)?;
+
+	Ok(message_prettify(message, Some(comment_char as u8))?)
+}
+
+/// Gets the comment prefix configured for commit-message cleanup.
+pub fn commit_message_comment_char(
+	repo_path: &RepoPath,
+	message: &str,
+) -> Result<char> {
+	let configured = repo(repo_path)?
 		.config()?
 		.get_string("core.commentChar")
-		.ok()
-		.and_then(|char_string| char_string.chars().next())
-		.unwrap_or('#') as u8;
+		.ok();
+	let Some(configured) = configured else {
+		return Ok('#');
+	};
+	if configured == "auto" {
+		return auto_commit_message_comment_char(message).ok_or_else(
+			|| {
+				Error::Generic(String::from(
+				"could not choose an unused ASCII comment character",
+			))
+			},
+		);
+	}
 
-	Ok(message_prettify(message, Some(comment_char))?)
+	Ok(configured
+		.chars()
+		.next()
+		.filter(char::is_ascii)
+		.unwrap_or('#'))
+}
+
+fn auto_commit_message_comment_char(message: &str) -> Option<char> {
+	const CANDIDATES: &[char] = &[
+		'#', ';', '@', '!', '$', '%', '^', '&', '|', ':', '?', '*',
+		'+', '-', '=', '_', '.', ',', '/', '\\', '(', ')', '[', ']',
+		'{', '}', '<', '>', '~', '`', '\'', '"',
+	];
+	CANDIDATES
+		.iter()
+		.copied()
+		.chain('!'..='~')
+		.find(|candidate| {
+			!message.lines().any(|line| line.starts_with(*candidate))
+		})
+}
+
+/// Normalizes a message after the caller has already removed editor comments.
+pub fn commit_message_prettify_without_comments(
+	message: String,
+) -> Result<String> {
+	Ok(message_prettify(message, None)?)
 }
 
 #[cfg(test)]
@@ -199,7 +246,11 @@ mod tests {
 		utils::get_head,
 		LogWalker,
 	};
-	use commit::{amend, commit_message_prettify, tag_commit};
+	use commit::{
+		amend, auto_commit_message_comment_char,
+		commit_message_prettify,
+		commit_message_prettify_without_comments, tag_commit,
+	};
 	use git2::Repository;
 	use std::{fs::File, io::Write, path::Path};
 
@@ -533,5 +584,25 @@ mod tests {
 		assert_eq!(message, "Test\n");
 
 		Ok(())
+	}
+
+	#[test]
+	fn test_prettify_without_comments_preserves_message_prefixes(
+	) -> Result<()> {
+		let message = commit_message_prettify_without_comments(
+			"#keep\na legitimate line".to_owned(),
+		)?;
+		assert_eq!(message, "#keep\na legitimate line\n");
+		Ok(())
+	}
+
+	#[test]
+	fn auto_comment_character_avoids_all_used_punctuation() {
+		let message = "#\n;\n@\n!\n$\n%\n^\n&\n|\n:\n?\n*\n+\n-\n=\n_\n.\n,\n/\n\\\n(\n)\n[\n]\n{\n}\n<\n>\n~\n`\n'\n\"";
+		let comment_char = auto_commit_message_comment_char(message)
+			.expect("unused printable ASCII character");
+		assert!(!message
+			.lines()
+			.any(|line| line.starts_with(comment_char)));
 	}
 }

@@ -12,7 +12,9 @@ use crate::{
 	ui::{self, style::SharedTheme},
 };
 use anyhow::Result;
-use crossterm::event::Event;
+use crossterm::event::{
+	Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind,
+};
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
 	layout::{Constraint, Direction, Layout, Margin, Rect},
@@ -20,7 +22,7 @@ use ratatui::{
 	widgets::{Block, Borders, Clear},
 	Frame,
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub struct FuzzyFindPopup {
@@ -35,6 +37,7 @@ pub struct FuzzyFindPopup {
 	filtered: Vec<(usize, Vec<usize>)>,
 	key_config: SharedKeyConfig,
 	target: Option<FuzzyFinderTarget>,
+	results_area: Cell<Rect>,
 }
 
 impl FuzzyFindPopup {
@@ -57,6 +60,7 @@ impl FuzzyFindPopup {
 			key_config: env.key_config.clone(),
 			selection: 0,
 			target: None,
+			results_area: Cell::new(Rect::default()),
 		}
 	}
 
@@ -301,7 +305,10 @@ impl DrawableComponent for FuzzyFindPopup {
 			self.find_text.draw(f, chunks[0])?;
 
 			if any_hits {
+				self.results_area.set(chunks[1]);
 				self.draw_matches_list(f, chunks[1]);
+			} else {
+				self.results_area.set(Rect::default());
 			}
 		}
 		Ok(())
@@ -309,6 +316,10 @@ impl DrawableComponent for FuzzyFindPopup {
 }
 
 impl Component for FuzzyFindPopup {
+	fn captures_input(&self) -> bool {
+		self.is_visible() && self.find_text.captures_input()
+	}
+
 	fn commands(
 		&self,
 		out: &mut Vec<CommandInfo>,
@@ -338,25 +349,66 @@ impl Component for FuzzyFindPopup {
 		event: &crossterm::event::Event,
 	) -> Result<EventState> {
 		if self.is_visible() {
+			if let Event::Mouse(mouse) = event {
+				let area = self.results_area.get();
+				if area.contains((mouse.column, mouse.row).into()) {
+					match mouse.kind {
+						MouseEventKind::Down(MouseButton::Left) => {
+							let list_height =
+								usize::from(area.height)
+									.saturating_sub(2);
+							let scroll_skip = self
+								.selection
+								.saturating_sub(list_height);
+							let row = usize::from(
+								mouse.row.saturating_sub(area.y),
+							)
+							.saturating_sub(1);
+							let selected =
+								scroll_skip.saturating_add(row);
+							if selected < self.filtered.len() {
+								self.selection = selected;
+								self.refresh_selection();
+							}
+						}
+						MouseEventKind::ScrollUp => {
+							self.move_selection(ScrollType::Up);
+						}
+						MouseEventKind::ScrollDown => {
+							self.move_selection(ScrollType::Down);
+						}
+						_ => {}
+					}
+				}
+				return Ok(EventState::Consumed);
+			}
+			let mut modal_arrow = false;
 			if let Event::Key(key) = event {
+				modal_arrow = self.key_config.is_modal()
+					&& key.modifiers == KeyModifiers::NONE
+					&& matches!(
+						key.code,
+						KeyCode::Up | KeyCode::Down
+					);
+
 				if key_match(key, self.key_config.keys.exit_popup)
 					|| key_match(key, self.key_config.keys.enter)
 				{
 					self.hide();
-				} else if key_match(
-					key,
-					self.key_config.keys.popup_down,
-				) {
+				} else if (modal_arrow && key.code == KeyCode::Down)
+					|| key_match(key, self.key_config.keys.popup_down)
+				{
 					self.move_selection(ScrollType::Down);
-				} else if key_match(
-					key,
-					self.key_config.keys.popup_up,
-				) {
+				} else if (modal_arrow && key.code == KeyCode::Up)
+					|| key_match(key, self.key_config.keys.popup_up)
+				{
 					self.move_selection(ScrollType::Up);
 				}
 			}
 
-			if self.find_text.event(event)?.is_consumed() {
+			if !modal_arrow
+				&& self.find_text.event(event)?.is_consumed()
+			{
 				self.update_query();
 			}
 
@@ -377,5 +429,69 @@ impl Component for FuzzyFindPopup {
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::keys::{KeyConfig, Keymap};
+	use crossterm::event::{KeyEvent, KeyEventKind};
+
+	#[test]
+	fn modal_arrows_move_results_and_leave_search_text_alone() {
+		let mut env = Environment::test_env();
+		env.key_config =
+			std::rc::Rc::new(KeyConfig::with_keymap(Keymap::Helix));
+		let mut popup = FuzzyFindPopup::new(&env);
+		popup
+			.open(
+				vec![
+					"jab".to_owned(),
+					"job".to_owned(),
+					"cat".to_owned(),
+				],
+				FuzzyFinderTarget::Files,
+			)
+			.unwrap();
+
+		popup
+			.event(&Event::Key(KeyEvent::new(
+				KeyCode::Char('j'),
+				KeyModifiers::NONE,
+			)))
+			.unwrap();
+		assert_eq!(popup.find_text.get_text(), "j");
+		assert_eq!(popup.filtered.len(), 2);
+
+		popup
+			.event(&Event::Key(KeyEvent::new_with_kind(
+				KeyCode::Down,
+				KeyModifiers::NONE,
+				KeyEventKind::Press,
+			)))
+			.unwrap();
+		assert_eq!(popup.selection, 1);
+		assert_eq!(popup.find_text.get_text(), "j");
+
+		popup
+			.event(&Event::Key(KeyEvent::new_with_kind(
+				KeyCode::Up,
+				KeyModifiers::NONE,
+				KeyEventKind::Press,
+			)))
+			.unwrap();
+		assert_eq!(popup.selection, 0);
+		assert_eq!(popup.find_text.get_text(), "j");
+
+		for character in ['k', 'g', 'q'] {
+			popup
+				.event(&Event::Key(KeyEvent::new(
+					KeyCode::Char(character),
+					KeyModifiers::NONE,
+				)))
+				.unwrap();
+		}
+		assert_eq!(popup.find_text.get_text(), "jkgq");
 	}
 }

@@ -1,7 +1,7 @@
 use crate::components::{
 	command_pump, event_pump, visibility_blocking, CommandBlocking,
 	CommandInfo, CommitDetailsComponent, Component, DiffComponent,
-	DrawableComponent, EventState,
+	DiffPreviewController, DrawableComponent, EventState,
 };
 use crate::{
 	accessors,
@@ -63,6 +63,9 @@ pub struct InspectCommitPopup {
 	visible: bool,
 	key_config: SharedKeyConfig,
 	options: SharedOptions,
+	theme: crate::ui::style::SharedTheme,
+	preview: DiffPreviewController,
+	review_mode: bool,
 }
 
 impl DrawableComponent for InspectCommitPopup {
@@ -88,7 +91,16 @@ impl DrawableComponent for InspectCommitPopup {
 			f.render_widget(Clear, rect);
 
 			self.details.draw(f, chunks[0])?;
-			self.diff.draw(f, chunks[1])?;
+			if self.review_mode {
+				self.preview.view().draw(
+					f,
+					chunks[1],
+					&self.theme,
+					true,
+				);
+			} else {
+				self.diff.draw(f, chunks[1])?;
+			}
 		}
 
 		Ok(())
@@ -107,6 +119,11 @@ impl Component for InspectCommitPopup {
 				force_all,
 				self.components().as_slice(),
 			);
+			out.push(CommandInfo::new(
+				strings::commands::diff_view_toggle(&self.key_config),
+				true,
+				self.diff.focused() || force_all,
+			));
 
 			out.push(
 				CommandInfo::new(
@@ -143,9 +160,31 @@ impl Component for InspectCommitPopup {
 
 	fn event(&mut self, ev: &Event) -> Result<EventState> {
 		if self.is_visible() {
-			if event_pump(ev, self.components_mut().as_mut_slice())?
-				.is_consumed()
+			if let Event::Key(key) = ev {
+				if key_match(
+					key,
+					self.key_config.keys.diff_view_toggle,
+				) {
+					self.review_mode = !self.review_mode;
+					if self.review_mode {
+						self.update_diff()?;
+					} else {
+						self.preview.clear();
+					}
+					return Ok(EventState::Consumed);
+				}
+			}
+			let consumed = if self.review_mode && self.diff.focused()
 			{
+				self.preview.view_mut().event(ev)?.is_consumed()
+			} else if self.review_mode {
+				event_pump(ev, &mut [&mut self.details])?
+					.is_consumed()
+			} else {
+				event_pump(ev, self.components_mut().as_mut_slice())?
+					.is_consumed()
+			};
+			if consumed {
 				if !self.details.is_visible() {
 					self.hide_stacked(true);
 				}
@@ -203,6 +242,7 @@ impl Component for InspectCommitPopup {
 	}
 	fn hide(&mut self) {
 		self.visible = false;
+		self.preview.clear();
 	}
 	fn show(&mut self) -> Result<()> {
 		self.visible = true;
@@ -231,6 +271,13 @@ impl InspectCommitPopup {
 			visible: false,
 			key_config: env.key_config.clone(),
 			options: env.options.clone(),
+			theme: env.theme.clone(),
+			preview: DiffPreviewController::new(
+				env.repo.clone(),
+				env.sender_git.clone(),
+				env.key_config.clone(),
+			),
+			review_mode: true,
 		}
 	}
 
@@ -244,7 +291,9 @@ impl InspectCommitPopup {
 
 	///
 	pub fn any_work_pending(&self) -> bool {
-		self.git_diff.is_pending() || self.details.any_work_pending()
+		self.git_diff.is_pending()
+			|| self.preview.is_pending()
+			|| self.details.any_work_pending()
 	}
 
 	///
@@ -252,8 +301,16 @@ impl InspectCommitPopup {
 		&mut self,
 		ev: AsyncGitNotification,
 	) -> Result<()> {
+		if ev == AsyncGitNotification::DiffPreview {
+			self.preview.update();
+			self.diff.update_preview();
+		}
 		if self.is_visible() {
-			if ev == AsyncGitNotification::CommitFiles {
+			if matches!(
+				ev,
+				AsyncGitNotification::CommitFiles
+					| AsyncGitNotification::CommitDetails
+			) {
 				self.update()?;
 			} else if ev == AsyncGitNotification::Diff {
 				self.update_diff()?;
@@ -261,6 +318,11 @@ impl InspectCommitPopup {
 		}
 
 		Ok(())
+	}
+
+	/// Apply completed native projection and highlighting work.
+	pub fn update_rendering(&mut self) {
+		self.diff.update_rendering();
 	}
 
 	/// called when any tree component changed selection
@@ -276,26 +338,66 @@ impl InspectCommitPopup {
 						),
 						options: self.options.borrow().diff_options(),
 					};
-
 					if let Some((params, last)) =
 						self.git_diff.last()?
 					{
 						if params == diff_params {
-							self.diff.update(f.path, false, last);
+							self.diff.update_with_params(
+								f.path,
+								false,
+								last.clone(),
+								Some(diff_params.clone()),
+							);
+							self.diff.update_preview();
+							self.request_preview(diff_params, &last);
 							return Ok(());
 						}
 					}
 
-					self.git_diff.request(diff_params)?;
+					if let Some(last) =
+						self.git_diff.request(diff_params.clone())?
+					{
+						self.diff.update_with_params(
+							f.path,
+							false,
+							last.clone(),
+							Some(diff_params.clone()),
+						);
+						self.diff.update_preview();
+						self.request_preview(diff_params, &last);
+						return Ok(());
+					}
 					self.diff.clear(true);
+					self.preview.clear_with_message(
+						"Loading commit preview…",
+					);
 					return Ok(());
 				}
 			}
 
 			self.diff.clear(false);
+			self.preview.clear();
 		}
 
 		Ok(())
+	}
+
+	fn request_preview(
+		&mut self,
+		params: DiffParams,
+		native_diff: &asyncgit::FileDiff,
+	) {
+		if !self.review_mode {
+			return;
+		}
+		let preference =
+			self.options.borrow().diff_preview_preference().into();
+		self.preview.request(
+			params,
+			100,
+			preference,
+			asyncgit::hash(native_diff),
+		);
 	}
 
 	fn update(&mut self) -> Result<()> {
@@ -326,5 +428,41 @@ impl InspectCommitPopup {
 		} else {
 			self.queue.push(InternalEvent::PopupStackPop);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::app::Environment;
+	use ratatui::{backend::TestBackend, Terminal};
+
+	#[test]
+	fn inspect_popup_renders_one_read_only_review_pane() {
+		let env = Environment::test_env();
+		let mut popup = InspectCommitPopup::new(&env);
+		popup.visible = true;
+		popup.details.show().unwrap();
+
+		let backend = TestBackend::new(120, 32);
+		let mut terminal = Terminal::new(backend).unwrap();
+		terminal
+			.draw(|frame| {
+				popup.draw(frame, frame.area()).unwrap();
+			})
+			.unwrap();
+		let rendered = terminal
+			.backend()
+			.buffer()
+			.content
+			.iter()
+			.map(|cell| cell.symbol())
+			.collect::<String>();
+
+		assert_eq!(
+			rendered.matches("REVIEW ·").count(),
+			1,
+			"{rendered}"
+		);
 	}
 }
