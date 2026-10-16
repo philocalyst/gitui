@@ -445,19 +445,23 @@ impl GraphWalker {
 			.collect()
 	}
 
-	/// Whether some lane already flows or is reserved for
-	/// `target_parent` without owing a second parent of its own,
-	/// making it redundant to track a new merge bridge to that
-	/// parent.
+	/// Whether a lane is already waiting for `target_parent`, making
+	/// a second lane for it both redundant and wrong.
+	///
+	/// This has to agree exactly with the two other places that go
+	/// looking for a lane by the parent it awaits: the one that places
+	/// a commit, and the one that picks the far end of a merge bridge.
+	/// Both take the *first* such lane. So if this said no while a
+	/// lane was in fact waiting, the reservation opened on the
+	/// strength of that answer would be left over — the bridge would
+	/// be drawn to the lane that was already there, and the reserved
+	/// column would draw a line with nothing above it.
 	fn has_lane_to_parent(&self, target_parent: CommitAlias) -> bool {
-		self.buffer.current.iter().flatten().any(|slot| {
-			matches!(
-				slot,
-				LaneSlot::Flowing { parent, .. }
-				| LaneSlot::Reserved { parent }
-					if **parent == target_parent
-			)
-		})
+		self.buffer
+			.current
+			.iter()
+			.flatten()
+			.any(|slot| slot.awaits() == Some(target_parent))
 	}
 
 	/// Whether the lane in `target_lane` is the same lane the row
